@@ -200,3 +200,60 @@ def test_vision_waits_until_ocr_and_embedding_settle():
     assert not scheduler._deferred_settled()
     scheduler.states['embedding'][1] = 'succeeded'
     assert scheduler._deferred_settled()
+
+
+def test_embedding_profile_passes_device_once(tmp_path, monkeypatch):
+    from dd_agent.retrieval import LocalModels
+    captured = {}
+
+    def fake_worker(python, name, manifest, directory, timeout_seconds=1200):
+        captured.update(manifest)
+        yield {'version': 'profile-once'}
+
+    monkeypatch.setattr('dd_agent.retrieval.worker_records', fake_worker)
+    settings = Settings(data_dir=tmp_path, retrieval_python=tmp_path / 'missing-python')
+    assert LocalModels(settings).profile() == 'profile-once'
+    assert captured['mode'] == 'profile'
+    assert captured['device'] == 'cpu' and captured['dtype'] == 'float32'
+
+
+def test_gpu_paddle_distribution_is_part_of_the_runtime_key(tmp_path):
+    from dd_agent.cache import venv_runtime_descriptor
+    root = tmp_path / 'venv'
+    site = root / 'Lib' / 'site-packages'
+    site.mkdir(parents=True)
+    (site / 'paddlepaddle_gpu-3.3.1.dist-info').mkdir()
+    (site / 'paddleocr-3.7.0.dist-info').mkdir()
+    (root / 'pyvenv.cfg').write_text('home = python\n', encoding='utf-8')
+    python = root / 'Scripts' / 'python'
+    python.parent.mkdir()
+    python.write_text('', encoding='utf-8')
+    descriptor = venv_runtime_descriptor(python, packages=('paddleocr', 'paddlex', 'paddlepaddle', 'pillow'))
+    assert descriptor is not None
+    assert 'paddlepaddle_gpu-3.3.1.dist-info' in descriptor
+    assert 'paddleocr-3.7.0.dist-info' in descriptor
+
+
+def test_reranker_scores_only_yes_and_no_rows():
+    torch = pytest.importorskip('torch')
+    from dd_agent.workers.retrieval_worker import yes_no_logits
+
+    class Body:
+        def __call__(self, **kwargs):
+            assert kwargs.get('use_cache') is False
+            return type('Out', (), {'last_hidden_state': torch.ones(2, 5, 4)})()
+
+    class Head:
+        def __init__(self):
+            self.weight = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4)
+            self.bias = None
+
+    class Model:
+        def __init__(self):
+            self.model = Body()
+            self.lm_head = Head()
+
+    scores = yes_no_logits(Model(), {'input_ids': torch.zeros(2, 5)}, 1, 3)
+    assert tuple(scores.shape) == (2, 2)
+    expected = torch.ones(2, 4).matmul(Head().weight[[1, 3]].transpose(0, 1))
+    assert torch.allclose(scores, expected)

@@ -33,7 +33,23 @@ def test_small_repeatable_performance_baseline(tmp_path, database_url):
         ('ocr', settings.ocr_python, ['paddleocr', 'paddlepaddle']),
         ('retrieval', settings.retrieval_python, ['torch', 'transformers']),
         ('vision', settings.vision_python, ['torch', 'transformers'])):
-        code = ('import importlib.metadata as m,json;print(json.dumps({p:m.version(p) for p in '+repr(packages)+'}))')
+        # paddlepaddle-gpu 的发行名不是 paddlepaddle，两种都要能读到版本。
+        code = (
+            'import importlib.metadata as m,json\n'
+            'names=' + repr(packages) + '\n'
+            'found={}\n'
+            'for name in names:\n'
+            '    options=(name,"paddlepaddle-gpu") if name=="paddlepaddle" else (name,)\n'
+            '    for candidate in options:\n'
+            '        try:\n'
+            '            found[name]=m.version(candidate)\n'
+            '            break\n'
+            '        except m.PackageNotFoundError:\n'
+            '            continue\n'
+            '    else:\n'
+            '        raise SystemExit("missing "+name)\n'
+            'print(json.dumps(found))\n'
+        )
         response = subprocess.run([str(python), '-c', code], capture_output=True, text=True, check=True, timeout=30)
         runtimes[name] = json.loads(response.stdout)
     cpu_name = platform.processor()

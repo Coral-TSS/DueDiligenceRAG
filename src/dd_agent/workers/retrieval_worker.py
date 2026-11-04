@@ -29,8 +29,12 @@ def profile(directory, device='auto', dtype='auto'):
     # 这比仅看目录名可靠，但每次查询都重算会有较大 I/O 开销，属于 RG-05 优化点。
     # 设备与注意力不进入指纹：float32 下换 GPU 不应让整卷重新嵌入。
     # 非 float32（例如 Ada 上 auto 选出的 bfloat16）数值不同，必须换索引版本。
-    from dd_agent.devices import resolve_torch
-    spec = resolve_torch('embedding', device, dtype)
+    # 主进程已经解析过设备时不要再 import torch，避免指纹进程和常驻模型同时占用显存。
+    if device in ('cpu', 'cuda') and dtype in ('float32', 'float16', 'bfloat16'):
+        spec = {'device': device, 'dtype': dtype}
+    else:
+        from dd_agent.devices import resolve_torch
+        spec = resolve_torch('embedding', device, dtype)
     path = Path(directory)
     files = sorted(p for p in path.rglob('*') if p.is_file() and p.suffix in {'.json', '.safetensors', '.txt'} and '.cache' not in p.parts)
     if not any(p.suffix == '.safetensors' for p in files):
@@ -102,6 +106,26 @@ def reranker_model(path, device='auto', dtype='auto'):
     return tokenizer, model
 
 
+def yes_no_logits(model, inputs, no_id, yes_id):
+    """只取最后一个 token 的 yes／no 两行，避免在 GPU 上展开整个词表。"""
+    import torch
+    head = getattr(model, 'lm_head', None)
+    body = getattr(model, 'model', None)
+    if head is None or body is None or not hasattr(head, 'weight'):
+        # 没有独立输出层时仍只保留最后一位；正常的 Qwen 重排模型不会走到这里。
+        logits = model(**inputs, use_cache=False).logits[:, -1, :]
+        return logits[:, [no_id, yes_id]]
+    hidden = body(**inputs, use_cache=False).last_hidden_state[:, -1, :]
+    index = torch.tensor([no_id, yes_id], device=head.weight.device)
+    weight = head.weight.index_select(0, index)
+    hidden = hidden.to(device=weight.device, dtype=weight.dtype)
+    scores = hidden.matmul(weight.transpose(0, 1))
+    bias = getattr(head, 'bias', None)
+    if bias is not None:
+        scores = scores + bias.index_select(0, index).to(dtype=scores.dtype, device=scores.device)
+    return scores
+
+
 @timed('rerank.worker')
 def rerank_loaded(engine, query, texts):
     import torch
@@ -110,18 +134,19 @@ def rerank_loaded(engine, query, texts):
     suffix = tokenizer.encode(SUFFIX, add_special_tokens=False)
     yes, no = (tokenizer.convert_tokens_to_ids(word) for word in ('yes', 'no'))
     results = []
-    # Small batches keep the full-vocabulary causal logits bounded on CPU.
-    for start in range(0, len(texts), 2):
-        # 每对输入带检索任务说明、问题及片段；两条一批限制 CPU 全词表 logits 内存。
-        pairs = [f'<Instruct>: {INSTRUCTION}\n<Query>: {query}\n<Document>: {text}' for text in texts[start:start + 2]]
+    # GPU 上一次一条，避免长序列激活和词表 logits 叠到 8GB 上限。CPU 仍两条一批。
+    on_gpu = next(model.parameters()).device.type == 'cuda'
+    batch = 1 if on_gpu else 2
+    for start in range(0, len(texts), batch):
+        pairs = [f'<Instruct>: {INSTRUCTION}\n<Query>: {query}\n<Document>: {text}' for text in texts[start:start + batch]]
         ids = tokenizer(pairs, add_special_tokens=False, truncation=False)['input_ids']
         if any(len(row) + len(prefix) + len(suffix) > 4096 for row in ids):
             raise ValueError('Reranking input exceeds token budget')
         inputs = tokenizer.pad({'input_ids': [prefix + row + suffix for row in ids]}, padding=True, return_tensors='pt').to(model.device)
         count('rerank.pairs', len(pairs))
         with torch.inference_mode(), span('rerank.inference'):
-            logits = model(**inputs, logits_to_keep=1, use_cache=False).logits[:, -1]
-            results.extend(logits[:, [no, yes]].softmax(dim=1)[:, 1].tolist())
+            chosen = yes_no_logits(model, inputs, no, yes)
+            results.extend(chosen.softmax(dim=1)[:, 1].tolist())
     return results
 
 

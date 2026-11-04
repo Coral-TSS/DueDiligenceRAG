@@ -146,9 +146,13 @@ class LocalModels:
 
     def records(self, mode, **payload):
         from .model_runtime import runtime_records, ModelRuntimeError
-        # 一次性进程从清单读设备；常驻进程以 worker_spec 为准。调用方传入的 device 可覆盖。
-        device = self.settings.reranker_device if mode == 'rerank' else self.settings.embedding_device
-        dtype = self.settings.reranker_dtype if mode == 'rerank' else self.settings.embedding_dtype
+        # 调用方传入的 device／dtype 覆盖配置。必须先取出，不能和下面的同名参数一起展开。
+        device = payload.pop('device', None)
+        dtype = payload.pop('dtype', None)
+        if device is None:
+            device = self.settings.reranker_device if mode == 'rerank' else self.settings.embedding_device
+        if dtype is None:
+            dtype = self.settings.reranker_dtype if mode == 'rerank' else self.settings.embedding_dtype
         manifest = dict(mode=mode, embedding=str(self.settings.embedding_dir.resolve()),
                         reranker=str(self.settings.reranker_dir.resolve()), threads=self.settings.model_cpu_threads,
                         device=device, dtype=dtype, **payload)

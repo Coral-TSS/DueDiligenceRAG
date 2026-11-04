@@ -161,6 +161,7 @@ def release_accelerators():
     try:
         import torch
         if torch.cuda.is_available():
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
     except Exception:
         pass

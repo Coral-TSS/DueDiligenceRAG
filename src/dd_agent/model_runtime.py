@@ -272,6 +272,7 @@ def worker_spec(settings,kind):
     else:config['dtype']={'vision':settings.vision_dtype,'embedding':settings.embedding_dtype,'reranker':settings.reranker_dtype}[kind]
     config['embedding' if kind=='embedding' else 'reranker' if kind=='reranker' else 'models']=str(models.resolve())
     if kind=='vision':config['max_new_tokens']=settings.vision_max_new_tokens
+    # paddlepaddle 同时匹配 CPU 包和 paddlepaddle-gpu 的 dist-info。
     packages=('paddleocr','paddlex','paddlepaddle','pillow') if kind=='ocr' else ('torch','transformers','tokenizers','pillow')
     environment=venv_runtime_descriptor(python,packages=packages)
     descriptor=dict(config=config,runtime=environment,files=file_entries(files+sources))
