@@ -1,8 +1,5 @@
-# 验收记录已迁移
+# 验收记录
 
-所有测试与试验记录统一放在 `testing/`。
+正式测试在 `testing/tests/`，说明见 [测试目录](../../testing/README.md)。长篇验收文不入库。
 
-- [P1 历史及当前验收记录](../../testing/records/p1-verification.md)
-- [测试目录与使用说明](../../testing/README.md)
-
-本文件仅保留旧链接兼容，不再追加测试结果。
+P1 早期自动验收在实现后曾到 16 passed。2026-10-20 含真实本地模型的一轮是 48 passed，补充质量指标后是 46 passed、2 skipped。历史人工核对的通过记录不能当作当前自动链路已经完成。其后的回归数字以 [tasks.md](./tasks.md) 为准。
