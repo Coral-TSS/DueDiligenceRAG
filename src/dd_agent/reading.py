@@ -1,0 +1,237 @@
+# 基础阅读层：登记原件 -> PDFium 预检／取文字／渲染 -> 必要时 PaddleOCR -> 保存基础页。
+# PDF 页码在业务接口中从 1 开始；原始 OCR 与后续机器增强分开保存。
+# “.venv-docling”是当前环境目录名，实际 pdf_worker 使用 pypdfium2，不等于已接 Docling 全能力。
+import json
+from contextlib import closing
+import hashlib
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+from threading import Timer
+from uuid import UUID, uuid4
+
+from .cache import cache_directory, file_entries, inspect_document, resolve_fingerprint
+from .config import Settings
+from .db import Database
+from .storage import Storage
+from .performance import active, accept_worker, worker_process, span, timed, observed, count
+from .model_admission import current_control
+from .control import ProcessingDeferred
+
+
+PIPELINE_VERSION='pdfium-text-v2-ppocr5-cpu-v1'
+OCR_MODEL_NAMES = ['PP-OCRv5_mobile_det','PP-OCRv5_server_rec','PP-LCNet_x1_0_doc_ori','PP-LCNet_x1_0_textline_ori']
+OCR_MODEL_SUFFIXES = ['pdiparams','json','yml']
+# 预检结果依赖 PDF 解析器行为；更换解析栈须同步调整该标记，不能只靠文件时间判断。
+PREFLIGHT_PARSER = PIPELINE_VERSION
+
+
+class ReadingError(Exception):
+    pass
+
+
+def parse_pages(value,total):
+    # CLI 可传 1-5,8；限制小批页数，避免一次调用直接把整个卷宗放入推理内存。
+    pages=set()
+    for item in value.split(','):
+        if not re.fullmatch(r'\d+(?:-\d+)?',item.strip()):
+            raise ValueError('页码格式须为 1-5,8；单批最多 20 页。')
+        parts=[int(x) for x in item.strip().split('-')]
+        first,last=parts[0],parts[-1]
+        if first<1 or last<first or last>total or last-first>=20:
+            raise ValueError('页码超出范围，或单批超过 20 页。')
+        pages.update(range(first,last+1))
+        if len(pages)>20:raise ValueError('单批最多 20 页。')
+    return sorted(pages)
+
+
+def normalize_ocr(payload):
+    # 将 Paddle 输出统一成 text＋lines。文字、分数、四点坐标必须一一对应。
+    # score 只是 OCR 识别分数，不是法律事实正确率，后续不能据此直接确认事实。
+    lines=[]
+    try:
+        for text,score,box in zip(payload.get('rec_texts',[]),payload.get('rec_scores',[]),payload.get('rec_polys',[]),strict=True):
+            if not text.strip():continue
+            score=float(score)
+            if not math.isfinite(score) or not 0<=score<=1:raise ValueError()
+            if len(box)!=4 or any(len(point)!=2 or any(not math.isfinite(float(v)) for v in point) for point in box):raise ValueError()
+            lines.append({'text':text,'score':score,'box':box})
+    except (ValueError,TypeError,AttributeError):
+        raise ReadingError('OCR 输出的文字、分数或区域不完整，请重试该页。') from None
+    return {'text':'\n'.join(line['text'] for line in lines),'lines':lines}
+
+
+def worker_records(python,worker,manifest,directory,timeout_seconds=1200):
+    # 主应用不直接 import 各套模型依赖，而是使用对应虚拟环境的解释器启动 worker。
+    # 输入：一个本地 JSON 清单；输出：stdout 每行一条 JSON；诊断：stderr 写本地日志。
+    # 采用生成器才能一页完成就保存，不必等整个子进程运行完才得到全部结果。
+    if not Path(python).is_file():raise ReadingError('工作进程 Python 未配置，请检查 DDA_PDF_PYTHON／DDA_OCR_PYTHON。')
+    directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
+    manifest_path=directory/(worker+'-'+uuid4().hex+'.json')
+    manifest_path.write_text(json.dumps(manifest,ensure_ascii=False),encoding='utf-8')
+    # 只传必要系统变量，不把主应用的数据库连接或模型服务凭据放进 worker 环境。
+    env={key:value for key,value in os.environ.items() if key.upper() in {'SYSTEMROOT','WINDIR','PATH','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC'}}
+    env.update(PYTHONUTF8='1',PYTHONIOENCODING='utf-8',HF_HUB_OFFLINE='1',PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True',PADDLE_PDX_CACHE_HOME=str(directory/'cache'))
+    if active(): env['DDA_WORKER_METRICS'] = '1'
+    script=Path(__file__).parent/'workers'/(worker+'.py')
+    with (directory/(worker+'.log')).open('a',encoding='utf-8') as log:
+        process=subprocess.Popen([str(python),str(script),str(manifest_path)],stdout=subprocess.PIPE,stderr=log,text=True,encoding='utf-8',env=env)
+        count('worker.'+worker+'.starts')
+        timer=Timer(timeout_seconds,process.kill);timer.daemon=True;timer.start()
+        try:
+            with worker_process(process.pid) as register, span('worker.'+worker):
+                for line in process.stdout:
+                    try: record = json.loads(line)
+                    except json.JSONDecodeError:raise ReadingError('工作进程输出无效，请检查本地处理日志。') from None
+                    if isinstance(record, dict) and '_dda_metric' in record:
+                        metric = record['_dda_metric']
+                        if isinstance(metric, dict) and 'runtime_pid' in metric:
+                            register(metric['runtime_pid'])
+                        else: accept_worker(metric)
+                    else: yield record
+                if process.wait()!=0:raise ReadingError('PDF／OCR 工作进程失败，请检查本地处理日志。')
+        finally:
+            # 即使上层因暂停而提前关闭生成器，也要结束／回收子进程。
+            # 否则文件锁已释放，旧模型却仍占着内存，下一次调用可能与它叠加。
+            timer.cancel();process.stdout.close()
+            if process.poll() is None:process.kill()
+            process.wait()
+
+
+def ocr_records(settings,manifest,directory):
+    from .model_runtime import runtime_records, ModelRuntimeError
+    from .retrieval import model_slot, RetrievalError
+    try:
+        if settings.model_runtime_enabled:
+            if manifest.get('pages') and any(not (settings.ocr_models_dir/name/'inference.pdiparams').is_file() for name in OCR_MODEL_NAMES):
+                for page in manifest['pages']:yield dict(page_number=page['page_number'],error_code='ocr_models_missing')
+                return
+            if manifest.get('pages'):
+                for page in manifest['pages']:
+                    # Release admission before SQL save/checkpoint, then let a
+                    # waiting query run before requesting the next OCR page.
+                    yield from list(runtime_records(settings,'ocr','recognize',dict(manifest,pages=[page])))
+            else:yield from runtime_records(settings,'ocr','recognize',manifest)
+        else:
+            with model_slot(settings.data_dir):
+                yield from worker_records(settings.ocr_python,'ocr_worker',manifest,directory)
+    except ModelRuntimeError as exc:
+        if str(exc)=='model_busy' and current_control().defer_busy:raise ProcessingDeferred() from None
+        raise ReadingError('本地 OCR 暂未完成，请稍后重试。') from None
+    except RetrievalError:
+        raise ReadingError('本地 OCR 暂未完成，请稍后重试。') from None
+
+
+class PdfWorker:
+    # inspect 会遍历 PDF 页面判断文字层及页数；它不执行视觉模型，也不建立索引。
+    def __init__(self,settings=None):
+        self.settings=settings or Settings()
+
+    @timed('pdf.inspect.request')
+    def inspect(self,source,identity=None,sha256=None,verify=False):
+        # identity/sha256 为项目内材料身份与内容摘要；缺一则不缓存（例如 CLI 诊断）。
+        def compute():
+            with tempfile.TemporaryDirectory(prefix='dda-preflight-') as directory:
+                results=list(worker_records(self.settings.pdf_python,'pdf_worker',{'mode':'inspect','source':str(Path(source).resolve())},directory))
+            if not results or 'error_code' in results[0]:raise ReadingError('PDF 无法打开，可能损坏或加密。请检查原件。')
+            return results[0]
+        return inspect_document(identity, sha256, PREFLIGHT_PARSER, source, compute,
+                                verify=verify, directory=cache_directory(self.settings))['value']
+
+
+def ocr_model_files(settings):
+    return [settings.ocr_models_dir/name/('inference.'+suffix)
+            for name in OCR_MODEL_NAMES for suffix in OCR_MODEL_SUFFIXES]
+
+
+@timed('fingerprint.ocr')
+def ocr_fingerprint(settings,verify=False):
+    # 摘要算法保持位级一致，只把结果放进缓存；命中时不读取权重内容。
+    def compute():
+        digest = hashlib.sha256()
+        for name in OCR_MODEL_NAMES:
+            for suffix in OCR_MODEL_SUFFIXES:
+                file = settings.ocr_models_dir/name/('inference.'+suffix)
+                digest.update((name+suffix).encode())
+                if file.is_file():
+                    with file.open('rb') as stream:
+                        for block in iter(lambda:stream.read(1024*1024),b''):
+                            digest.update(block); count('fingerprint.ocr.bytes', len(block))
+                else: digest.update(b'missing')
+        return digest.hexdigest()
+    # 算法本体所在文件参与清单：改动实现即失效，不靠模型目录时间判断。
+    entries = file_entries(ocr_model_files(settings) + [Path(__file__)])
+    return resolve_fingerprint('ocr_weights', 'python-stdlib', 'ocr-weights-digest-v1',
+        dict(names=OCR_MODEL_NAMES, suffixes=OCR_MODEL_SUFFIXES, models=str(settings.ocr_models_dir.resolve())),
+        entries, compute, verify=verify, directory=cache_directory(settings))['value']
+
+
+class Reader:
+    # read() 写 document_pages（基础结果），不负责决定增强文字是否可信。
+    def __init__(self,settings,database=None):
+        self.settings=settings;self.database=database if database is not None else Database(settings.database_url)
+        self.storage=Storage(settings.data_dir,settings.max_upload_bytes)
+
+    def prepare(self,project_id,document_id,force_ocr=False,activate=True):
+        project_id,document_id=UUID(str(project_id)),UUID(str(document_id))
+        document=self.database.document(project_id,document_id)
+        if document is None:raise ReadingError('材料不存在或不属于当前项目。')
+        if document['status']!='registered':raise ReadingError('材料不是可处理的 PDF，请检查登记状态。')
+        source=self.storage.path(document['storage_key'])
+        # 预检按材料身份＋原件摘要缓存；同一原件不再逐批遍历全卷。
+        profile=PdfWorker(self.settings).inspect(source,identity=str(document_id),sha256=document.get('sha256'))
+        # 阅读版本绑定基础 OCR 权重、渲染比例及是否强制 OCR。
+        # 参数变了就选择新版本，不能把旧结果直接算作本次已完成；旧版本仍保留。
+        version=PIPELINE_VERSION+'-'+ocr_fingerprint(self.settings)[:16]+f'-render{self.settings.pdf_render_scale:g}'+('-force-ocr' if force_ocr else '')
+        if activate:self.database.set_reading(document_id,profile['page_count'],version)
+        return profile,version
+
+    @observed('reading')
+    def read(self,project_id,document_id,pages,force_ocr=False,checkpoint=None,prepared=None):
+        project_id,document_id=UUID(str(project_id)),UUID(str(document_id))
+        document=self.database.document(project_id,document_id)
+        if document is None:raise ReadingError('材料不存在或不属于当前项目。')
+        source=self.storage.path(document['storage_key'])
+        profile,version=prepared if prepared is not None else self.prepare(project_id,document_id,force_ocr)
+        pages=parse_pages(','.join(map(str,pages)),profile['page_count'])
+        # 本批页状态用字段投影读取，不先取回整卷正文再判断跳过。
+        existing={r['page_number'] for r in self.database.page_status(document_id,version,pages) if r['status']=='succeeded'}
+        # “跳过”只针对当前阅读版本的成功页；失败页会重新进入 pending。
+        skipped=sorted(existing.intersection(pages));pending=sorted(set(pages)-existing)
+        count('pages.read.reused', len(skipped))
+        if not pending:return {**self.database.reading(document_id),'skipped_pages':skipped}
+        directory=self.storage.root/'readings'/str(document_id)/uuid4().hex
+        directory.mkdir(parents=True)
+        ocr_pages=[];saved=set()
+        def persist(record,method):
+            # 每页先提交数据库，再检查暂停。此时停下也不会丢失刚完成页面。
+            record['method']=method
+            record['status']='failed' if record.get('error_code') else 'succeeded'
+            if record.get('image_path'):
+                record['image_key']=str(Path(record['image_path']).resolve().relative_to(self.storage.root))
+            self.database.save_page(document_id,version,record)
+            count('pages.'+method+'.'+record['status'])
+            saved.add(record['page_number'])
+            if checkpoint:checkpoint('ocr' if method=='ocr' else 'reading',record['page_number'])
+        try:
+            # 文字页也渲染预览图，但不因此自动调用 OCR／视觉模型。
+            with closing(worker_records(self.settings.pdf_python,'pdf_worker',{'mode':'read','source':str(source),'pages':pending,'output_dir':str(directory),'render_scale':self.settings.pdf_render_scale},directory)) as records:
+                for page in records:
+                    if page.get('error_code'):persist(page,'text')
+                    elif force_ocr or page['route']=='ocr':ocr_pages.append(page)
+                    else:persist(page,'text')
+            if ocr_pages:
+                # 一次 worker 调用复用这一批的 Paddle 实例；当前尚非跨批次常驻服务。
+                if checkpoint:checkpoint('ocr',ocr_pages[0]['page_number'])
+                with closing(ocr_records(self.settings,{'models':str(self.settings.ocr_models_dir.resolve()),'pages':ocr_pages},directory)) as records:
+                    for result in records:
+                        if 'payload' in result:result.update(normalize_ocr(result.pop('payload')))
+                        persist(result,'ocr')
+        except ReadingError:
+            # 工作进程失败时，已经保存的页保留，只为剩余页补失败记录。
+            # ProcessingPaused／ProcessingStopped 不在这里捕获，让调度层正确收束状态。
+            for number in set(pending)-saved:persist({'page_number':number,'error_code':'worker_failed'},'ocr' if any(p['page_number']==number for p in ocr_pages) else 'text')
+        return {**self.database.reading(document_id),'skipped_pages':skipped}

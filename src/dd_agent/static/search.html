@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>证据检索</title><link rel="stylesheet" href="/static/styles.css"><script defer src="/static/search.js"></script></head>
+<body><header><div><span class="eyebrow">尽调报告 AGENT · 本地检索</span><h1>查找证据片段</h1><a href="/">返回材料工作区</a></div><span class="local">● 本地模型</span></header>
+<main><section class="card"><form id="search-form"><label for="search-project">尽调项目</label><select id="search-project" required></select><label for="query">想查找什么内容</label><div class="create-row"><input id="query" maxlength="500" required placeholder="例如：公司的注册资本及历次变更"><button id="submit-search" disabled>查找</button><button id="cancel-search" type="button" hidden>取消查询</button></div></form>
+<p class="notice">仅检索已经建立索引的页面。结果是待核实的候选材料，相关分数不表示事实正确率；未命中也不能证明原卷没有该内容。</p>
+<p id="search-state" role="status" aria-live="polite">正在读取项目…</p><p id="search-error" class="error" role="alert"></p><div id="search-results"></div></section></main></body></html>

@@ -1,0 +1,145 @@
+"""Offline Qwen inference in its own Python environment, with no DB credentials."""
+# 由 reading.worker_records() 在 .venv-retrieval 中启动，只接受本地 JSON 清单。
+# mode=profile：模型指纹；embed：一组文字；embed_pages：逐页流式向量；rerank：相关性排序。
+# 模型权重只在本进程内复用，进程退出即释放；本文件不访问 PostgreSQL。
+import hashlib
+from importlib.metadata import version
+import json
+import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from dd_agent.performance import timed, span, count
+
+os.environ['HF_HUB_OFFLINE'] = '1'
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+INSTRUCTION = 'Retrieve evidence passages relevant to the due diligence question.'
+PREFIX = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
+SUFFIX = '<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
+
+
+def emit(value):
+    print(json.dumps(value, ensure_ascii=False), flush=True)
+
+
+@timed('fingerprint.embedding.worker')
+def profile(directory):
+    # 完整读取 Embedding 文件做内容指纹，包含推理规则与关键库版本。
+    # 这比仅看目录名可靠，但每次查询都重算会有较大 I/O 开销，属于 RG-05 优化点。
+    path = Path(directory)
+    files = sorted(p for p in path.rglob('*') if p.is_file() and p.suffix in {'.json', '.safetensors', '.txt'} and '.cache' not in p.parts)
+    if not any(p.suffix == '.safetensors' for p in files):
+        raise ValueError('Local embedding weights missing')
+    digest = hashlib.sha256()
+    digest.update(('qwen-last-token-normalized-fp32-v1|' + INSTRUCTION + '|max4096|' + version('torch') + '|' + version('transformers')).encode())
+    for file in files:
+        digest.update(file.relative_to(path).as_posix().encode())
+        with file.open('rb') as stream:
+            for block in iter(lambda: stream.read(4 * 1024 * 1024), b''):
+                digest.update(block)
+                count('fingerprint.embedding.bytes', len(block))
+    return digest.hexdigest()
+
+
+@timed('model.embedding.load')
+def embedding_model(path):
+    # CPU float32、本地权重、eval；没有训练或云端 Embedding API 调用。
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(path, padding_side='left', local_files_only=True)
+    model = AutoModel.from_pretrained(path, torch_dtype=torch.float32, local_files_only=True).to('cpu').eval()
+    count('model.embedding.loads')
+    return tokenizer, model
+
+
+@timed('embedding.inference')
+def embed(tokenizer, model, texts):
+    # 左填充后每行最后一个位置是真实末 token，取其 hidden state 作为句向量并归一化。
+    # 小批量 4 控制峰值内存；这不是 4 个页面并行 worker。
+    import torch
+    from torch.nn.functional import normalize
+    results = []
+    count('embedding.passages', len(texts))
+    for start in range(0, len(texts), 4):
+        inputs = tokenizer(texts[start:start + 4], padding=True, truncation=False, return_tensors='pt')
+        count('embedding.tokens', int(inputs['attention_mask'].sum()))
+        count('embedding.padded_tokens', int(inputs['input_ids'].numel()))
+        if inputs['input_ids'].shape[1] > 4096:
+            # 不允许默默截掉尾部证据；超预算应由上游分块／错误处理解决。
+            raise ValueError('Passage exceeds token budget; split before embedding')
+        with torch.inference_mode():
+            hidden = model(**inputs, use_cache=False).last_hidden_state[:, -1]
+            results.extend(normalize(hidden, p=2, dim=1).tolist())
+    return results
+
+
+@timed('model.reranker.initialize')
+def reranker_model(path):
+    # 用 Qwen 因果模型比较 yes/no 的相对分数，判断片段与问题的相关程度。
+    # 分数不是字段准确率，也不是法律事实为真的概率；只用于候选排序。
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    with span('model.reranker.load'):
+        tokenizer = AutoTokenizer.from_pretrained(path, padding_side='left', local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float32, local_files_only=True).to('cpu').eval()
+    count('model.reranker.loads')
+    return tokenizer, model
+
+
+@timed('rerank.worker')
+def rerank_loaded(engine, query, texts):
+    import torch
+    tokenizer, model = engine
+    prefix = tokenizer.encode(PREFIX, add_special_tokens=False)
+    suffix = tokenizer.encode(SUFFIX, add_special_tokens=False)
+    yes, no = (tokenizer.convert_tokens_to_ids(word) for word in ('yes', 'no'))
+    results = []
+    # Small batches keep the full-vocabulary causal logits bounded on CPU.
+    for start in range(0, len(texts), 2):
+        # 每对输入带检索任务说明、问题及片段；两条一批限制 CPU 全词表 logits 内存。
+        pairs = [f'<Instruct>: {INSTRUCTION}\n<Query>: {query}\n<Document>: {text}' for text in texts[start:start + 2]]
+        ids = tokenizer(pairs, add_special_tokens=False, truncation=False)['input_ids']
+        if any(len(row) + len(prefix) + len(suffix) > 4096 for row in ids):
+            raise ValueError('Reranking input exceeds token budget')
+        inputs = tokenizer.pad({'input_ids': [prefix + row + suffix for row in ids]}, padding=True, return_tensors='pt')
+        count('rerank.pairs', len(pairs))
+        with torch.inference_mode(), span('rerank.inference'):
+            logits = model(**inputs, logits_to_keep=1, use_cache=False).logits[:, -1]
+            results.extend(logits[:, [no, yes]].softmax(dim=1)[:, 1].tolist())
+    return results
+
+
+def rerank(path, query, texts):
+    return rerank_loaded(reranker_model(path), query, texts)
+
+
+def main():
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+    mode = payload['mode']
+    if mode == 'profile':
+        # 仅计算指纹时不加载完整推理模型，但仍会读取权重文件内容。
+        emit({'version': profile(payload['embedding'])})
+        return
+    import torch
+    torch.set_num_threads(4)
+    if mode == 'rerank':
+        emit({'scores': rerank(payload['reranker'], payload['query'], payload['texts'])})
+    elif mode in {'embed', 'embed_pages'}:
+        tokenizer, model = embedding_model(payload['embedding'])
+        if mode == 'embed':
+            texts = payload['texts']
+            if payload.get('query'):
+                # 查询采用检索指令前缀；资料片段本身不追加这个 Query 前缀。
+                texts = [f'Instruct: {INSTRUCTION}\nQuery:{q}' for q in texts]
+            emit({'vectors': embed(tokenizer, model, texts)})
+        else:
+            # 本批共用同一个 Embedding 实例，一页完成就输出，主进程可马上事务发布。
+            for page in payload['pages']:
+                emit({'page_number': page['page_number'], 'vectors': embed(tokenizer, model, page['texts'])})
+    else:
+        raise ValueError('Unknown retrieval operation')
+
+
+if __name__ == '__main__':
+    main()

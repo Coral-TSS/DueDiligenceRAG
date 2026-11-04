@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dd-report-agent"
+version = "0.1.0"
+description = "Local due diligence document workspace"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "psycopg[binary]>=3.2,<4",
+  "psycopg-pool>=3.3,<4",
+  "python-multipart>=0.0.20,<1", "python-dotenv>=1,<2"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "httpx>=0.28,<1", "httpx2>=2.14,<3"]
+
+[project.scripts]
+dd-agent = "dd_agent.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dd_agent = ["static/*", "migrations/*.sql", "profiles/*.json", "agent_profiles/*.yml"]
+
+[tool.pytest.ini_options]
+testpaths = ["testing/tests"]
+pythonpath = ["src", "testing/tests"]
+addopts = "-ra --basetemp=testing/runs/current/tmp"
+cache_dir = "testing/cache/pytest"

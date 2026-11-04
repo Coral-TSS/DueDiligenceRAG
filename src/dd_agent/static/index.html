@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>尽调材料工作区</title><link rel="stylesheet" href="/static/styles.css"><script defer src="/static/app.js"></script></head>
+<body>
+<header><div><span class="eyebrow">尽调报告 AGENT · 材料与阅读</span><h1>材料工作区</h1><p>从收集原件开始，让每一份材料有迹可循。</p></div><span class="local">● 本机存储</span></header>
+<main>
+<section class="diagnostic" aria-label="环境状态"><div><strong id="health-title">正在检查工作区…</strong><p id="health-message" role="status" aria-live="polite">检查数据库连接和初始化状态。</p></div><button id="retry" class="secondary">重新检查</button></section>
+<div class="layout">
+<aside class="card"><h2>尽调项目</h2><form id="project-form"><label for="project-name">新建项目</label><div class="create-row"><input id="project-name" name="name" maxlength="200" placeholder="例如：某公司并购尽调" required><button id="create-project" type="submit">创建</button></div><p id="project-error" class="error" role="alert"></p></form><nav id="projects" aria-label="项目列表"></nav></aside>
+<section class="card workspace" aria-labelledby="project-title"><div class="section-heading"><div><span class="eyebrow">项目材料</span><h2 id="project-title">选择或创建一个项目</h2></div><span id="document-count" class="muted"></span></div>
+<p class="notice">导入后先登记原件。已读页面建立索引后，可进入<a href="/search">证据检索</a>；报告生成将在后续阶段加入。</p>
+<form id="upload-form"><label for="files">导入材料</label><div class="upload-box"><input id="files" type="file" multiple aria-describedby="upload-help"><button id="upload" type="submit" disabled>导入所选文件</button></div><p id="upload-help" class="muted">可多选；逐个导入，单个失败不会中断其他文件。</p></form>
+<div id="upload-results" role="status" aria-live="polite"></div><p id="list-error" class="error" role="alert"></p>
+<div id="empty" class="empty">先创建项目，再将收集到的材料导入这里。</div>
+<div class="table-scroll"><table id="documents-table" hidden><thead><tr><th>原始文件名</th><th>状态</th><th>大小</th><th>登记时间</th><th>原件</th></tr></thead><tbody id="documents"></tbody></table></div>
+<button id="more-materials" class="secondary" hidden>加载更多材料</button>
+</section></div><footer>材料与 OCR 处理结果保存在本机目录和数据库中，当前不调用云端模型。</footer>
+</main></body></html>

@@ -1,0 +1,63 @@
+.venv*/
+.local/
+.env
+.env.*
+!.env.example
+models/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+testing/runs/
+testing/cache/
+testing/archive/
+testing/records/*
+!testing/records/*.md
+*.egg-info/
+build/
+dist/
+*.log
+/【吉林津升】法律尽调报告-202060702.docx
+/01一-1，一-2工商档案.pdf
+
+# ---- 2026-11-04 git 基线补充 ----
+# IDE / 工具缓存
+.idea/
+**/.idea/
+node_modules/
+**/node_modules/
+.mypy_cache/
+.ruff_cache/
+*.tmp
+# 所有 .env（保留 .env.example）
+**/.env
+**/.env.*
+!**/.env.example
+# 客户材料与办公文档：全树不入库
+*.pdf
+*.PDF
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.xlsm
+*.ppt
+*.pptx
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.bmp
+*.gif
+*.webp
+# 模型权重 / 大型二进制
+*.safetensors
+*.pdiparams
+*.onnx
+*.bin
+*.pt
+*.pth
+# 数据库文件
+*.sqlite
+*.db# 含真实客户字段（企业名称／注册号／住址）的质量参考脚本，仅本地保留
+testing/scripts/quality/annotate_sample.py
