@@ -81,10 +81,20 @@ def load_engine(payload):
             config.text_config.tie_word_embeddings = False
         config.tie_word_embeddings = False
         def factory(attention):
-            return AutoModelForImageTextToText.from_pretrained(path, config=config, dtype=torch_dtype(runtime['dtype']),
-                        attn_implementation=attention, local_files_only=True)
+            # 直接放到目标 GPU，避免先在显存里放一份再 .to() 复制第二份。
+            kwargs=dict(config=config, dtype=torch_dtype(runtime['dtype']), attn_implementation=attention,
+                        local_files_only=True, low_cpu_mem_usage=True)
+            if runtime['device']!='cpu':
+                try:
+                    return AutoModelForImageTextToText.from_pretrained(path, device_map={"": 0}, **kwargs)
+                except Exception:
+                    model=AutoModelForImageTextToText.from_pretrained(path, **kwargs)
+                    return model.to(runtime['device'])
+            return AutoModelForImageTextToText.from_pretrained(path, **kwargs).to('cpu')
         model, attention = load_with_attention(factory, runtime['attention'], 'vision')
-        model = model.to(runtime['device']).eval()
+        model.eval()
+        if runtime['device']!='cpu' and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         runtime = dict(runtime, attention=attention)
     count('model.vision.loads')
     return processor, model, digest.hexdigest(), runtime
@@ -103,6 +113,11 @@ def recognize(payload, engine=None):
             raise ValueError('Image exceeds local pixel budget')
         picture, box = crop_region(source.convert('RGB'), payload['bounds'])
         image_size = list(source.size)
+        # 大图会让视觉编码器的激活把 8GB 卡顶满。区域文字在长边 1280 以内已经可读。
+        long_side=max(picture.size)
+        if long_side>1280:
+            scale=1280/long_side
+            picture=picture.resize((max(1, round(picture.width*scale)), max(1, round(picture.height*scale))))
     data = io.BytesIO(); picture.save(data, format='PNG')
     messages = [{'role':'user', 'content':[{'type':'image','image':picture}, {'type':'text','text':'OCR:'}]}]
     # 提示仅要求 OCR，不附带基础 OCR 猜测或旧报告答案，减少答案反向污染识别。
@@ -113,7 +128,10 @@ def recognize(payload, engine=None):
     # 检查点默认 use_cache=False。打开后文本与关闭时逐字节一致，CPU 约 55 秒降到约 4 秒，GPU 约 6 秒降到约 1 秒。
     with torch.inference_mode(), span('vision.inference', page=page, region=region):
         output = model.generate(**inputs, max_new_tokens=payload['max_new_tokens'], do_sample=False, use_cache=True)
-    tokens = output[0, inputs['input_ids'].shape[-1]:]
+    tokens = output[0, inputs['input_ids'].shape[-1]:].detach()
+    del output, inputs, picture
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     # 只解码生成部分；达到长度上限且未遇结束 token 时，明确报告 truncated。
     # 主进程会把截断候选当作不完整结果，而不是把缺尾的识别文字直接采用。
     eos = model.generation_config.eos_token_id
@@ -126,5 +144,10 @@ def recognize(payload, engine=None):
 
 
 if __name__ == '__main__':
+    from dd_agent.devices import release_accelerators
     config = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-    print(json.dumps(recognize(config), ensure_ascii=False), flush=True)
+    try:
+        print(json.dumps(recognize(config), ensure_ascii=False), flush=True)
+    finally:
+        # 一次性进程必须先交还显存再退出，否则下一个常驻进程会和它叠在一起。
+        release_accelerators()

@@ -125,12 +125,11 @@ def regions_for(page, route, path, limit, low_score=0.85):
                  min(1,(max(p[0] for p in points)+12)/width),min(1,(max(p[1] for p in points)+12)/height)]
             if box[0]>=box[2] or box[1]>=box[3]:raise ValueError()
             regions.append(dict(bounds=box,start=offsets[first][0],end=offsets[last][1],priority=priority))
-        # 预算留给优先级更高的窗口；其余仍显式标未知，不能假装已经覆盖。
+        # 预算留给优先级更高的窗口。没选中的区域保留基础 OCR，不能标成未知。
         chosen=set(sorted(range(len(regions)),key=lambda i:(regions[i]['priority'],i))[:limit])
         for i,region in enumerate(regions):
             region['over_budget']=i not in chosen
             region.pop('priority',None)
-        # 超预算区域仍返回给下游标未知，不能因“没调用模型”就声称已处理完整。
         return regions
     except (ValueError,KeyError,TypeError,struct.error):
         return [dict(bounds=[0.,0.,1.,1.],start=0,end=len(text))]
@@ -138,6 +137,22 @@ def regions_for(page, route, path, limit, low_score=0.85):
 
 def numbers(text):
     return [Decimal(value.replace(',','')) for value in re.findall(r'\d+(?:,\d{3})*(?:\.\d+)?', text)]
+
+
+def summarize_regions(text, regions):
+    """只改实际看过的区域。没送进模型的区域保留 OCR，也不把整页算成不确定。"""
+    examined=[region for region in regions if region.get('decision')!='not_run']
+    for region in sorted(examined, key=lambda item: item['start'], reverse=True):
+        text=text[:region['start']]+region['text']+text[region['end']:]
+    if any(region['decision']=='unknown' for region in examined):
+        outcome='uncertain'
+    elif any(region['decision']=='enhanced' for region in examined):
+        outcome='enhanced'
+    elif examined:
+        outcome='checked'
+    else:
+        outcome='base'
+    return text, outcome
 
 
 def mask_unknown(text):
@@ -283,14 +298,17 @@ class AutomaticProcessor:
                     count('vision.timeout_budget_skips')
                 if checkpoint:checkpoint('vision_saved',number)
                 # 先保存候选，再检查暂停；即使整页机器结果还没形成，候选也不会白跑。
-                choice=choose_region(page['text'][region['start']:region['end']],candidate)
-                if region_timed_out:
-                    choice=dict(choice,reason='视觉超时或超时预算已用尽，区域标为未知',timed_out=True)
+                if region.get('over_budget'):
+                    choice=dict(decision='not_run', text=page['text'][region['start']:region['end']],
+                                reason='超出每页区域预算，保留基础 OCR')
+                else:
+                    choice=choose_region(page['text'][region['start']:region['end']],candidate)
+                    if region_timed_out:
+                        choice=dict(choice,reason='视觉超时或超时预算已用尽，区域标为未知',timed_out=True)
                 regions.append({**region,**choice,'candidate':candidate})
-            for region in sorted(regions,key=lambda r:r['start'],reverse=True):
-                # 从后向前替换，避免前一区域长度变化使后续 start/end 偏移失效。
-                text=text[:region['start']]+region['text']+text[region['end']:]
-        outcome='uncertain' if any(r['decision']=='unknown' for r in regions) else 'enhanced' if any(r['decision']=='enhanced' for r in regions) else 'checked' if regions else 'base'
+            text,outcome=summarize_regions(text, regions)
+        else:
+            outcome='base'
         count('pages.automatic.'+outcome)
         output=dict(text=text,route=route,regions=regions,outcome=outcome,stop_retry=timed_out,
                     verification={'uncertain':'machine_uncertain','enhanced':'machine_enhanced','checked':'machine_checked','base':'unverified'}[outcome])

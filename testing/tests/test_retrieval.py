@@ -183,7 +183,7 @@ def test_real_offline_qwen_pgvector_roundtrip(tmp_path, database_url):
     from dd_agent.performance import capture
     from dd_agent.model_runtime import close_runtime
     if os.getenv('DDA_TEST_LOCAL_MODELS') != '1':
-        pytest.skip('Set DDA_TEST_LOCAL_MODELS=1 for local CPU model integration')
+        pytest.skip('Set DDA_TEST_LOCAL_MODELS=1 for local model integration')
     _, p, d, service, _ = setup(tmp_path, database_url)
     service.models = retrieval().LocalModels(service.settings)
     try:

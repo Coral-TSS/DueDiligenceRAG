@@ -150,23 +150,28 @@ def test_process_pages_order_indexes_before_vision_then_refreshes():
 
     class Reader:
         def read(self, *args, **kwargs):
-            order.append('reading')
+            order.append(('reading', list(args[2])))
             return {}
 
     class Automatic:
         def process(self, *args, **kwargs):
-            order.append('vision')
-            return {'failed_pages': []}
+            order.append(('vision', list(args[2])))
+            return {'processed_pages': list(args[2]), 'skipped_pages': [], 'failed_pages': []}
 
     class Evidence:
         def index(self, *args, **kwargs):
-            order.append('embedding')
-            return {'failed_pages': []}
+            order.append(('embedding', list(args[2])))
+            return {'indexed_pages': list(args[2]), 'skipped_pages': [], 'failed_pages': []}
 
     pipeline = ProcessingPipeline(Settings(), reader=Reader(), automatic=Automatic(),
                                   evidence=Evidence(), database=SimpleNamespace())
     pipeline.run('project', 'document', [1, 2])
-    assert order == ['reading', 'embedding', 'vision', 'embedding']
+    assert [item[0] for item in order] == ['reading', 'embedding', 'vision', 'embedding']
+    order.clear()
+    wide = list(range(1, 25))
+    pipeline.run('project', 'document', wide)
+    assert [item[0] for item in order] == ['reading', 'reading', 'embedding', 'embedding', 'vision', 'vision', 'embedding', 'embedding']
+    assert order[0][1] == list(range(1, 21)) and order[1][1] == list(range(21, 25))
 
 
 def _scheduler():
@@ -200,6 +205,27 @@ def test_vision_waits_until_ocr_and_embedding_settle():
     assert not scheduler._deferred_settled()
     scheduler.states['embedding'][1] = 'succeeded'
     assert scheduler._deferred_settled()
+
+
+def test_unexamined_regions_keep_ocr_and_do_not_mark_the_page_uncertain():
+    from dd_agent.automatic import UNKNOWN, summarize_regions
+    text, outcome = summarize_regions('注册资本2000万元\n普通说明', [
+        dict(start=0, end=10, decision='checked', text='注册资本2000万元'),
+        dict(start=11, end=15, decision='not_run', text='普通说明'),
+    ])
+    assert outcome == 'checked'
+    assert UNKNOWN not in text and '普通说明' in text
+    masked, uncertain = summarize_regions('注册资本2000万元', [
+        dict(start=0, end=10, decision='unknown', text=UNKNOWN),
+    ])
+    assert uncertain == 'uncertain' and masked == UNKNOWN
+
+
+def test_process_pages_can_name_a_whole_document():
+    from dd_agent.reading import parse_pages
+    assert parse_pages('1-300', total=300, limit=300) == list(range(1, 301))
+    with pytest.raises(ValueError):
+        parse_pages('1-21', total=30)
 
 
 def test_embedding_profile_passes_device_once(tmp_path, monkeypatch):

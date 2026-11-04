@@ -102,7 +102,7 @@ Paddle 也可以改用 cu129 索引：`https://www.paddlepaddle.org.cn/packages/
 
 ## 6. 十页计时
 
-登记材料后，在工程根目录：
+登记材料后，在工程根目录。整份材料可以一次跑完，例如 `--pages 1-300`：先完成全部 OCR，再全部嵌入，再全部视觉，最后再嵌入一次。网页“自动处理”对整卷用同一顺序。`python -m dd_agent search` 每次新开进程并重新加载模型；长期开着的服务在空闲约 30 秒内复用已加载的模型。
 
 ```powershell
 .\.venv-dev\Scripts\python.exe -m dd_agent process-pages --project-id <项目ID> --document-id <材料ID> --pages 1-10

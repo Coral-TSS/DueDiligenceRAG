@@ -163,7 +163,8 @@ class ModelRuntime:
             log=(self.directory/'model-runtime.log').open('ab')
             env={k:v for k,v in os.environ.items() if k.upper() in {'SYSTEMROOT','WINDIR','PATH','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC'}}
             env.update(PYTHONUTF8='1',PYTHONIOENCODING='utf-8',HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',
-                PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True',PADDLE_PDX_CACHE_HOME=str(self.directory/'cache'),DDA_WORKER_METRICS='0')
+                PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True',PADDLE_PDX_CACHE_HOME=str(self.directory/'cache'),DDA_WORKER_METRICS='0',
+                PYTORCH_CUDA_ALLOC_CONF=os.environ.get('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True'))
             nonce=uuid4().hex
             process=subprocess.Popen([str(spec.python),str(spec.script),'--serve',nonce],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=log,env=env)
             r=dict(process=process,owner=None,queue=Queue(8),stop=Event(),lease=lease,log=log,

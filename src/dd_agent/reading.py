@@ -35,18 +35,20 @@ class ReadingError(Exception):
     pass
 
 
-def parse_pages(value,total):
-    # CLI 可传 1-5,8；限制小批页数，避免一次调用直接把整个卷宗放入推理内存。
+def parse_pages(value,total,limit=20):
+    # 阅读／索引的单次调用仍最多 20 页。process-pages 传入材料总页数，由流水线按阶段拆开。
+    if type(limit) is not int or limit<1:
+        raise ValueError('页数上限无效。')
     pages=set()
     for item in value.split(','):
         if not re.fullmatch(r'\d+(?:-\d+)?',item.strip()):
-            raise ValueError('页码格式须为 1-5,8；单批最多 20 页。')
+            raise ValueError('页码格式须为 1-5,8。')
         parts=[int(x) for x in item.strip().split('-')]
         first,last=parts[0],parts[-1]
-        if first<1 or last<first or last>total or last-first>=20:
-            raise ValueError('页码超出范围，或单批超过 20 页。')
+        if first<1 or last<first or last>total or last-first>=limit:
+            raise ValueError('页码超出范围，或超过本次页数上限。')
         pages.update(range(first,last+1))
-        if len(pages)>20:raise ValueError('单批最多 20 页。')
+        if len(pages)>limit:raise ValueError('超过本次页数上限。')
     return sorted(pages)
 
 
@@ -76,7 +78,8 @@ def worker_records(python,worker,manifest,directory,timeout_seconds=1200):
     manifest_path.write_text(json.dumps(manifest,ensure_ascii=False),encoding='utf-8')
     # 只传必要系统变量，不把主应用的数据库连接或模型服务凭据放进 worker 环境。
     env={key:value for key,value in os.environ.items() if key.upper() in {'SYSTEMROOT','WINDIR','PATH','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC'}}
-    env.update(PYTHONUTF8='1',PYTHONIOENCODING='utf-8',HF_HUB_OFFLINE='1',PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True',PADDLE_PDX_CACHE_HOME=str(directory/'cache'))
+    env.update(PYTHONUTF8='1',PYTHONIOENCODING='utf-8',HF_HUB_OFFLINE='1',PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True',PADDLE_PDX_CACHE_HOME=str(directory/'cache'),
+        PYTORCH_CUDA_ALLOC_CONF=os.environ.get('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True'))
     if active(): env['DDA_WORKER_METRICS'] = '1'
     script=Path(__file__).parent/'workers'/(worker+'.py')
     with (directory/(worker+'.log')).open('a',encoding='utf-8') as log:

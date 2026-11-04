@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--file', type=Path, help='本地原件绝对路径')
     parser.add_argument('--project-id', type=UUID)
     parser.add_argument('--document-id', type=UUID)
-    parser.add_argument('--pages', default='1-3', help='单批最多 20 页，例如 1-5,8')
+    parser.add_argument('--pages', default='1-3', help='例如 1-10 或 1-300；process-pages 可覆盖整份材料')
     parser.add_argument('--force-ocr', action='store_true', help='忽略已有文字层，使用本地 OCR；使用独立阅读版本')
     parser.add_argument('--query', help='项目内查询，最多 500 字')
     args = parser.parse_args()
@@ -63,7 +63,7 @@ def dispatch(args, parser, settings, database):
             doc=database.document(args.project_id,args.document_id)
             if doc is None:raise ReadingError('材料不存在或不属于当前项目。')
             total=PdfWorker(settings).inspect(Storage(settings.data_dir,settings.max_upload_bytes).path(doc['storage_key']))['page_count']
-            result=ProcessingPipeline(settings, database=database).run(args.project_id,args.document_id,parse_pages(args.pages,total))
+            result=ProcessingPipeline(settings, database=database).run(args.project_id,args.document_id,parse_pages(args.pages,total,limit=total))
             print(json.dumps(result,ensure_ascii=False,default=str))
             return 1 if result['automatic']['failed_pages'] or result['index']['failed_pages'] else 0
         except (ReadingError,ReviewError,RetrievalError,ValueError) as exc:

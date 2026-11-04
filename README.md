@@ -47,7 +47,9 @@
 .\.venv-dev\Scripts\python.exe -m dd_agent search --project-id <项目ID> --query '注册资本及历次变更'
 ```
 
-`process-pages` 按顺序完成基础阅读、自动增强和索引，每批最多 20 页。低层诊断命令 `inspect-pdf`、`import-file`、`read-pages`、`index-pages` 仍保留；它们单独运行时不等于完成整个自动链路。`read-pages --force-ocr` 使用独立版本，用于开发诊断。
+`process-pages` 可以一次指定整份材料，例如 `--pages 1-300`。它按阶段跑完：全部 OCR，再全部嵌入，再全部视觉，最后再嵌入一次。同一阶段只加载一次模型。网页上的“自动处理”走后台任务，同样按这个阶段顺序处理整卷，不需要拆成多次命令。`read-pages` 和 `index-pages` 仍是单批最多 20 页的诊断命令。`read-pages --force-ocr` 使用独立版本，用于开发诊断。
+
+直接运行的 `search` 每次都是新进程，会重新加载向量和重排序模型，所以冷查询大约要十几秒。用 `python -m dd_agent` 启动的服务会把模型留在进程里，空闲约 30 秒后才释放，连续查询不用每次重载。
 
 ## 父子混合查询
 
