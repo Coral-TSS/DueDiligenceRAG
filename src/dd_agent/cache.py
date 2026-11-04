@@ -218,3 +218,48 @@ def venv_runtime_descriptor(python, packages=('torch', 'transformers', 'tokenize
     except OSError:
         marker = 'nocfg'
     return '|'.join(names) + '#' + marker
+
+
+def verified_content_digest(prefix, labeled_files, directory=None, kind='weights'):
+    """完整内容哈希。size 与 mtime 都未变时复用已核对的哈希，不再重读权重。
+
+    labeled_files 是 (写入摘要的标签字节, 路径)，顺序必须与原先逐文件哈希一致。
+    首次仍读完全部字节；之后只有大小或修改时间变化才重算。没有目录时每次都重算。
+    """
+    stats = []
+    for label, path in labeled_files:
+        target = Path(path)
+        try:
+            stat = target.stat()
+        except OSError:
+            stats.append({'label': label.decode('utf-8', 'surrogateescape'), 'missing': True})
+            continue
+        stats.append({'label': label.decode('utf-8', 'surrogateescape'),
+                      'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns})
+    identity = {'prefix': prefix.decode('utf-8', 'surrogateescape'), 'files': stats}
+
+    def compute():
+        digest = hashlib.sha256()
+        digest.update(prefix)
+        for label, path in labeled_files:
+            digest.update(label)
+            with Path(path).open('rb') as stream:
+                for block in iter(lambda: stream.read(4 * 1024 * 1024), b''):
+                    digest.update(block)
+                    count('fingerprint.' + kind + '.bytes', len(block))
+        return digest.hexdigest()
+
+    if directory is None:
+        return compute()
+    key = _key(identity)
+    path = Path(directory) / 'weight-manifests' / kind / (key[:32] + '.json')
+    try:
+        stored = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        stored = None
+    if isinstance(stored, dict) and stored.get('key') == key and isinstance(stored.get('digest'), str) and len(stored['digest']) == 64:
+        count('fingerprint.' + kind + '.manifest_hit')
+        return stored['digest']
+    value = compute()
+    _write(path, {'key': key, 'digest': value})
+    return value

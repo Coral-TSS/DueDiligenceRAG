@@ -7,10 +7,11 @@ import hashlib
 import math
 import os
 from pathlib import Path
+from queue import Queue
 import re
 import subprocess
 import tempfile
-from threading import Timer
+from threading import Lock, Thread, Timer
 from uuid import UUID, uuid4
 
 from .cache import cache_directory, file_entries, inspect_document, resolve_fingerprint
@@ -19,7 +20,8 @@ from .db import Database
 from .storage import Storage
 from .performance import active, accept_worker, worker_process, span, timed, observed, count
 from .model_admission import current_control
-from .control import ProcessingDeferred
+from .control import ProcessingDeferred, ProcessingPaused, ProcessingStopped
+from .maintenance import rotate_log
 
 
 # 字符串里的 cpu 是历史算法编号，不是运行设备。GPU 与 CPU 的 OCR 文本已核对为一致，
@@ -82,7 +84,9 @@ def worker_records(python,worker,manifest,directory,timeout_seconds=1200):
         PYTORCH_CUDA_ALLOC_CONF=os.environ.get('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True'))
     if active(): env['DDA_WORKER_METRICS'] = '1'
     script=Path(__file__).parent/'workers'/(worker+'.py')
-    with (directory/(worker+'.log')).open('a',encoding='utf-8') as log:
+    log_path=directory/(worker+'.log')
+    rotate_log(log_path)
+    with log_path.open('a',encoding='utf-8') as log:
         process=subprocess.Popen([str(python),str(script),str(manifest_path)],stdout=subprocess.PIPE,stderr=log,text=True,encoding='utf-8',env=env)
         count('worker.'+worker+'.starts')
         timer=Timer(timeout_seconds,process.kill);timer.daemon=True;timer.start()
@@ -114,14 +118,18 @@ def ocr_records(settings,manifest,directory):
             if manifest.get('pages') and any(not (settings.ocr_models_dir/name/'inference.pdiparams').is_file() for name in OCR_MODEL_NAMES):
                 for page in manifest['pages']:yield dict(page_number=page['page_number'],error_code='ocr_models_missing')
                 return
-            if manifest.get('pages'):
-                for page in manifest['pages']:
-                    # Release admission before SQL save/checkpoint, then let a
-                    # waiting query run before requesting the next OCR page.
-                    number = page.get('page_number') if type(page.get('page_number')) is int else None
+            pages=list(manifest.get('pages') or [])
+            batch=max(1, int(getattr(settings, 'ocr_page_batch', 1) or 1))
+            payload=dict(manifest, rec_batch=settings.ocr_rec_batch, page_batch=batch)
+            if pages:
+                for start in range(0, len(pages), batch):
+                    group=pages[start:start+batch]
+                    # 一批推理结束后再把结果交给保存，避免发布事务占着模型许可。
+                    number = group[0].get('page_number') if type(group[0].get('page_number')) is int else None
                     with span('page.ocr', page=number):
-                        yield from list(runtime_records(settings,'ocr','recognize',dict(manifest,pages=[page])))
-            else:yield from runtime_records(settings,'ocr','recognize',manifest)
+                        ready=list(runtime_records(settings,'ocr','recognize',dict(payload,pages=group)))
+                    yield from ready
+            else:yield from runtime_records(settings,'ocr','recognize',payload)
         else:
             with model_slot(settings.data_dir):
                 yield from worker_records(settings.ocr_python,'ocr_worker',manifest,directory)
@@ -176,6 +184,22 @@ def ocr_fingerprint(settings,verify=False):
         entries, compute, verify=verify, directory=cache_directory(settings))['value']
 
 
+def render_plan(numbers, routes, exists, force_ocr):
+    """OCR 页已有稳定渲染图时不再重画。文字层页仍要渲染，除非强制 OCR 且图已在。"""
+    reuse, render = [], []
+    for number in numbers:
+        if exists(number) and (force_ocr or routes.get(number) == 'ocr'):
+            reuse.append(number)
+        else:
+            render.append(number)
+    return reuse, render
+
+
+def stable_render_path(root, document_id, number, scale, sha256):
+    stamp = (sha256 or 'nosha')[:12]
+    return Path(root) / 'readings' / str(document_id) / 'rendered' / f'page-{number}-x{scale:g}-{stamp}.png'
+
+
 class Reader:
     # read() 写 document_pages（基础结果），不负责决定增强文字是否可信。
     def __init__(self,settings,database=None):
@@ -212,37 +236,84 @@ class Reader:
         if not pending:return {**self.database.reading(document_id),'skipped_pages':skipped}
         directory=self.storage.root/'readings'/str(document_id)/uuid4().hex
         directory.mkdir(parents=True)
-        ocr_pages=[];saved=set()
+        saved=set(); persist_lock=Lock()
         def persist(record,method):
-            # 每页先提交数据库，再检查暂停。此时停下也不会丢失刚完成页面。
-            record['method']=method
-            record['status']='failed' if record.get('error_code') else 'succeeded'
-            if record.get('image_path'):
-                record['image_key']=str(Path(record['image_path']).resolve().relative_to(self.storage.root))
-            self.database.save_page(document_id,version,record)
-            count('pages.'+method+'.'+record['status'])
-            saved.add(record['page_number'])
-            if checkpoint:checkpoint('ocr' if method=='ocr' else 'reading',record['page_number'])
-        try:
-            # 文字页也渲染预览图，但不因此自动调用 OCR／视觉模型。
-            with closing(worker_records(self.settings.pdf_python,'pdf_worker',{'mode':'read','source':str(source),'pages':pending,'output_dir':str(directory),'render_scale':self.settings.pdf_render_scale},directory)) as records:
-                for page in records:
-                    if page.get('error_code'):persist(page,'text')
-                    elif force_ocr or page['route']=='ocr':ocr_pages.append(page)
-                    else:persist(page,'text')
-            if ocr_pages:
-                # 一次 worker 调用复用这一批的 Paddle 实例；当前尚非跨批次常驻服务。
-                if checkpoint:checkpoint('ocr',ocr_pages[0]['page_number'])
+            # 渲染线程和 OCR 线程都会保存。先提交数据库，再检查暂停。
+            with persist_lock:
+                record['method']=method
+                record['status']='failed' if record.get('error_code') else 'succeeded'
+                if record.get('image_path'):
+                    record['image_key']=str(Path(record['image_path']).resolve().relative_to(self.storage.root))
+                self.database.save_page(document_id,version,record)
+                count('pages.'+method+'.'+record['status'])
+                saved.add(record['page_number'])
+                if checkpoint:checkpoint('ocr' if method=='ocr' else 'reading',record['page_number'])
+        routes={item['page_number']:item.get('route') for item in profile.get('pages') or [] if isinstance(item, dict)}
+        scale=self.settings.pdf_render_scale
+        stamp=document.get('sha256')
+        def image_for(number):
+            return stable_render_path(self.storage.root, document_id, number, scale, stamp)
+        reuse, render = render_plan(pending, routes, lambda number: image_for(number).is_file() and image_for(number).stat().st_size>0, force_ocr)
+        failure=[]; control=[]
+        batch_limit=max(1, self.settings.ocr_page_batch)
+        incoming=Queue()
+        enqueued=set(reuse)
+        def consume():
+            group=[]
+            def flush():
+                if not group:return
+                pages=list(group); group.clear()
+                if checkpoint:checkpoint('ocr', pages[0]['page_number'])
                 with closing(ocr_records(self.settings,{
-                        'models':str(self.settings.ocr_models_dir.resolve()),'pages':ocr_pages,
-                        'device':self.settings.ocr_device,
+                        'models':str(self.settings.ocr_models_dir.resolve()),'pages':pages,
+                        'device':self.settings.ocr_device,'rec_batch':self.settings.ocr_rec_batch,
+                        'page_batch':self.settings.ocr_page_batch,
                         'threads':self.settings.ocr_cpu_threads or self.settings.model_cpu_threads,
                         'enable_mkldnn':self.settings.ocr_enable_mkldnn},directory)) as records:
                     for result in records:
                         if 'payload' in result:result.update(normalize_ocr(result.pop('payload')))
                         persist(result,'ocr')
+            try:
+                while True:
+                    item=incoming.get()
+                    if item is None:
+                        flush();return
+                    group.append(item)
+                    if len(group)>=batch_limit:flush()
+            except (ProcessingPaused, ProcessingStopped) as exc:
+                control.append(exc)
+            except Exception as exc:
+                failure.append(exc)
+        worker=Thread(target=consume, name='ocr-pipeline', daemon=True)
+        worker.start()
+        try:
+            for number in reuse:
+                count('pdf.render.reused')
+                incoming.put({'page_number':number,'route':'ocr','text':'','image_path':str(image_for(number))})
+            if render:
+                pattern='page-{number}-x'+f'{scale:g}-'+(stamp or 'nosha')[:12]+'.png'
+                rendered=image_for(render[0]).parent
+                with closing(worker_records(self.settings.pdf_python,'pdf_worker',{
+                        'mode':'read','source':str(source),'pages':render,'output_dir':str(rendered),
+                        'render_scale':scale,'image_pattern':pattern},directory)) as records:
+                    for page in records:
+                        if page.get('error_code'):persist(page,'text')
+                        elif force_ocr or page.get('route')=='ocr':
+                            enqueued.add(page['page_number']); incoming.put(page)
+                        else:persist(page,'text')
+            incoming.put(None)
+            worker.join()
+            if control:raise control[0]
+            if failure:raise ReadingError('PDF／OCR 工作进程失败，请检查本地处理日志。')
         except ReadingError:
+            if worker.is_alive():
+                incoming.put(None); worker.join()
             # 工作进程失败时，已经保存的页保留，只为剩余页补失败记录。
             # ProcessingPaused／ProcessingStopped 不在这里捕获，让调度层正确收束状态。
-            for number in set(pending)-saved:persist({'page_number':number,'error_code':'worker_failed'},'ocr' if any(p['page_number']==number for p in ocr_pages) else 'text')
+            for number in set(pending)-saved:
+                persist({'page_number':number,'error_code':'worker_failed'},'ocr' if number in enqueued else 'text')
+        finally:
+            if worker.is_alive():
+                incoming.put(None)
+                worker.join()
         return {**self.database.reading(document_id),'skipped_pages':skipped}

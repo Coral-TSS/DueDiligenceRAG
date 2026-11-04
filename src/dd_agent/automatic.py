@@ -52,7 +52,14 @@ def keyword_hits(text):
     return {name: words for name, words in hits.items() if words}
 
 
-def line_priority(line, page_important, low_score):
+def _score_allows(score, ceiling):
+    # 没有分数时沿用旧规则：只要行本身符合条件就选。有分数时不超过配置上限才选。
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+        return True
+    return float(score) <= ceiling
+
+
+def line_priority(line, page_important, low_score, *, value_lines=True, value_max_score=1.0, keyword_max_score=1.0):
     """0 表示不调用视觉。1 低置信，2 行内既有线索又有数字，3 本页有线索时的数字／日期／金额行。"""
     text = alias_text(str(line.get('text') or ''))
     if not text:
@@ -63,25 +70,36 @@ def line_priority(line, page_important, low_score):
     if low:
         return 1
     # 同一行里既有画像线索又有数字，例如“注册资本2000万元”。
-    if keyword and re.search(r'\d', text):
+    if keyword and re.search(r'\d', text) and _score_allows(score, keyword_max_score):
         return 2
-    # 线索在邻行时，本行仍可能是日期或金额。
-    if page_important and _VALUE.search(text):
+    # 线索在邻行时，本行仍可能是日期或金额。关闭金额行后不再单凭日期／金额入选。
+    if value_lines and page_important and _VALUE.search(text) and _score_allows(score, value_max_score):
         return 3
     return 0
 
 
-def route_page(page, filename='', low_score=0.85):
+def _policy_from(settings=None, **policy):
+    if settings is not None:
+        policy.setdefault('value_lines', settings.vision_value_lines)
+        policy.setdefault('value_max_score', settings.vision_value_max_score)
+        policy.setdefault('keyword_max_score', settings.vision_keyword_max_score)
+    return dict(value_lines=policy.get('value_lines', True),
+                value_max_score=policy.get('value_max_score', 1.0),
+                keyword_max_score=policy.get('keyword_max_score', 1.0))
+
+
+def route_page(page, filename='', low_score=0.85, *, value_lines=True, value_max_score=1.0, keyword_max_score=1.0):
     # 关键词仍用于分类；视觉只打在低置信行，或带数字／日期／金额的关键行。
     # 不再因为整页出现一个词就把全页送进视觉模型。文字过少时仍保留一页兜底。
     text = alias_text(page.get('text', ''))
     hits = keyword_hits(text)
     poor = not text or '\ufffd' in text or (len(text) < 8 and any(t in filename for t in PROFILE['material_hints']))
     lines = page.get('lines') or []
+    policy = _policy_from(value_lines=value_lines, value_max_score=value_max_score, keyword_max_score=keyword_max_score)
     if lines:
-        triggered = any(line_priority(line, bool(hits), low_score) for line in lines)
+        triggered = any(line_priority(line, bool(hits), low_score, **policy) for line in lines)
     else:
-        triggered = bool(hits) and (bool(re.search(r'\d', text)) or bool(_VALUE.search(text)))
+        triggered = bool(hits) and (bool(re.search(r'\d', text)) or (value_lines and bool(_VALUE.search(text))))
     important = bool(hits)
     return dict(important=important, needs_vision=page.get('method') == 'ocr' and (poor or triggered),
                 classification='important' if important else 'uncertain' if poor else 'ordinary',
@@ -89,12 +107,39 @@ def route_page(page, filename='', low_score=0.85):
                 profile=PROFILE['version'])
 
 
-def regions_for(page, route, path, limit, low_score=0.85):
+REASONS = {1: 'low', 2: 'keyword_digit', 3: 'value'}
+
+
+def selection_report(triggered, regions):
+    """页是否触发、实际送入模型的区域，以及入选原因。不包含正文。"""
+    reasons = {}
+    selected = not_selected = 0
+    for region in regions:
+        if region.get('over_budget'):
+            not_selected += 1
+            continue
+        selected += 1
+        reason = region.get('select_reason') or 'poor'
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return dict(triggered=bool(triggered), selected=selected, not_selected=not_selected, reasons=reasons)
+
+
+def _mark_region(region, reason, tokens):
+    region['select_reason'] = reason
+    if tokens and tokens.get(reason):
+        region['max_new_tokens'] = int(tokens[reason])
+    return region
+
+
+def regions_for(page, route, path, limit, low_score=0.85, *, value_lines=True, value_max_score=1.0, keyword_max_score=1.0, tokens=None):
     # 将重要行与其前后行合成上下文窗口，使用 OCR 行框换算 0–1 归一化裁剪坐标。
     # start/end 是在基础页 text 中的切片位置，和图片坐标属于两套定位，需要同时保留。
     text=page['text']; lines=page.get('lines',[])
+    policy=_policy_from(value_lines=value_lines, value_max_score=value_max_score, keyword_max_score=keyword_max_score)
+    def whole(reason='poor'):
+        return [_mark_region(dict(bounds=[0.,0.,1.,1.],start=0,end=len(text),over_budget=False), reason, tokens)]
     if not lines or not path.is_file():
-        return [dict(bounds=[0.,0.,1.,1.],start=0,end=len(text))]
+        return whole()
     try:
         with path.open('rb') as stream:
             header=stream.read(24)
@@ -105,12 +150,13 @@ def regions_for(page, route, path, limit, low_score=0.85):
             start=text.find(line['text'],cursor)
             if start<0:raise ValueError()
             offsets.append((start,start+len(line['text'])));cursor=start+len(line['text'])
-        priorities=[(i,line_priority(line,route.get('classification')=='important' or route.get('important'),low_score)) for i,line in enumerate(lines)]
+        important=route.get('classification')=='important' or route.get('important')
+        priorities=[(i,line_priority(line, important, low_score, **policy)) for i,line in enumerate(lines)]
         anchors=[(i,priority) for i,priority in priorities if priority]
         # 没有低置信或数字关键行时，只有文字不足的页才退回整页。
         if not anchors:
             if route.get('classification')=='uncertain':
-                return [dict(bounds=[0.,0.,1.,1.],start=0,end=len(text))]
+                return whole()
             return []
         windows=[]
         for i,priority in anchors:
@@ -128,11 +174,12 @@ def regions_for(page, route, path, limit, low_score=0.85):
         # 预算留给优先级更高的窗口。没选中的区域保留基础 OCR，不能标成未知。
         chosen=set(sorted(range(len(regions)),key=lambda i:(regions[i]['priority'],i))[:limit])
         for i,region in enumerate(regions):
+            priority=region.pop('priority')
             region['over_budget']=i not in chosen
-            region.pop('priority',None)
+            _mark_region(region, REASONS[priority], tokens)
         return regions
     except (ValueError,KeyError,TypeError,struct.error):
-        return [dict(bounds=[0.,0.,1.,1.],start=0,end=len(text))]
+        return whole()
 
 
 def numbers(text):
@@ -219,9 +266,14 @@ class AutomaticProcessor:
     @timed('fingerprint.automatic')
     def version(self):
         # 增强策略版本同时绑定画像、选择规则、视觉模型、区域预算、低置信阈值和生成长度。
-        selector='|'.join((SELECTION_VERSION, f'regions={self.settings.vision_regions_per_page}',
-                           f'low={self.settings.vision_low_score:.4f}', f'tokens={self.settings.vision_max_new_tokens}',
-                           f'budget={self.settings.vision_timeout_budget}'))
+        settings=self.settings
+        selector='|'.join((SELECTION_VERSION, f'regions={settings.vision_regions_per_page}',
+                           f'low={settings.vision_low_score:.4f}', f'tokens={settings.vision_max_new_tokens}',
+                           f'tokens_low={settings.vision_tokens_low}', f'tokens_value={settings.vision_tokens_value}',
+                           f'value_lines={int(settings.vision_value_lines)}',
+                           f'value_max={settings.vision_value_max_score:.4f}',
+                           f'keyword_max={settings.vision_keyword_max_score:.4f}',
+                           f'budget={settings.vision_timeout_budget}'))
         return hashlib.sha256((json.dumps(PROFILE,sort_keys=True)+selector+self.vision.profile()).encode()).hexdigest()
 
     def state(self,project_id,document_id,number):
@@ -266,41 +318,58 @@ class AutomaticProcessor:
                 except ReviewConflict:result['failed_pages'].append(number)
                 else:result['processed_pages'].append(number)
             return
-        route=route_page(page,document['filenames'][0],self.settings.vision_low_score)
+        policy=_policy_from(self.settings)
+        route=route_page(page,document['filenames'][0],self.settings.vision_low_score,**policy)
         text=page['text']; regions=[]; timed_out=False
         if route['needs_vision']:
+            count('pages.vision.triggered')
             image=Storage(self.settings.data_dir,self.settings.max_upload_bytes).path(page['image_key']) if page['image_key'] else self.settings.data_dir/'missing.png'
-            for region in regions_for(page,route,image,self.settings.vision_regions_per_page,self.settings.vision_low_score):
+            tokens=dict(low=self.settings.vision_tokens_low, keyword_digit=self.settings.vision_max_new_tokens,
+                        value=self.settings.vision_tokens_value, poor=self.settings.vision_max_new_tokens)
+            planned=regions_for(page,route,image,self.settings.vision_regions_per_page,self.settings.vision_low_score,
+                                tokens=tokens,**policy)
+            report=selection_report(True, planned)
+            count('vision.regions.selected', report['selected'])
+            count('vision.regions.not_selected', report['not_selected'])
+            for reason, amount in report['reasons'].items():
+                count('vision.reason.'+reason, amount)
+            decided={}
+            pending=[]
+            for index,region in enumerate(planned):
                 if checkpoint:checkpoint('vision',number)
-                candidate=None; region_timed_out=False
-                blocked=self.vision_timeouts>=self.settings.vision_timeout_budget
-                if not region.get('over_budget') and not blocked:
-                    try:
-                        with span('page.vision.region', page=number, region=len(regions)):
-                            with self.database.connect() as conn:
-                                cached=conn.execute('''SELECT result FROM dd_agent.vision_candidates
-                                    WHERE document_id=%s AND page_number=%s AND base_revision=%s AND bounds=%s
-                                    AND profile_version=%s AND status='succeeded'
-                                    ORDER BY created_at DESC,id DESC LIMIT 1''',(document_id,number,revision,Jsonb(region['bounds']),version)).fetchone()
-                            if cached and not cached['result'].get('truncated'):
-                                # 区域候选已成功保存时可直接复用，暂停后不用再跑一次视觉模型。
-                                count('vision.candidates.reused')
-                                candidate=cached['result']
-                            else:
-                                response=self.review.recognize(project_id,document_id,number,region['bounds'],revision,profile_version=version,region_index=len(regions))
-                                if response['status']=='succeeded':candidate=response['result']
-                    except VisionTimeout:
-                        self.vision_timeouts+=1; region_timed_out=True; timed_out=True
-                        count('vision.timeouts')
-                    except (ReviewError,OSError):pass
-                elif not region.get('over_budget') and blocked:
-                    region_timed_out=True; timed_out=True
-                    count('vision.timeout_budget_skips')
-                if checkpoint:checkpoint('vision_saved',number)
-                # 先保存候选，再检查暂停；即使整页机器结果还没形成，候选也不会白跑。
                 if region.get('over_budget'):
+                    decided[index]=('skip', None, False)
+                    continue
+                if self.vision_timeouts>=self.settings.vision_timeout_budget:
+                    decided[index]=('run', None, True)
+                    count('vision.timeout_budget_skips')
+                    continue
+                try:
+                    with self.database.connect() as conn:
+                        cached=conn.execute('''SELECT result FROM dd_agent.vision_candidates
+                            WHERE document_id=%s AND page_number=%s AND base_revision=%s AND bounds=%s
+                            AND profile_version=%s AND status='succeeded'
+                            ORDER BY created_at DESC,id DESC LIMIT 1''',(document_id,number,revision,Jsonb(region['bounds']),version)).fetchone()
+                    if cached and not cached['result'].get('truncated'):
+                        count('vision.candidates.reused')
+                        decided[index]=('run', cached['result'], False)
+                        continue
+                except OSError:
+                    pass
+                pending.append(index)
+            if pending and hasattr(self.vision,'recognize_many'):
+                self._infer_batch(project_id,document_id,number,planned,pending,revision,version,decided)
+            else:
+                for index in pending:
+                    decided[index]=self._infer_one(project_id,document_id,number,planned[index],index,revision,version)
+            for index,region in enumerate(planned):
+                kind,candidate,region_timed_out=decided[index]
+                if region_timed_out:timed_out=True
+                if checkpoint:checkpoint('vision_saved',number)
+                if kind=='skip':
                     choice=dict(decision='not_run', text=page['text'][region['start']:region['end']],
                                 reason='超出每页区域预算，保留基础 OCR')
+                    candidate=None
                 else:
                     choice=choose_region(page['text'][region['start']:region['end']],candidate)
                     if region_timed_out:
@@ -308,14 +377,51 @@ class AutomaticProcessor:
                 regions.append({**region,**choice,'candidate':candidate})
             text,outcome=summarize_regions(text, regions)
         else:
+            count('pages.vision.not_triggered')
             outcome='base'
         count('pages.automatic.'+outcome)
         output=dict(text=text,route=route,regions=regions,outcome=outcome,stop_retry=timed_out,
+                    selection=selection_report(route['needs_vision'], regions),
                     verification={'uncertain':'machine_uncertain','enhanced':'machine_enhanced','checked':'machine_checked','base':'unverified'}[outcome])
         try:self._publish(document_id,number,revision,version,output)
         except ReviewConflict:
             result['failed_pages'].append(number);return
         result['processed_pages'].append(number)
+
+    def _infer_one(self,project_id,document_id,number,region,index,revision,version):
+        try:
+            with span('page.vision.region', page=number, region=index):
+                response=self.review.recognize(project_id,document_id,number,region['bounds'],revision,profile_version=version,region_index=index)
+            if response['status']=='succeeded':
+                return ('run', response['result'], False)
+        except VisionTimeout:
+            self.vision_timeouts+=1
+            count('vision.timeouts')
+            return ('run', None, True)
+        except (ReviewError,OSError):
+            pass
+        return ('run', None, False)
+
+    def _infer_batch(self,project_id,document_id,number,planned,pending,revision,version,decided):
+        items=[dict(bounds=planned[index]['bounds'], region_index=index,
+                    max_new_tokens=planned[index].get('max_new_tokens') or self.settings.vision_max_new_tokens)
+               for index in pending]
+        try:
+            with span('page.vision.region', page=number, region=pending[0]):
+                rows=self.review.recognize_batch(project_id,document_id,number,items,revision,profile_version=version)
+            if len(rows)!=len(pending):
+                raise ReviewError('视觉批结果数量不符。')
+            for index,row in zip(pending, rows):
+                candidate=row['result'] if row and row.get('status')=='succeeded' else None
+                decided[index]=('run', candidate, False)
+        except VisionTimeout:
+            self.vision_timeouts+=1
+            count('vision.timeouts')
+            for index in pending:
+                decided[index]=('run', None, True)
+        except (ReviewError,OSError):
+            for index in pending:
+                decided[index]=('run', None, False)
 
     def _publish(self,document_id,number,revision,version,output):
         with self.database.publication('vision',number,document_id=document_id) as conn:

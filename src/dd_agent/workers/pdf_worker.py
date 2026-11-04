@@ -2,6 +2,7 @@
 # 实际解析引擎是 PDFium；本进程负责取文字／生成预览，不做 PaddleOCR 或向量化。
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -69,10 +70,15 @@ def main():
                         tp=page.get_textpage()
                         try:text=tp.get_text_range()
                         finally:tp.close()
-                    target=Path(config['output_dir'])/f'page-{number}.png'
+                    pattern=config.get('image_pattern') or 'page-{number}.png'
+                    target=Path(config['output_dir'])/pattern.format(number=number)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    partial=target.with_suffix(target.suffix+'.part')
                     # 可读文字页也保留预览图，供回看；渲染图片本身不表示调用视觉识别。
+                    # 先写临时文件再替换，避免 OCR 重试读到半张图。
                     with span('pdf.render', page=number):
-                        page.render(scale=config.get('render_scale',2)).to_pil().save(target)
+                        page.render(scale=config.get('render_scale',2)).to_pil().save(partial)
+                        os.replace(partial, target)
                     count('pdf.render.pages')
                     emit({'page_number':number,'route':text_route(text),'text':text,'image_path':str(target)})
                 except Exception:

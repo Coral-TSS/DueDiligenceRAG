@@ -67,11 +67,20 @@ def test_environment_loads_performance_settings(monkeypatch):
     monkeypatch.setenv('DDA_VISION_TIMEOUT_BUDGET', '1')
     monkeypatch.setenv('DDA_OCR_ENABLE_MKLDNN', 'yes')
     monkeypatch.setenv('DDA_OCR_CPU_THREADS', '6')
+    monkeypatch.setenv('DDA_VISION_TOKENS_LOW', '32')
+    monkeypatch.setenv('DDA_VISION_BATCH', '1')
+    monkeypatch.setenv('DDA_VISION_VALUE_LINES', '0')
+    monkeypatch.setenv('DDA_OCR_REC_BATCH', '8')
+    monkeypatch.setenv('DDA_EMBED_TOKEN_BUDGET', '1024')
+    monkeypatch.setenv('DDA_RERANK_TOKEN_BUDGET', '2048')
     settings = Settings.from_env()
     assert settings.ocr_device == 'gpu:0' and settings.vision_device == 'cuda'
     assert settings.embedding_dtype == 'float32' and settings.reranker_dtype == 'bfloat16'
     assert settings.vision_max_new_tokens == 96 and settings.vision_regions_per_page == 2
     assert settings.vision_low_score == 0.6 and settings.vision_timeout_budget == 1
+    assert settings.vision_tokens_low == 32 and settings.vision_batch == 1
+    assert settings.vision_value_lines is False and settings.ocr_rec_batch == 8
+    assert settings.embed_token_budget == 1024 and settings.rerank_token_budget == 2048
     assert settings.ocr_enable_mkldnn is True and settings.ocr_cpu_threads == 6
 
 
@@ -79,6 +88,12 @@ def test_defaults_keep_fast_vision_and_fewer_regions():
     settings = Settings()
     assert settings.vision_regions_per_page == 1
     assert settings.vision_max_new_tokens == 128
+    assert settings.vision_tokens_low == 64 and settings.vision_tokens_value == 96
+    assert settings.vision_batch == 2 and settings.vision_value_lines is True
+    assert settings.vision_value_max_score == 1 and settings.vision_keyword_max_score == 1
+    assert settings.ocr_rec_batch == 16 and settings.ocr_page_batch == 4
+    assert settings.embed_token_budget == 2048 and settings.embed_batch_limit == 32
+    assert settings.rerank_token_budget == 4096
     assert settings.ocr_enable_mkldnn is False
     assert settings.ocr_device == 'auto' and settings.vision_dtype == 'auto'
     assert not hasattr(settings, 'ingest_schedule')

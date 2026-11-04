@@ -34,7 +34,7 @@
 
 正常退出在安全检查点停止，并关闭模型运行时。Windows 常驻进程在加载前纳入所属作业对象，父进程突然退出、请求取消或超时会清理实际解释器。一次性回退保留原有清理边界。失败任务可再次启动；未知区域同一来源／策略最多尝试两次，超过区域预算的信息会明确标为未知。
 
-扫描页先完成基础 OCR 和索引，材料可以先检索；视觉增强在整卷 OCR 之后集中进行，并回写、再嵌入发生变化的页。默认每页最多 1 个视觉区域，只处理低置信行或带数字、日期、金额的关键行，不再因整页出现关键词就把整页送进视觉模型。每个区域最多等待 300 秒，同一处理里超时达到 3 次后其余区域直接标未知。视觉生成固定打开 KV cache。安装与 GTX 1070／RTX 40 的推荐配置见 [GPU 安装](specs/due-diligence-agent/gpu-setup.md)。当前未完成客户整卷验收，建议先用下面的 10 页命令测量。
+扫描页先完成基础 OCR 和索引，材料可以先检索；视觉增强在整卷 OCR 之后集中进行。文本没变的片段复用已有向量，整页都没变就不再加载嵌入模型。默认每页最多 1 个视觉区域，只处理低置信行或带数字、日期、金额的关键行，不再因整页出现关键词就把整页送进视觉模型。触发条件和各类区域的生成长度都由 `DDA_VISION_*` 控制，默认与原先的选行规则一致。每个区域最多等待 300 秒，同一处理里超时达到 3 次后其余区域直接标未知。视觉生成固定打开 KV cache。安装与 GTX 1070／RTX 40 的推荐配置见 [GPU 安装](specs/due-diligence-agent/gpu-setup.md)。当前未完成客户整卷验收，建议先用下面的 10 页命令测量。
 
 2026-10-23 已完成 RG-01／PR-05 中断恢复修复，回归 76 项通过、2 项真实模型测试跳过。实际材料持久化数量以应用和数据库当前状态为准，tasks.md 只维护开发进度，前三页仅指早期试点；完整当前覆盖与缺口清单是下一项 RG-02。验收和已知观察项见 [恢复记录](testing/records/recovery.md)。
 
@@ -101,7 +101,18 @@ DDA_SEARCH_PARENT_DOCUMENT_IDS=
 | `DDA_VISION_REGIONS_PER_PAGE` | 1，允许 1–10 |
 | `DDA_VISION_MAX_NEW_TOKENS` | 128，允许 16–512 |
 | `DDA_VISION_LOW_SCORE` | 0.85；低于该分的 OCR 行才触发视觉 |
+| `DDA_VISION_TOKENS_LOW` | 64，允许 16–512；低置信区域的生成长度 |
+| `DDA_VISION_TOKENS_VALUE` | 96；日期／金额行的生成长度。关键词行仍用 `DDA_VISION_MAX_NEW_TOKENS` |
+| `DDA_VISION_BATCH` | 2，允许 1–8；同一生成长度的区域一次 generate |
+| `DDA_VISION_VALUE_LINES` | 1；设为 0 后，日期／金额行不再单独触发视觉 |
+| `DDA_VISION_VALUE_MAX_SCORE` | 1；只增强分数不超过该值的日期／金额行 |
+| `DDA_VISION_KEYWORD_MAX_SCORE` | 1；只增强分数不超过该值、且带数字的关键词行 |
 | `DDA_VISION_TIMEOUT_BUDGET` | 3，允许 0–50；用尽后不再调用视觉 |
+| `DDA_OCR_REC_BATCH` | 16，允许 1–64；GPU 上的识别批大小 |
+| `DDA_OCR_PAGE_BATCH` | 4，允许 1–16；检测阶段一次送入的页数 |
+| `DDA_EMBED_TOKEN_BUDGET` | 2048；向量按 token 预算跨页合批 |
+| `DDA_EMBED_BATCH_LIMIT` | 32；单批最多条数 |
+| `DDA_RERANK_TOKEN_BUDGET` | 4096；一次查询的候选在该预算内一批打分 |
 | `DDA_OCR_DEVICE` | `auto`；Paddle 用 `cpu` 或 `gpu:0`。没有 GPU 时用 CPU |
 | `DDA_VISION_DEVICE`／`DDA_EMBEDDING_DEVICE`／`DDA_RERANKER_DEVICE` | `auto`；PyTorch 用 `cpu` 或 `cuda` |
 | `DDA_VISION_DTYPE`／`DDA_EMBEDDING_DTYPE`／`DDA_RERANKER_DTYPE` | `auto`：CPU 或计算能力低于 8.0 用 float32；8.0 及以上优先 bfloat16，否则 float16 |

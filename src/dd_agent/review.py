@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 from psycopg.types.json import Jsonb
 
 from .cache import cache_directory, file_entries, resolve_fingerprint
-from .config import Settings
+from .config import Settings, vision_token_ceiling
 from .db import Database
 from .reading import worker_records, ReadingError
 from .retrieval import model_slot, RetrievalError
@@ -82,8 +82,10 @@ class LocalVision:
         from .model_runtime import runtime_records, ModelRuntimeError
         # 新 token 上限可配置，默认 128；是否截断由 worker 明确返回，不能静默当全文。
         manifest = dict(image=str(image_path), bounds=bounds, models=str(self.settings.vision_models_dir.resolve()),
-                        max_new_tokens=self.settings.vision_max_new_tokens, device=self.settings.vision_device,
-                        dtype=self.settings.vision_dtype, threads=self.settings.model_cpu_threads)
+                        max_new_tokens=self.settings.vision_max_new_tokens,
+                        token_ceiling=vision_token_ceiling(self.settings), device=self.settings.vision_device,
+                        dtype=self.settings.vision_dtype, threads=self.settings.model_cpu_threads,
+                        manifest_dir=str(cache_directory(self.settings)))
         if type(page_number) is int: manifest['page_number'] = page_number
         if type(region) is int: manifest['region'] = region
         try:
@@ -97,6 +99,28 @@ class LocalVision:
         if len(records) != 1 or not isinstance(records[0].get('text'), str):
             raise ReviewError('视觉模型返回内容不完整。')
         return records[0]
+
+    def recognize_many(self, *, image_path, items, directory):
+        # 一次加载、按区域类型分批 generate。items 各自带不超过加载上限的 max_new_tokens。
+        from .model_runtime import runtime_records, ModelRuntimeError
+        manifest = dict(image=str(image_path), models=str(self.settings.vision_models_dir.resolve()),
+                        max_new_tokens=vision_token_ceiling(self.settings), batch=self.settings.vision_batch,
+                        device=self.settings.vision_device, dtype=self.settings.vision_dtype,
+                        threads=self.settings.model_cpu_threads, manifest_dir=str(cache_directory(self.settings)),
+                        items=[dict(bounds=item['bounds'], max_new_tokens=int(item['max_new_tokens']),
+                                    page_number=item.get('page_number'), region=item.get('region')) for item in items])
+        timeout = self.settings.vision_timeout_seconds * max(1, len(items))
+        try:
+            records = list(runtime_records(self.settings,'vision','recognize_batch',manifest,timeout=timeout)) if self.managed else list(worker_records(self.settings.vision_python, 'vision_worker', manifest, directory, timeout_seconds=timeout))
+        except ModelRuntimeError as exc:
+            if str(exc)=='model_busy' and current_control().defer_busy:raise ProcessingDeferred() from None
+            if str(exc)=='worker_timeout':raise VisionTimeout('视觉区域超过时限。') from None
+            raise ReviewError('本地视觉模型未完成，请稍后重试。') from None
+        except ReadingError:
+            raise ReviewError('本地视觉模型未完成，请检查环境或缩小区域后重试。') from None
+        if len(records) != 1 or not isinstance(records[0].get('items'), list) or len(records[0]['items']) != len(items):
+            raise ReviewError('视觉模型返回内容不完整。')
+        return records[0]['items']
 
 
 class ReviewService:
@@ -163,3 +187,58 @@ class ReviewService:
         if deferred is not None:raise deferred
         if timed_out is not None:raise timed_out
         return candidate
+
+    def recognize_batch(self, project_id, document_id, number, regions, raw_revision, profile_version=''):
+        # 测试替身没有 recognize_many 时，仍按区域调用 recognize，次数和失败语义保持不变。
+        if not hasattr(self.vision, 'recognize_many'):
+            return [self.recognize(project_id, document_id, number, region['bounds'], raw_revision,
+                                   profile_version=profile_version, region_index=region.get('region_index'))
+                    for region in regions]
+        prepared=[]
+        for region in regions:
+            prepared.append(dict(region, bounds=valid_bounds(region['bounds'])))
+        state = self.state(project_id, document_id, number)
+        if state['raw_revision'] != raw_revision:
+            raise ReviewConflict('页面已更新，请刷新后选择识别区域。')
+        raw = next(p for p in self.database.pages(document_id) if p['page_number'] == number)
+        if raw['status'] != 'succeeded':
+            raise ReviewError('该页基础阅读未成功，不能复核。')
+        directory = self.settings.data_dir / 'vision' / uuid4().hex
+        directory.mkdir(parents=True)
+        identifiers=[]
+        for item in prepared:
+            identifier=uuid4(); identifiers.append(identifier)
+            with self.database.publication('vision',number,document_id=document_id,final=False) as conn:
+                conn.execute('''INSERT INTO dd_agent.vision_candidates(id,document_id,page_number,base_revision,bounds,status,profile_version)
+                    VALUES (%s,%s,%s,%s,%s,'running',%s)''', (identifier, document_id, number, raw_revision, Jsonb(item['bounds']), profile_version))
+        outputs=[None]*len(prepared)
+        status, error = 'failed', 'vision_failed'
+        deferred=timed_out=None
+        try:
+            with model_slot(self.settings.data_dir,managed=getattr(self.vision,'managed',False)):
+                image = Storage(self.settings.data_dir, self.settings.max_upload_bytes).path(raw['image_key']) if raw['image_key'] else directory / 'missing.png'
+                items=[dict(bounds=item['bounds'], max_new_tokens=item.get('max_new_tokens') or self.settings.vision_max_new_tokens,
+                            page_number=number, region=item.get('region_index')) for item in prepared]
+                values=self.vision.recognize_many(image_path=image, items=items, directory=directory)
+                if len(values)!=len(prepared):
+                    raise ReviewError('视觉结果不完整。')
+                for index,result in enumerate(values):
+                    if not isinstance(result, dict) or not isinstance(result.get('text'), str) or len(result['text'])>100000:
+                        raise ReviewError('视觉结果不完整。')
+                    outputs[index]=result
+                status = 'succeeded' if self.state(project_id, document_id, number)['raw_revision'] == raw_revision else 'stale'
+                error = ''
+        except ProcessingDeferred as exc:
+            deferred=exc;error='model_busy'
+        except VisionTimeout as exc:
+            timed_out=exc;error='vision_timeout'
+        except (ReviewError, RetrievalError, OSError):
+            pass
+        rows=[]
+        for identifier,result in zip(identifiers, outputs):
+            with self.database.publication('vision',number,document_id=document_id,final=False) as conn:
+                rows.append(conn.execute('''UPDATE dd_agent.vision_candidates SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
+                    WHERE id=%s RETURNING *''', (status, Jsonb(result or {}), error, identifier)).fetchone())
+        if deferred is not None:raise deferred
+        if timed_out is not None:raise timed_out
+        return rows
