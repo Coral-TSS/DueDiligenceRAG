@@ -22,6 +22,8 @@ from .model_admission import current_control
 from .control import ProcessingDeferred
 
 
+# 字符串里的 cpu 是历史算法编号，不是运行设备。GPU 与 CPU 的 OCR 文本已核对为一致，
+# 设备、线程、oneDNN 都不写入阅读版本，避免换卡后把已成功页全部重跑。
 PIPELINE_VERSION='pdfium-text-v2-ppocr5-cpu-v1'
 OCR_MODEL_NAMES = ['PP-OCRv5_mobile_det','PP-OCRv5_server_rec','PP-LCNet_x1_0_doc_ori','PP-LCNet_x1_0_textline_ori']
 OCR_MODEL_SUFFIXES = ['pdiparams','json','yml']
@@ -113,7 +115,9 @@ def ocr_records(settings,manifest,directory):
                 for page in manifest['pages']:
                     # Release admission before SQL save/checkpoint, then let a
                     # waiting query run before requesting the next OCR page.
-                    yield from list(runtime_records(settings,'ocr','recognize',dict(manifest,pages=[page])))
+                    number = page.get('page_number') if type(page.get('page_number')) is int else None
+                    with span('page.ocr', page=number):
+                        yield from list(runtime_records(settings,'ocr','recognize',dict(manifest,pages=[page])))
             else:yield from runtime_records(settings,'ocr','recognize',manifest)
         else:
             with model_slot(settings.data_dir):
@@ -226,7 +230,11 @@ class Reader:
             if ocr_pages:
                 # 一次 worker 调用复用这一批的 Paddle 实例；当前尚非跨批次常驻服务。
                 if checkpoint:checkpoint('ocr',ocr_pages[0]['page_number'])
-                with closing(ocr_records(self.settings,{'models':str(self.settings.ocr_models_dir.resolve()),'pages':ocr_pages},directory)) as records:
+                with closing(ocr_records(self.settings,{
+                        'models':str(self.settings.ocr_models_dir.resolve()),'pages':ocr_pages,
+                        'device':self.settings.ocr_device,
+                        'threads':self.settings.ocr_cpu_threads or self.settings.model_cpu_threads,
+                        'enable_mkldnn':self.settings.ocr_enable_mkldnn},directory)) as records:
                     for result in records:
                         if 'payload' in result:result.update(normalize_ocr(result.pop('payload')))
                         persist(result,'ocr')

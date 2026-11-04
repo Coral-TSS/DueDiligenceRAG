@@ -163,7 +163,7 @@ class StageJobs:
             cls._end_attempt(conn,row['id'],'cancelled','old_epoch')
 
     @timed('stage.reconcile')
-    def reconcile(self, job_id, policy_versions, limit=100, bind_vision=False):
+    def reconcile(self, job_id, policy_versions, limit=100):
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError('每批对账事件须在 1–100 之间。')
         with self.database.connect() as conn:
@@ -181,22 +181,21 @@ class StageJobs:
                     waiting=True; break  # Never skip an event because the consumer has no actual model policy yet.
                 dep = dict(page_number=event['page_number'],view='raw' if event['stage']=='vision' else 'effective',revision=event['source_revision'])
                 if self._sources(conn,parent['document_id'],[dep]):
-                    predecessors=[]; eligible=True
-                    if bind_vision and event['stage']=='embedding':
-                        current=conn.execute('''SELECT e.raw_revision,m.profile_version FROM dd_agent.effective_document_pages e
-                            JOIN LATERAL (SELECT profile_version FROM dd_agent.machine_pages
-                                WHERE document_id=e.document_id AND page_number=e.page_number ORDER BY created_at DESC,id DESC LIMIT 1) m ON true
-                            WHERE e.document_id=%s AND e.page_number=%s''',(parent['document_id'],event['page_number'])).fetchone()
-                        eligible=bool(current and current['profile_version']==policy_versions.get('vision'))
-                        if eligible:
-                            raw_dep=dict(page_number=event['page_number'],view='raw',revision=current['raw_revision'])
-                            upstream=self.ensure(job_id,'vision',{'pages':[event['page_number']]},source_revision=current['raw_revision'],
-                                policy_version=policy_versions['vision'],dependencies=[raw_dep],conn=conn)
-                            predecessors=[upstream['id']]
-                    if eligible:
-                        task=self.ensure(job_id,event['stage'],{'pages':[event['page_number']]},source_revision=event['source_revision'],
-                            policy_version=policy,dependencies=[dep],depends_on=predecessors,conn=conn)
-                        tasks.append(task);created+=1
+                    task=self.ensure(job_id,event['stage'],{'pages':[event['page_number']]},source_revision=event['source_revision'],
+                        policy_version=policy,dependencies=[dep],conn=conn)
+                    tasks.append(task);created+=1
+                    # 基础 OCR 一落地就登记向量任务，检索不必等视觉。
+                    # 视觉写入 machine_pages 后，原触发器会用新的 source_revision 再登记一次。
+                    if event['stage']=='vision' and policy_versions.get('embedding'):
+                        current=conn.execute('''SELECT status,source_revision FROM dd_agent.effective_document_pages
+                            WHERE document_id=%s AND page_number=%s''',(parent['document_id'],event['page_number'])).fetchone()
+                        if current and current['status']=='succeeded' and current['source_revision']:
+                            emb_dep=dict(page_number=event['page_number'],view='effective',revision=current['source_revision'])
+                            if self._sources(conn,parent['document_id'],[emb_dep]):
+                                emb=self.ensure(job_id,'embedding',{'pages':[event['page_number']]},
+                                    source_revision=current['source_revision'],policy_version=policy_versions['embedding'],
+                                    dependencies=[emb_dep],conn=conn)
+                                tasks.append(emb);created+=1
                 conn.execute('INSERT INTO dd_agent.stage_deliveries(job_id,run_epoch,event_id) VALUES (%s,%s,%s)',
                     (job_id,parent['run_epoch'],event['id']))
                 scanned+=1; cursor=max(cursor,event['id'])

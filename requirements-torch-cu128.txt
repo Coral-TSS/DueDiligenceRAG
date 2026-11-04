@@ -1,0 +1,4 @@
+# RTX 40 系 / Ada sm_89 及更新架构。不要用于 GTX 1070，也不要加 torch<2.15。
+# pip install -r requirements-torch-cu128.txt
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.14

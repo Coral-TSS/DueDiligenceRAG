@@ -93,7 +93,13 @@ class Trace:
             return
         if status not in ('ok', 'error', 'paused', 'stopped', 'closed'): return
         # 显式投影；即使工作进程误带 text／query，也不落进性能记录。
+        # page／region 只是序号，供 10 页试跑对照各阶段耗时。
         safe = dict(stage=name, seconds=seconds, status=status)
+        page, region = value.get('page'), value.get('region')
+        if type(page) is int and page >= 1:
+            safe['page'] = page
+        if type(region) is int and region >= 0:
+            safe['region'] = region
         pid = value.get('pid')
         peak = value.get('peak_rss_mb')
         with self.lock:
@@ -196,7 +202,7 @@ def worker_process(pid):
 
 
 @contextmanager
-def span(name):
+def span(name, *, page=None, region=None):
     if not active() and os.environ.get('DDA_WORKER_METRICS') != '1':
         yield; return
     start, status = perf_counter(), 'ok'
@@ -205,6 +211,10 @@ def span(name):
         status = _status(exc); raise
     finally:
         value = dict(stage=name, seconds=perf_counter()-start, status=status, pid=os.getpid())
+        if type(page) is int and page >= 1:
+            value['page'] = page
+        if type(region) is int and region >= 0:
+            value['region'] = region
         memory = _memory(os.getpid())
         if memory: value['peak_rss_mb'] = memory[1]
         trace = _active.get()

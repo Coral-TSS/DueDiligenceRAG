@@ -34,7 +34,7 @@
 
 正常退出在安全检查点停止，并关闭模型运行时。Windows 常驻进程在加载前纳入所属作业对象，父进程突然退出、请求取消或超时会清理实际解释器。一次性回退保留原有清理边界。失败任务可再次启动；未知区域同一来源／策略最多尝试两次，超过区域预算的信息会明确标为未知。
 
-默认每页最多 3 个视觉区域，每个区域最多等待 300 秒；CPU 视觉识别较慢，全卷可能耗时很长。当前未完成全卷或 GB 级性能验收，建议先用下面的命令做小批验证。已登记的 649 页样例只验证过前三页的基础阅读与检索，本次不会默认启动整个卷宗。
+扫描页先完成基础 OCR 和索引，材料可以先检索；视觉增强在整卷 OCR 之后集中进行，并回写、再嵌入发生变化的页。默认每页最多 1 个视觉区域，只处理低置信行或带数字、日期、金额的关键行，不再因整页出现关键词就把整页送进视觉模型。每个区域最多等待 300 秒，同一处理里超时达到 3 次后其余区域直接标未知。视觉生成固定打开 KV cache。安装与 GTX 1070／RTX 40 的推荐配置见 [GPU 安装](specs/due-diligence-agent/gpu-setup.md)。当前未完成客户整卷验收，建议先用下面的 10 页命令测量。
 
 2026-10-23 已完成 RG-01／PR-05 中断恢复修复，回归 76 项通过、2 项真实模型测试跳过。实际材料持久化数量以应用和数据库当前状态为准，tasks.md 只维护开发进度，前三页仅指早期试点；完整当前覆盖与缺口清单是下一项 RG-02。验收和已知观察项见 [恢复记录](testing/records/recovery.md)。
 
@@ -96,7 +96,15 @@ DDA_SEARCH_PARENT_DOCUMENT_IDS=
 | `DDA_VISION_PYTHON` | `.venv-vision/Scripts/python.exe` |
 | `DDA_VISION_MODELS_DIR` | `models/vision/PaddleOCR-VL-1.6` |
 | `DDA_VISION_TIMEOUT_SECONDS` | 300 |
-| `DDA_VISION_REGIONS_PER_PAGE` | 3，允许 1–10 |
+| `DDA_VISION_REGIONS_PER_PAGE` | 1，允许 1–10 |
+| `DDA_VISION_MAX_NEW_TOKENS` | 128，允许 16–512 |
+| `DDA_VISION_LOW_SCORE` | 0.85；低于该分的 OCR 行才触发视觉 |
+| `DDA_VISION_TIMEOUT_BUDGET` | 3，允许 0–50；用尽后不再调用视觉 |
+| `DDA_OCR_DEVICE` | `auto`；Paddle 用 `cpu` 或 `gpu:0`。没有 GPU 时用 CPU |
+| `DDA_VISION_DEVICE`／`DDA_EMBEDDING_DEVICE`／`DDA_RERANKER_DEVICE` | `auto`；PyTorch 用 `cpu` 或 `cuda` |
+| `DDA_VISION_DTYPE`／`DDA_EMBEDDING_DTYPE`／`DDA_RERANKER_DTYPE` | `auto`：CPU 或计算能力低于 8.0 用 float32；8.0 及以上优先 bfloat16，否则 float16 |
+| `DDA_OCR_ENABLE_MKLDNN` | 默认 0。Windows 上 oneDNN 不稳定，仅 CPU 试跑时可设为 1 |
+| `DDA_OCR_CPU_THREADS` | 0 表示沿用 `DDA_MODEL_CPU_THREADS`；GPU 上不传给 Paddle |
 | `DDA_PDF_RENDER_SCALE` | 2，允许 1–4，变化后产生新的阅读版本 |
 
 原件按内容摘要保存在 `documents/` 下，原文件名在数据库中。请同时备份 PostgreSQL 和业务数据目录。历史原始 OCR、视觉候选、人工版本保留；主流程不再写入或使用人工版本。机器有效文字单独追加，原始文字不被覆盖。来源改变立即排除旧索引，受影响页需要重新处理。不同项目资料不能交叉检索。
@@ -150,7 +158,7 @@ RG-06b-b1 提供父子原文／引用映射、真实 tokenizer 预算、独立�
 - [最近测试结果](testing/records/latest-run.md)
 
 
-暂停功能的范围、状态和验证见 [暂停与继续规格](specs/01-evidence-to-report/pause-resume.md)。当前 Qwen3-Embedding-0.6B 使用 CPU float32，1024 维；默认常驻运行时复用同模型实例，切换模型时释放前一实例。备选模型见 [选型记录](testing/records/embedding-options.md)。
+暂停功能的范围、状态和验证见 [暂停与继续规格](specs/01-evidence-to-report/pause-resume.md)。Qwen3-Embedding-0.6B 为 1024 维。`auto` 在有 GPU 时用 CUDA，否则用 CPU float32；计算能力 8.0 及以上才自动改用 bfloat16 或 float16。同一时间只常驻一个模型，换模型先结束前一个进程并释放显存。GTX 1070 上视觉约 3.6GB、向量约 2.5GB，不能同时常驻。备选模型见 [选型记录](testing/records/embedding-options.md)。设备、注意力和 KV cache 不改变已完成页的版本，不会因此重跑 OCR 或重建 float32 索引。
 
 查询与后台处理共享一个模型计算许可，各自按到达顺序等待；连续最多 3 次查询后，给仍在等待的后台一次机会，在当前页／区域完成后切换。默认最多等待 8 个请求、排队 3 秒；后台繁忙会保留成果并重新排队，不消耗识别失败重试次数。公平规则限同一应用进程，其他进程仍通过文件租约避免重复加载。
 

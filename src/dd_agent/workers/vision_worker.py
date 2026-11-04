@@ -55,8 +55,12 @@ def load_engine(payload):
     from transformers import AutoConfig, AutoProcessor, AutoModelForImageTextToText
     torch.set_num_threads(payload.get('threads',4))
     path = Path(payload['models'])
+    from dd_agent.devices import load_with_attention, resolve_torch, torch_dtype
+    runtime = resolve_torch('vision', payload.get('device', 'auto'), payload.get('dtype', 'auto'))
     digest = hashlib.sha256()
-    # 输出保留模型／推理配置摘要、裁剪图片摘要及坐标，方便回查某次候选的来源。
+    # 前缀里的 fp32-eager 是历史候选指纹，不是当前设备或注意力实现。
+    # 实测换 GPU／sdpa／KV cache 的文本一致，不能因为这些开关改变 model_version 而让旧候选失效。
+    # 生成长度会改变截断，因此仍然写入。
     digest.update(f'vl-region-ocr-fp32-eager-v1|{torch.__version__}|{transformers.__version__}|{payload["max_new_tokens"]}'.encode())
     weights = sorted(path.glob('*.safetensors'))
     if not weights:
@@ -76,10 +80,14 @@ def load_engine(payload):
             # 尊重该模型不共享输入／输出嵌入的配置，处理 Transformers 配置转换兼容性。
             config.text_config.tie_word_embeddings = False
         config.tie_word_embeddings = False
-        model = AutoModelForImageTextToText.from_pretrained(path, config=config, dtype=torch.float32,
-                    attn_implementation='eager', local_files_only=True).to('cpu').eval()
+        def factory(attention):
+            return AutoModelForImageTextToText.from_pretrained(path, config=config, dtype=torch_dtype(runtime['dtype']),
+                        attn_implementation=attention, local_files_only=True)
+        model, attention = load_with_attention(factory, runtime['attention'], 'vision')
+        model = model.to(runtime['device']).eval()
+        runtime = dict(runtime, attention=attention)
     count('model.vision.loads')
-    return processor, model, digest.hexdigest()
+    return processor, model, digest.hexdigest(), runtime
 
 
 @timed('vision.worker')
@@ -87,7 +95,8 @@ def recognize(payload, engine=None):
     from PIL import Image
     import torch
     start = time.monotonic()
-    processor, model, model_version = engine if engine is not None else load_engine(payload)
+    loaded = engine if engine is not None else load_engine(payload)
+    processor, model, model_version = loaded[:3]
     with span('vision.image'), Image.open(payload['image']) as source:
         # 当前对输入整张图片设像素上限，再裁剪；小裁剪不代表任意大原图都可接收。
         if source.width * source.height > 12000000:
@@ -98,9 +107,12 @@ def recognize(payload, engine=None):
     messages = [{'role':'user', 'content':[{'type':'image','image':picture}, {'type':'text','text':'OCR:'}]}]
     # 提示仅要求 OCR，不附带基础 OCR 猜测或旧报告答案，减少答案反向污染识别。
     inputs = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=True,
-                                          return_dict=True, return_tensors='pt')
-    with torch.inference_mode(), span('vision.inference'):
-        output = model.generate(**inputs, max_new_tokens=payload['max_new_tokens'], do_sample=False)
+                                          return_dict=True, return_tensors='pt').to(model.device)
+    page = payload.get('page_number') if type(payload.get('page_number')) is int else None
+    region = payload.get('region') if type(payload.get('region')) is int else None
+    # 检查点默认 use_cache=False。打开后文本与关闭时逐字节一致，CPU 约 55 秒降到约 4 秒，GPU 约 6 秒降到约 1 秒。
+    with torch.inference_mode(), span('vision.inference', page=page, region=region):
+        output = model.generate(**inputs, max_new_tokens=payload['max_new_tokens'], do_sample=False, use_cache=True)
     tokens = output[0, inputs['input_ids'].shape[-1]:]
     # 只解码生成部分；达到长度上限且未遇结束 token 时，明确报告 truncated。
     # 主进程会把截断候选当作不完整结果，而不是把缺尾的识别文字直接采用。

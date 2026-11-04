@@ -24,6 +24,10 @@ class ReviewError(Exception):
     pass
 
 
+class VisionTimeout(ReviewError):
+    """区域推理超过配置时限。自动增强据此计入预算，并避免同一页无限重试。"""
+
+
 class ReviewConflict(ReviewError):
     pass
 
@@ -54,6 +58,9 @@ class LocalVision:
         # 缓存策略绑定本地权重／配置与超时；改变配置后不应无条件复用旧候选。
         # 命中缓存时不读取权重内容，只比对文件清单（RG-05b／K01）。
         def compute():
+            # 前缀中的 cpu-fp32 是历史指纹，不表示本次推理设备。
+            # 设备、精度、注意力和 KV cache 的识别文本已核对一致，不能写进指纹，否则换卡会重跑视觉。
+            # 生成长度改的是截断边界，由自动增强版本单独绑定，不放进这份权重指纹。
             digest=hashlib.sha256(b'vision-region-v1-cpu-fp32')
             for file in sorted(self.settings.vision_models_dir.glob('*')):
                 if file.suffix in {'.safetensors','.json'}:
@@ -71,14 +78,19 @@ class LocalVision:
             entries, compute, verify=verify, directory=cache_directory(self.settings))['value']
 
     @timed('vision.request')
-    def recognize(self, *, image_path, bounds, directory):
+    def recognize(self, *, image_path, bounds, directory, page_number=None, region=None):
         from .model_runtime import runtime_records, ModelRuntimeError
-        # 短区域输出限制为 256 个新 token；是否截断由 worker 明确返回，不能静默当全文。
-        manifest = dict(image=str(image_path), bounds=bounds, models=str(self.settings.vision_models_dir.resolve()), max_new_tokens=256)
+        # 新 token 上限可配置，默认 128；是否截断由 worker 明确返回，不能静默当全文。
+        manifest = dict(image=str(image_path), bounds=bounds, models=str(self.settings.vision_models_dir.resolve()),
+                        max_new_tokens=self.settings.vision_max_new_tokens, device=self.settings.vision_device,
+                        dtype=self.settings.vision_dtype, threads=self.settings.model_cpu_threads)
+        if type(page_number) is int: manifest['page_number'] = page_number
+        if type(region) is int: manifest['region'] = region
         try:
             records = list(runtime_records(self.settings,'vision','recognize',manifest,timeout=self.settings.vision_timeout_seconds)) if self.managed else list(worker_records(self.settings.vision_python, 'vision_worker', manifest, directory,timeout_seconds=self.settings.vision_timeout_seconds))
         except ModelRuntimeError as exc:
             if str(exc)=='model_busy' and current_control().defer_busy:raise ProcessingDeferred() from None
+            if str(exc)=='worker_timeout':raise VisionTimeout('视觉区域超过时限。') from None
             raise ReviewError('本地视觉模型未完成，请稍后重试。') from None
         except ReadingError:
             raise ReviewError('本地视觉模型未完成，请检查环境或缩小区域后重试。') from None
@@ -112,7 +124,7 @@ class ReviewService:
 
 
     @observed('vision')
-    def recognize(self, project_id, document_id, number, bounds, raw_revision, profile_version=''):
+    def recognize(self, project_id, document_id, number, bounds, raw_revision, profile_version='', region_index=None):
         # 调用前确认基础修订未变化，调用后再查一次，避免将旧图片输出绑定到新 OCR。
         bounds = valid_bounds(bounds)
         state = self.state(project_id, document_id, number)
@@ -129,21 +141,25 @@ class ReviewService:
                 VALUES (%s,%s,%s,%s,%s,'running',%s)''', (identifier, document_id, number, raw_revision, Jsonb(bounds),profile_version))
         result, status, error = {}, 'failed', 'vision_failed'
         deferred=None
+        timed_out=None
         try:
             # 与向量化／检索共用资源锁，控制本机内存竞争；拿不到时保留失败候选记录。
             with model_slot(self.settings.data_dir,managed=getattr(self.vision,'managed',False)):
                 image = Storage(self.settings.data_dir, self.settings.max_upload_bytes).path(raw['image_key']) if raw['image_key'] else directory / 'missing.png'
-                result = self.vision.recognize(image_path=image, bounds=bounds, directory=directory)
+                result = self.vision.recognize(image_path=image, bounds=bounds, directory=directory, page_number=number, region=region_index)
                 if not isinstance(result.get('text'), str) or len(result['text']) > 100000:
                     raise ReviewError('视觉结果不完整。')
                 status = 'succeeded' if self.state(project_id, document_id, number)['raw_revision'] == raw_revision else 'stale'
                 error = ''
         except ProcessingDeferred as exc:
             deferred=exc;error='model_busy'
+        except VisionTimeout as exc:
+            timed_out=exc;error='vision_timeout'
         except (ReviewError, RetrievalError, OSError):
             pass
         with self.database.publication('vision',number,document_id=document_id,final=False) as conn:
             candidate=conn.execute('''UPDATE dd_agent.vision_candidates SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
                 WHERE id=%s RETURNING *''', (status, Jsonb(result), error, identifier)).fetchone()
         if deferred is not None:raise deferred
+        if timed_out is not None:raise timed_out
         return candidate

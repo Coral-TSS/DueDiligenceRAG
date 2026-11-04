@@ -51,12 +51,14 @@ class ProcessingPipeline:
 
     @observed('pipeline')
     def run(self, project_id, document_id, pages, checkpoint=None):
-        # 必须按此顺序：基础文字 -> 机器有效文字 -> 使用该版本文字建立向量索引。
-        # checkpoint 是协作式控制回调；下层在页／区域安全边界调用它。
-        # 不传回调时仍能处理小批材料，但不受页面上的后台任务暂停按钮控制。
+        # 顺序：基础文字 -> 先按基础文字建索引（可检索）-> 视觉增强 -> 按新修订再嵌入。
+        # 不再把视觉插在索引前面。checkpoint 在页／区域安全边界协作暂停。
         kwargs = {'checkpoint':checkpoint} if checkpoint else {}
         if checkpoint:checkpoint('reading',pages[0])
         reading = self.reader.read(project_id, document_id, pages, **kwargs)
+        count('ingest.index_first')
+        if checkpoint:checkpoint('embedding',pages[0])
+        self.evidence.index(project_id, document_id, pages, **kwargs)
         if checkpoint:checkpoint('vision',pages[0])
         automatic = self.automatic.process(project_id, document_id, pages, **kwargs)
         if checkpoint:checkpoint('embedding',pages[0])

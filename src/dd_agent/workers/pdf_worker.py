@@ -65,13 +65,13 @@ def main():
                 page=None
                 try:
                     page=pdf[number-1]
-                    with span('pdf.text'):
+                    with span('pdf.text', page=number):
                         tp=page.get_textpage()
                         try:text=tp.get_text_range()
                         finally:tp.close()
                     target=Path(config['output_dir'])/f'page-{number}.png'
                     # 可读文字页也保留预览图，供回看；渲染图片本身不表示调用视觉识别。
-                    with span('pdf.render'):
+                    with span('pdf.render', page=number):
                         page.render(scale=config.get('render_scale',2)).to_pil().save(target)
                     count('pdf.render.pages')
                     emit({'page_number':number,'route':text_route(text),'text':text,'image_path':str(target)})

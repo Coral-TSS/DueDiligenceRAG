@@ -1,6 +1,6 @@
 # 命令行入口：python -m dd_agent 默认启动本机 FastAPI 服务。
 # import-file 只登记；read-pages 只做基础阅读；index-pages 只建索引；search 只检索。
-# process-pages 才按“基础阅读 -> 自动增强 -> 向量入库”处理指定小批页。
+# process-pages 按“基础阅读 -> 先索引 -> 视觉增强 -> 再索引”处理指定小批页。
 # 这些 CLI 诊断命令与网页后台队列不同，不能用网页暂停按钮停止它们。
 import argparse
 import sys

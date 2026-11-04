@@ -1,0 +1,7 @@
+# GTX 1070 / sm_61。PaddlePaddle GPU 3.3.x 的 CUDA 11.8 构建。
+# nvidia-cudnn-cu11==8.9.4.19 在 PyPI 上已被 yanked，依赖解析不会自动选中，
+# 但 paddlepaddle-gpu 3.3.1 需要它。请先精确安装该版本，再安装本文件。
+# pip install nvidia-cudnn-cu11==8.9.4.19
+# pip install -r requirements-paddle-cu118.txt
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu118/
+paddlepaddle-gpu>=3.3,<3.4

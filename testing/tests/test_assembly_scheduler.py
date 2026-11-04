@@ -36,7 +36,8 @@ def test_embedding_pause_also_stops_new_assembly_windows(tmp_path,database_url):
     manager.control_stage(p,d,'embedding',pause=True)
     thread=start(manager)
     try:
-        wait_for(lambda:len(calls['vision'])==13)
+        wait_for(lambda:len(calls['reading'])==13)
+        assert calls['vision']==[]
         with db.connect() as conn:
             assert conn.execute('SELECT count(*) AS n FROM dd_agent.assembly_batches WHERE document_id=%s',(d,)).fetchone()['n']==0
         manager.control_stage(p,d,'embedding',pause=False)

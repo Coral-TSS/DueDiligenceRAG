@@ -25,6 +25,8 @@ class StageScheduler:
         self.states={s:{} for s in ('reading','vision','embedding')}
         self.waiting={s:'' for s in self.states};self.current={};self.paused=[]
         self.total=0;self.last_persist=0.;self.ready_since=None
+        # index_first 进入视觉阶段后，即使视觉写回触发了新的向量任务，也先把视觉跑完。
+        self._vision_pass=False
         # 工作包可能跨多页，同一页也可贡献多个工作包。它们不能挤占页号状态。
         self.parent_counts={s:0 for s in ('pending','running','succeeded','failed','cancelled')}
         self.parent_worker=None
@@ -257,7 +259,7 @@ class StageScheduler:
 
     def _reconcile(self):
         for _ in range(4):
-            result=self.store.reconcile(self.job['id'],self.policies,bind_vision=True)
+            result=self.store.reconcile(self.job['id'],self.policies)
             for task in result['tasks']:
                 self._mark_task(task)
             if not result['has_more']:break
@@ -283,7 +285,41 @@ class StageScheduler:
             with self.lock:self.assembly_progress=dict(self.ingestion.progress)
             self._refresh_parent_work()
 
+    def _stage_open(self, stage):
+        return any(state in ('pending','running') for state in self.states[stage].values())
+
+    def _deferred_phase(self):
+        """先嵌入已读页；整卷 OCR 结束且基础索引清空后，再集中跑视觉。"""
+        with self.lock:
+            reading_open=self._stage_open('reading')
+            embedding_open=self._stage_open('embedding') or bool(self.parent_counts['pending'] or self.parent_counts['running'])
+            vision_open=self._stage_open('vision')
+            vision_paused='vision' in self.paused
+        if not self.reader_done.is_set() or reading_open or vision_paused:
+            return 'embed'
+        if self._vision_pass:
+            if vision_open:
+                return 'vision'
+            self._vision_pass=False
+            return 'embed'
+        if vision_open and not embedding_open:
+            self._vision_pass=True
+            return 'vision'
+        return 'embed'
+
+    def _deferred_settled(self):
+        if not self.reader_done.is_set():
+            return False
+        with self.lock:
+            if any(self._stage_open(stage) for stage in ('reading','vision','embedding')):
+                return False
+            if self.parent_counts['pending'] or self.parent_counts['running']:
+                return False
+            read_ok=sum(state=='succeeded' for state in self.states['reading'].values())
+            return len(self.states['vision'])>=read_ok
+
     def run(self):
+        count('ingest.index_first')
         self._control();self._persist(force=True)
         self.document=self.db.document(self.job['project_id'],self.job['document_id'])
         preflight=self.store.seed(self.job['id'])
@@ -312,8 +348,10 @@ class StageScheduler:
                 flush=pending>=self.settings.stage_window_pages or self.reader_done.is_set() or (self.ready_since is not None and monotonic()-self.ready_since>=self.settings.stage_flush_seconds)
                 worked=False
                 if flush:
-                    # Alternate stages, so a ready embedding batch is not starved by later visual work.
-                    for stage in ('vision','embedding'):
+                    # 基础索引完成前不加载视觉模型，避免 OCR／视觉／向量来回换入显存。
+                    phase=self._deferred_phase()
+                    stages=('vision',) if phase=='vision' else ('embedding',)
+                    for stage in stages:
                         try:
                             tasks=self._claims(stage,self.settings.stage_window_pages)
                             if tasks:self._execute(stage,tasks);worked=True
@@ -324,7 +362,7 @@ class StageScheduler:
                 with self.lock:
                     succeeded={n for n,s in self.states['embedding'].items() if s=='succeeded'}
                     assembly_done=self.ingestion is None or self.assembly_progress.get('terminal',False)
-                    done=self.reader_done.is_set() and len(succeeded|self._failed())==self.total and self._parent_work_done() and assembly_done
+                    done=self.reader_done.is_set() and len(succeeded|self._failed())==self.total and self._parent_work_done() and assembly_done and self._deferred_settled()
                 if done:
                     # An empty claim is not completion: all physical pages need a durable outcome.
                     with self.db.connect() as conn:

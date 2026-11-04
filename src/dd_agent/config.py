@@ -9,6 +9,8 @@ from uuid import UUID
 
 from dotenv import load_dotenv
 
+from .devices import DTYPES, PADDLE_DEVICES, TORCH_DEVICES
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -32,7 +34,22 @@ class Settings:
     vision_models_dir: Path = ROOT / 'models' / 'vision' / 'PaddleOCR-VL-1.6'
     vision_timeout_seconds: int = 300
     pdf_render_scale: float = 2.0
-    vision_regions_per_page: int = 3
+    # 扫描卷默认只增强最需要的 1 个区域；需要更密的复核时再调高。
+    vision_regions_per_page: int = 1
+    vision_max_new_tokens: int = 128
+    vision_low_score: float = 0.85
+    # 单次处理里视觉超时达到该次数后，其余区域直接标未知，不再各等满超时。
+    vision_timeout_budget: int = 3
+    ocr_device: str = 'auto'
+    ocr_enable_mkldnn: bool = False
+    # 0 表示沿用 model_cpu_threads。oneDNN 默认关闭，见 devices.describe_paddle。
+    ocr_cpu_threads: int = 0
+    vision_device: str = 'auto'
+    embedding_device: str = 'auto'
+    reranker_device: str = 'auto'
+    vision_dtype: str = 'auto'
+    embedding_dtype: str = 'auto'
+    reranker_dtype: str = 'auto'
     performance_enabled: bool = True
     db_pool_size: int = 4
     db_pool_timeout: float = 3.
@@ -90,6 +107,18 @@ class Settings:
             raise ValueError('数据库连接池容量、等待队列或超时配置无效。')
         if self.max_upload_bytes <= 0 or not 1 <= self.port <= 65535 or not 1 <= self.vision_timeout_seconds <= 1200 or not math.isfinite(self.pdf_render_scale) or not 1 <= self.pdf_render_scale <= 4 or not 1<=self.vision_regions_per_page<=10:
             raise ValueError("文件大小上限须大于 0，端口须在 1–65535 之间。")
+        if self.ocr_device not in PADDLE_DEVICES or any(v not in TORCH_DEVICES for v in (self.vision_device, self.embedding_device, self.reranker_device)):
+            raise ValueError('模型设备配置无效。OCR 用 cpu 或 gpu:0，PyTorch 模型用 cpu 或 cuda，也可用 auto。')
+        if any(v not in DTYPES for v in (self.vision_dtype, self.embedding_dtype, self.reranker_dtype)):
+            raise ValueError('模型精度只支持 auto、float32、float16 或 bfloat16。')
+        if type(self.vision_max_new_tokens) is not int or not 16 <= self.vision_max_new_tokens <= 512:
+            raise ValueError('视觉生成长度须为 16–512。')
+        if type(self.vision_timeout_budget) is not int or not 0 <= self.vision_timeout_budget <= 50:
+            raise ValueError('视觉超时预算须为 0–50。')
+        if not math.isfinite(self.vision_low_score) or not 0 <= self.vision_low_score <= 1:
+            raise ValueError('视觉低置信阈值须在 0–1 之间。')
+        if type(self.ocr_cpu_threads) is not int or not 0 <= self.ocr_cpu_threads <= 16 or type(self.ocr_enable_mkldnn) is not bool:
+            raise ValueError('OCR 线程或 oneDNN 开关无效。')
 
     @classmethod
     def from_env(cls):
@@ -119,7 +148,19 @@ class Settings:
             vision_models_dir=Path(os.getenv('DDA_VISION_MODELS_DIR') or ROOT / 'models' / 'vision' / 'PaddleOCR-VL-1.6'),
             vision_timeout_seconds=int(os.getenv('DDA_VISION_TIMEOUT_SECONDS') or '300'),
             pdf_render_scale=float(os.getenv('DDA_PDF_RENDER_SCALE') or '2'),
-            vision_regions_per_page=int(os.getenv('DDA_VISION_REGIONS_PER_PAGE') or '3'),
+            vision_regions_per_page=int(os.getenv('DDA_VISION_REGIONS_PER_PAGE') or '1'),
+            vision_max_new_tokens=int(os.getenv('DDA_VISION_MAX_NEW_TOKENS') or '128'),
+            vision_low_score=float(os.getenv('DDA_VISION_LOW_SCORE') or '0.85'),
+            vision_timeout_budget=int(os.getenv('DDA_VISION_TIMEOUT_BUDGET') or '3'),
+            ocr_device=os.getenv('DDA_OCR_DEVICE', 'auto').strip().lower(),
+            ocr_enable_mkldnn=os.getenv('DDA_OCR_ENABLE_MKLDNN', '0').strip().lower() in {'1', 'true', 'yes'},
+            ocr_cpu_threads=int(os.getenv('DDA_OCR_CPU_THREADS') or '0'),
+            vision_device=os.getenv('DDA_VISION_DEVICE', 'auto').strip().lower(),
+            embedding_device=os.getenv('DDA_EMBEDDING_DEVICE', 'auto').strip().lower(),
+            reranker_device=os.getenv('DDA_RERANKER_DEVICE', 'auto').strip().lower(),
+            vision_dtype=os.getenv('DDA_VISION_DTYPE', 'auto').strip().lower(),
+            embedding_dtype=os.getenv('DDA_EMBEDDING_DTYPE', 'auto').strip().lower(),
+            reranker_dtype=os.getenv('DDA_RERANKER_DTYPE', 'auto').strip().lower(),
             performance_enabled=os.getenv('DDA_PERFORMANCE_ENABLED', '1').strip().lower() not in {'0', 'false', 'no'},
             db_pool_size=int(os.getenv('DDA_DB_POOL_SIZE') or '4'),
             db_pool_timeout=float(os.getenv('DDA_DB_POOL_TIMEOUT') or '3'),
