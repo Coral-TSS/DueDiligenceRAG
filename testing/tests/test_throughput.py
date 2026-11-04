@@ -12,7 +12,7 @@ from dd_agent.cache import verified_content_digest
 from dd_agent.config import Settings
 from dd_agent.maintenance import inventory, rotate_log
 from dd_agent.model_runtime import residence_action
-from dd_agent.reading import render_plan
+from dd_agent.reading import image_key_for, render_plan
 from dd_agent.retrieval import parse_stored_vector, reuse_vectors
 from dd_agent.workers.vision_worker import group_items
 
@@ -109,6 +109,17 @@ def test_unchanged_chunks_reuse_vectors_and_changed_text_is_embedded():
     assert vectors[0] == vectors[2] == [0.1, 0.2] and vectors[1] is None
     assert parse_stored_vector('[0.5, 1]') == [0.5, 1.0]
     assert parse_stored_vector([1, 2]) == [1.0, 2.0]
+
+
+def test_preview_partial_stays_a_png_and_image_key_stays_under_the_data_dir(tmp_path):
+    from dd_agent.workers.pdf_worker import preview_paths
+    target, partial = preview_paths(tmp_path, 'page-{number}-x2-abc.png', 1)
+    assert target.name == 'page-1-x2-abc.png'
+    assert partial.suffix == '.png' and partial.name.endswith('.partial.png')
+    image = tmp_path / 'readings' / 'doc' / 'rendered' / target.name
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b'png')
+    assert image_key_for(tmp_path, image) == 'readings/doc/rendered/page-1-x2-abc.png'
 
 
 def test_render_plan_reuses_ocr_images_and_still_renders_text_pages(tmp_path):

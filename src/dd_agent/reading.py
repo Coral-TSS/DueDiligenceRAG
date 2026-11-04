@@ -17,10 +17,10 @@ from uuid import UUID, uuid4
 from .cache import cache_directory, file_entries, inspect_document, resolve_fingerprint
 from .config import Settings
 from .db import Database
-from .storage import Storage
+from .storage import Storage, _resolved_path
 from .performance import active, accept_worker, worker_process, span, timed, observed, count
 from .model_admission import current_control
-from .control import ProcessingDeferred, ProcessingPaused, ProcessingStopped
+from .control import ProcessingDeferred
 from .maintenance import rotate_log
 
 
@@ -200,6 +200,13 @@ def stable_render_path(root, document_id, number, scale, sha256):
     return Path(root) / 'readings' / str(document_id) / 'rendered' / f'page-{number}-x{scale:g}-{stamp}.png'
 
 
+def image_key_for(root, image_path):
+    """把渲染图收成相对数据目录的键。Windows 的 \\\\?\\ 前缀先去掉，避免和存储根对不上。"""
+    image = _resolved_path(Path(image_path))
+    base = root if isinstance(root, Path) else _resolved_path(Path(root))
+    return image.relative_to(base).as_posix()
+
+
 class Reader:
     # read() 写 document_pages（基础结果），不负责决定增强文字是否可信。
     def __init__(self,settings,database=None):
@@ -243,7 +250,7 @@ class Reader:
                 record['method']=method
                 record['status']='failed' if record.get('error_code') else 'succeeded'
                 if record.get('image_path'):
-                    record['image_key']=str(Path(record['image_path']).resolve().relative_to(self.storage.root))
+                    record['image_key']=image_key_for(self.storage.root, record['image_path'])
                 self.database.save_page(document_id,version,record)
                 count('pages.'+method+'.'+record['status'])
                 saved.add(record['page_number'])
@@ -254,16 +261,16 @@ class Reader:
         def image_for(number):
             return stable_render_path(self.storage.root, document_id, number, scale, stamp)
         reuse, render = render_plan(pending, routes, lambda number: image_for(number).is_file() and image_for(number).stat().st_size>0, force_ocr)
-        failure=[]; control=[]
+        finished=object()
         batch_limit=max(1, self.settings.ocr_page_batch)
-        incoming=Queue()
+        incoming=Queue(); done=Queue()
         enqueued=set(reuse)
         def consume():
+            # 只跑 OCR。保存和暂停检查留在调用线程，避免检查点异常留在后台线程里出不来。
             group=[]
             def flush():
                 if not group:return
                 pages=list(group); group.clear()
-                if checkpoint:checkpoint('ocr', pages[0]['page_number'])
                 with closing(ocr_records(self.settings,{
                         'models':str(self.settings.ocr_models_dir.resolve()),'pages':pages,
                         'device':self.settings.ocr_device,'rec_batch':self.settings.ocr_rec_batch,
@@ -272,18 +279,25 @@ class Reader:
                         'enable_mkldnn':self.settings.ocr_enable_mkldnn},directory)) as records:
                     for result in records:
                         if 'payload' in result:result.update(normalize_ocr(result.pop('payload')))
-                        persist(result,'ocr')
+                        done.put(result)
             try:
                 while True:
                     item=incoming.get()
                     if item is None:
-                        flush();return
+                        flush();break
                     group.append(item)
                     if len(group)>=batch_limit:flush()
-            except (ProcessingPaused, ProcessingStopped) as exc:
-                control.append(exc)
             except Exception as exc:
-                failure.append(exc)
+                done.put(exc)
+            finally:
+                # 无论成功或失败都给调用线程一个结束标记，避免它停在空队列上。
+                done.put(finished)
+        def finish_ocr():
+            while True:
+                item=done.get()
+                if item is finished:return
+                if isinstance(item, BaseException):raise item
+                persist(item,'ocr')
         worker=Thread(target=consume, name='ocr-pipeline', daemon=True)
         worker.start()
         try:
@@ -302,12 +316,14 @@ class Reader:
                             enqueued.add(page['page_number']); incoming.put(page)
                         else:persist(page,'text')
             incoming.put(None)
-            worker.join()
-            if control:raise control[0]
-            if failure:raise ReadingError('PDF／OCR 工作进程失败，请检查本地处理日志。')
+            finish_ocr()
         except ReadingError:
             if worker.is_alive():
-                incoming.put(None); worker.join()
+                incoming.put(None)
+            try:
+                finish_ocr()
+            except ReadingError:
+                pass
             # 工作进程失败时，已经保存的页保留，只为剩余页补失败记录。
             # ProcessingPaused／ProcessingStopped 不在这里捕获，让调度层正确收束状态。
             for number in set(pending)-saved:

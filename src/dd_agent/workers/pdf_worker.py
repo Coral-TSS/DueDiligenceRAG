@@ -45,6 +45,12 @@ def emit(value):
     print(json.dumps(value,ensure_ascii=False),flush=True)
 
 
+def preview_paths(directory, pattern, number):
+    """最终图和临时图都用 .png 结尾，Pillow 才能按 PNG 保存。"""
+    target = Path(directory) / pattern.format(number=number)
+    return target, target.with_name(target.stem + '.partial.png')
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('manifest')
@@ -71,13 +77,14 @@ def main():
                         try:text=tp.get_text_range()
                         finally:tp.close()
                     pattern=config.get('image_pattern') or 'page-{number}.png'
-                    target=Path(config['output_dir'])/pattern.format(number=number)
+                    target, partial = preview_paths(config['output_dir'], pattern, number)
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    partial=target.with_suffix(target.suffix+'.part')
+                    # 临时名必须仍以 .png 结尾。Pillow 靠扩展名选格式，.png.part 会让保存失败，
+                    # 整页被记成 pdf_page_failed，后面的 OCR 和 image_key 都不会发生。
                     # 可读文字页也保留预览图，供回看；渲染图片本身不表示调用视觉识别。
                     # 先写临时文件再替换，避免 OCR 重试读到半张图。
                     with span('pdf.render', page=number):
-                        page.render(scale=config.get('render_scale',2)).to_pil().save(partial)
+                        page.render(scale=config.get('render_scale',2)).to_pil().save(partial, format='PNG')
                         os.replace(partial, target)
                     count('pdf.render.pages')
                     emit({'page_number':number,'route':text_route(text),'text':text,'image_path':str(target)})
