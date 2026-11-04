@@ -19,6 +19,15 @@ from .storage import Storage
 from .control import ProcessingPaused, ProcessingStopped
 from .review import ReviewConflict
 from .performance import observed, timed, count
+
+
+def _merge_stage(left, right):
+    """把同一阶段的多段页结果拼起来。单段调用保持原对象。"""
+    merged=dict(right)
+    for key in ('processed_pages','skipped_pages','failed_pages','indexed_pages'):
+        if key in left or key in right:
+            merged[key]=sorted(set(left.get(key,[])) | set(right.get(key,[])))
+    return merged
 from .stage_jobs import StageJobs
 
 
@@ -51,16 +60,30 @@ class ProcessingPipeline:
 
     @observed('pipeline')
     def run(self, project_id, document_id, pages, checkpoint=None):
-        # 必须按此顺序：基础文字 -> 机器有效文字 -> 使用该版本文字建立向量索引。
-        # checkpoint 是协作式控制回调；下层在页／区域安全边界调用它。
-        # 不传回调时仍能处理小批材料，但不受页面上的后台任务暂停按钮控制。
+        # 整批先读完，再嵌入，再视觉，最后按新文本再嵌入。同一阶段的多段 20 页共用已加载的模型。
+        # checkpoint 在页／区域安全边界协作暂停。
+        if not pages:
+            raise ValueError('请指定有效页码。')
+        groups=[list(pages)[i:i+20] for i in range(0,len(list(pages)),20)]
         kwargs = {'checkpoint':checkpoint} if checkpoint else {}
-        if checkpoint:checkpoint('reading',pages[0])
-        reading = self.reader.read(project_id, document_id, pages, **kwargs)
-        if checkpoint:checkpoint('vision',pages[0])
-        automatic = self.automatic.process(project_id, document_id, pages, **kwargs)
-        if checkpoint:checkpoint('embedding',pages[0])
-        index = self.evidence.index(project_id, document_id, pages, **kwargs)
+        reading=None
+        for group in groups:
+            if checkpoint:checkpoint('reading',group[0])
+            reading=self.reader.read(project_id, document_id, group, **kwargs)
+        count('ingest.index_first')
+        for group in groups:
+            if checkpoint:checkpoint('embedding',group[0])
+            self.evidence.index(project_id, document_id, group, **kwargs)
+        automatic=None
+        for group in groups:
+            if checkpoint:checkpoint('vision',group[0])
+            part=self.automatic.process(project_id, document_id, group, **kwargs)
+            automatic=part if automatic is None else _merge_stage(automatic, part)
+        index=None
+        for group in groups:
+            if checkpoint:checkpoint('embedding',group[0])
+            part=self.evidence.index(project_id, document_id, group, **kwargs)
+            index=part if index is None else _merge_stage(index, part)
         return dict(reading=reading, automatic=automatic, index=index)
 
 

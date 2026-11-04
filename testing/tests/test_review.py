@@ -132,7 +132,7 @@ assert crop.getpixel((0,0))==(255,0,0)
 def test_real_offline_vision_region_with_resource_metadata(tmp_path):
     import os, subprocess
     if os.getenv('DDA_TEST_VISION_MODEL') != '1':
-        pytest.skip('Set DDA_TEST_VISION_MODEL=1 for local CPU visual model integration')
+        pytest.skip('Set DDA_TEST_VISION_MODEL=1 for local visual model integration')
     target = tmp_path/'image.png'
     code = "from PIL import Image,ImageDraw,ImageFont; im=Image.new('RGB',(1000,160),'white'); ImageDraw.Draw(im).text((30,40),'Registered capital: 2000',font=ImageFont.truetype('C:/Windows/Fonts/arial.ttf',48),fill='black'); im.save(%r)" % str(target)
     subprocess.run([str(Settings().vision_python), '-c', code], check=True, timeout=30)

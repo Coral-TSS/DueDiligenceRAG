@@ -115,13 +115,27 @@ def test_resource_deferral_never_consumes_recognition_failure_budget(tmp_path,da
         assert conn.execute("SELECT count(*) AS n FROM dd_agent.stage_attempts a JOIN dd_agent.stage_jobs s ON s.id=a.stage_job_id WHERE s.job_id=%s AND a.outcome='deferred'",(job['id'],)).fetchone()['n']>=5
 
 
-def test_slow_vision_does_not_block_native_reader_and_backlog_is_bounded(tmp_path,database_url):
+def test_paused_embedding_keeps_the_reading_backlog_bounded(tmp_path,database_url):
+    db,manager,p,d,_,calls,_,release,_=fixture(tmp_path,database_url,total=45)
+    manager.control_stage(p,d,'embedding',pause=True)
+    thread=start(manager)
+    try:
+        wait_for(lambda:len(calls['reading'])>=20, seconds=15)
+        assert len(calls['reading'])<=20
+        assert calls['vision']==[]
+        manager.control_stage(p,d,'embedding',pause=False)
+    finally:
+        release.set();thread.join(30)
+    assert not thread.is_alive() and manager.latest(p,d)['status']=='completed'
+
+
+def test_slow_vision_starts_only_after_the_volume_is_read(tmp_path,database_url):
     db,manager,p,d,_,calls,entered,release,_=fixture(tmp_path,database_url,total=45,slow=True)
     thread=start(manager)
     try:
-        assert entered.wait(8)
-        wait_for(lambda:len(calls['reading'])>=20)
-        assert len(calls['reading'])<=20  # no downstream page completed while vision 1 is held
+        assert entered.wait(15)
+        # 视觉要等整卷基础文字嵌入之后才加载，不能把阅读卡在第一页。
+        assert len(calls['reading'])==45
     finally:
         release.set();thread.join(20)
     assert not thread.is_alive() and manager.latest(p,d)['status']=='completed'
@@ -132,13 +146,19 @@ def test_stage_pause_is_persistent_and_other_stage_can_advance(tmp_path,database
     manager.control_stage(p,d,'embedding',pause=True)
     worker=start(manager)
     try:
-        wait_for(lambda:len(calls['vision'])==13)
+        wait_for(lambda:len(calls['reading'])==13)
+        # 基础索引暂停时不提前加载视觉；阅读仍可完成。
+        assert calls['vision']==[]
         assert manager.latest(p,d)['status']=='running'
         assert 'embedding' in JobManager(manager.settings,database=db).latest(p,d)['paused_stages']
+        manager.control_stage(p,d,'reading',pause=True)
+        assert 'reading' in JobManager(manager.settings,database=db).latest(p,d)['paused_stages']
+        manager.control_stage(p,d,'reading',pause=False)
         manager.control_stage(p,d,'embedding',pause=False)
     finally:
         release.set();worker.join(20)
     assert not worker.is_alive() and manager.latest(p,d)['status']=='completed'
+    assert len(calls['vision'])==13
 
 
 def test_global_pause_waits_for_inflight_work_and_resume_reuses_ocr(tmp_path,database_url):

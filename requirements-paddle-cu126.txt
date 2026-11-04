@@ -1,0 +1,4 @@
+# RTX 40 系等更新 GPU 的 Paddle CUDA 12.6 构建。不要用于 GTX 1070。
+# pip install -r requirements-paddle-cu126.txt
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/
+paddlepaddle-gpu>=3.3,<3.4

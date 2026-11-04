@@ -185,10 +185,19 @@ def _site_packages(interpreter):
     return None
 
 
+def _distribution_key(name):
+    """dist-info 目录或请求的包名。GPU 轮子目录是 paddlepaddle_gpu-版本.dist-info。"""
+    stem = name.split('-', 1)[0].lower().replace('_', '-')
+    if stem == 'paddlepaddle-gpu':
+        return 'paddlepaddle'
+    return stem
+
+
 def venv_runtime_descriptor(python, packages=('torch', 'transformers', 'tokenizers')):
     """把缓存键绑定到 worker 环境的依赖版本；无法确定时返回 None（禁用复用）。
 
     描述符＝依赖 dist-info 名称 + 虚拟环境 pyvenv.cfg 摘要（含基础解释器版本）。
+    paddlepaddle 与 paddlepaddle-gpu 视为同一个运行时依赖。
     """
     interpreter = Path(python)
     if not interpreter.is_file():
@@ -196,9 +205,9 @@ def venv_runtime_descriptor(python, packages=('torch', 'transformers', 'tokenize
     site = _site_packages(interpreter.resolve())
     if site is None:
         return None
-    wanted = {name.lower() for name in packages}
+    wanted = {_distribution_key(name) for name in packages}
     try:
-        names = sorted(p.name for p in site.glob('*.dist-info') if p.name.split('-')[0].lower() in wanted)
+        names = sorted(p.name for p in site.glob('*.dist-info') if _distribution_key(p.name) in wanted)
     except OSError:
         return None
     if not names:

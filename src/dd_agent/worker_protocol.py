@@ -59,6 +59,12 @@ def serve(load, infer, nonce):
         if current is not None:emit(dict(current,event='error',code='worker_failed'))
         return 1
     finally:
+        engine=None
+        try:
+            from dd_agent.devices import release_accelerators
+            release_accelerators()
+        except Exception:
+            pass
         performance._emit=old_emit
         if old_enabled is None:os.environ.pop('DDA_WORKER_METRICS',None)
         else:os.environ['DDA_WORKER_METRICS']=old_enabled

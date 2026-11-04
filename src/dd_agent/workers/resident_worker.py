@@ -15,10 +15,10 @@ def load(config):
     torch.set_num_threads(config.get('threads',4))
     if kind=='embedding':
         from dd_agent.workers.retrieval_worker import embedding_model
-        return kind,embedding_model(config['embedding'])
+        return kind,embedding_model(config['embedding'],config.get('device','auto'),config.get('dtype','auto'))
     if kind=='reranker':
         from dd_agent.workers.retrieval_worker import reranker_model
-        return kind,reranker_model(config['reranker'])
+        return kind,reranker_model(config['reranker'],config.get('device','auto'),config.get('dtype','auto'))
     if kind=='vision':
         from dd_agent.workers.vision_worker import load_engine
         return kind,(load_engine(config),config['max_new_tokens'])

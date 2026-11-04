@@ -146,8 +146,16 @@ class LocalModels:
 
     def records(self, mode, **payload):
         from .model_runtime import runtime_records, ModelRuntimeError
+        # 调用方传入的 device／dtype 覆盖配置。必须先取出，不能和下面的同名参数一起展开。
+        device = payload.pop('device', None)
+        dtype = payload.pop('dtype', None)
+        if device is None:
+            device = self.settings.reranker_device if mode == 'rerank' else self.settings.embedding_device
+        if dtype is None:
+            dtype = self.settings.reranker_dtype if mode == 'rerank' else self.settings.embedding_dtype
         manifest = dict(mode=mode, embedding=str(self.settings.embedding_dir.resolve()),
-                        reranker=str(self.settings.reranker_dir.resolve()), **payload)
+                        reranker=str(self.settings.reranker_dir.resolve()), threads=self.settings.model_cpu_threads,
+                        device=device, dtype=dtype, **payload)
         try:
             if self.managed and mode!='profile':
                 yield from runtime_records(self.settings,'reranker' if mode=='rerank' else 'embedding',mode,payload)
@@ -173,12 +181,21 @@ class LocalModels:
     def profile(self, verify=False):
         # worker 会读取权重计算指纹；它可防止版本混用，但每次重算都要启动进程并读全量权重。
         # 这里按“worker 环境依赖版本＋权重文件清单”缓存；命中时不启动 worker（RG-05b／K01）。
+        # float32 的缓存键不包含设备：GPU 与 CPU 共用已有索引。只有实际精度离开 float32 才换键。
+        from .devices import describe_torch, probe_torch
+        probed = probe_torch(self.settings.retrieval_python)
+        capability = tuple(probed['capability']) if probed.get('capability') else None
+        spec = describe_torch(self.settings.embedding_device, self.settings.embedding_dtype, cuda_available=probed['cuda'],
+                              capability=capability, bf16_supported=bool(probed.get('bf16')))
         def compute():
-            return self.one('profile')['version']
+            return self.one('profile', device=spec['device'], dtype=spec['dtype'])['version']
+        parameters = dict(embedding=str(self.settings.embedding_dir.resolve()))
+        if spec['dtype'] != 'float32':
+            parameters['dtype'] = spec['dtype']
         # worker 脚本参与清单：指纹算法改动即失效；环境版本无法识别时退化为完整复验。
         entries = file_entries(model_files(self.settings) + [WORKER_SCRIPT, Path(__file__)])
         return resolve_fingerprint('embedding_weights', venv_runtime_descriptor(self.settings.retrieval_python),
-            'embedding-profile-v1', dict(embedding=str(self.settings.embedding_dir.resolve())),
+            'embedding-profile-v1', parameters,
             entries, compute, verify=verify, directory=cache_directory(self.settings))['value']
 
     def one(self, mode, **payload):
@@ -194,7 +211,8 @@ class LocalModels:
         for page in pages:
             # A page is a scheduling boundary: keep the resident, release admission.
             # Consume done before the caller opens its page publication transaction.
-            yield from list(self.records('embed_pages',pages=[page]))
+            with span('page.embedding', page=page.get('page_number') if type(page.get('page_number')) is int else None):
+                yield from list(self.records('embed_pages',pages=[page]))
 
     @timed('embedding.request')
     def embed(self, texts, query=False):

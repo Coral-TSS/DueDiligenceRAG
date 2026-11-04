@@ -22,6 +22,8 @@ from .model_admission import current_control
 from .control import ProcessingDeferred
 
 
+# 字符串里的 cpu 是历史算法编号，不是运行设备。GPU 与 CPU 的 OCR 文本已核对为一致，
+# 设备、线程、oneDNN 都不写入阅读版本，避免换卡后把已成功页全部重跑。
 PIPELINE_VERSION='pdfium-text-v2-ppocr5-cpu-v1'
 OCR_MODEL_NAMES = ['PP-OCRv5_mobile_det','PP-OCRv5_server_rec','PP-LCNet_x1_0_doc_ori','PP-LCNet_x1_0_textline_ori']
 OCR_MODEL_SUFFIXES = ['pdiparams','json','yml']
@@ -33,18 +35,20 @@ class ReadingError(Exception):
     pass
 
 
-def parse_pages(value,total):
-    # CLI 可传 1-5,8；限制小批页数，避免一次调用直接把整个卷宗放入推理内存。
+def parse_pages(value,total,limit=20):
+    # 阅读／索引的单次调用仍最多 20 页。process-pages 传入材料总页数，由流水线按阶段拆开。
+    if type(limit) is not int or limit<1:
+        raise ValueError('页数上限无效。')
     pages=set()
     for item in value.split(','):
         if not re.fullmatch(r'\d+(?:-\d+)?',item.strip()):
-            raise ValueError('页码格式须为 1-5,8；单批最多 20 页。')
+            raise ValueError('页码格式须为 1-5,8。')
         parts=[int(x) for x in item.strip().split('-')]
         first,last=parts[0],parts[-1]
-        if first<1 or last<first or last>total or last-first>=20:
-            raise ValueError('页码超出范围，或单批超过 20 页。')
+        if first<1 or last<first or last>total or last-first>=limit:
+            raise ValueError('页码超出范围，或超过本次页数上限。')
         pages.update(range(first,last+1))
-        if len(pages)>20:raise ValueError('单批最多 20 页。')
+        if len(pages)>limit:raise ValueError('超过本次页数上限。')
     return sorted(pages)
 
 
@@ -74,7 +78,8 @@ def worker_records(python,worker,manifest,directory,timeout_seconds=1200):
     manifest_path.write_text(json.dumps(manifest,ensure_ascii=False),encoding='utf-8')
     # 只传必要系统变量，不把主应用的数据库连接或模型服务凭据放进 worker 环境。
     env={key:value for key,value in os.environ.items() if key.upper() in {'SYSTEMROOT','WINDIR','PATH','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC'}}
-    env.update(PYTHONUTF8='1',PYTHONIOENCODING='utf-8',HF_HUB_OFFLINE='1',PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True',PADDLE_PDX_CACHE_HOME=str(directory/'cache'))
+    env.update(PYTHONUTF8='1',PYTHONIOENCODING='utf-8',HF_HUB_OFFLINE='1',PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True',PADDLE_PDX_CACHE_HOME=str(directory/'cache'),
+        PYTORCH_CUDA_ALLOC_CONF=os.environ.get('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True'))
     if active(): env['DDA_WORKER_METRICS'] = '1'
     script=Path(__file__).parent/'workers'/(worker+'.py')
     with (directory/(worker+'.log')).open('a',encoding='utf-8') as log:
@@ -113,7 +118,9 @@ def ocr_records(settings,manifest,directory):
                 for page in manifest['pages']:
                     # Release admission before SQL save/checkpoint, then let a
                     # waiting query run before requesting the next OCR page.
-                    yield from list(runtime_records(settings,'ocr','recognize',dict(manifest,pages=[page])))
+                    number = page.get('page_number') if type(page.get('page_number')) is int else None
+                    with span('page.ocr', page=number):
+                        yield from list(runtime_records(settings,'ocr','recognize',dict(manifest,pages=[page])))
             else:yield from runtime_records(settings,'ocr','recognize',manifest)
         else:
             with model_slot(settings.data_dir):
@@ -226,7 +233,11 @@ class Reader:
             if ocr_pages:
                 # 一次 worker 调用复用这一批的 Paddle 实例；当前尚非跨批次常驻服务。
                 if checkpoint:checkpoint('ocr',ocr_pages[0]['page_number'])
-                with closing(ocr_records(self.settings,{'models':str(self.settings.ocr_models_dir.resolve()),'pages':ocr_pages},directory)) as records:
+                with closing(ocr_records(self.settings,{
+                        'models':str(self.settings.ocr_models_dir.resolve()),'pages':ocr_pages,
+                        'device':self.settings.ocr_device,
+                        'threads':self.settings.ocr_cpu_threads or self.settings.model_cpu_threads,
+                        'enable_mkldnn':self.settings.ocr_enable_mkldnn},directory)) as records:
                     for result in records:
                         if 'payload' in result:result.update(normalize_ocr(result.pop('payload')))
                         persist(result,'ocr')
