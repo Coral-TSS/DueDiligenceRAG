@@ -46,8 +46,9 @@ def fixture(tmp_path, database_url, total=13, slow=False, failed=()):
     db=app.state.database
     with client(app) as c: p=project(c); d=upload(c,p).json()['document']['id']
     db.provider.start()  # Same bounded provider lifetime as the real app; no per-operation TCP setup.
+    # 生产默认会建父子索引。这组调度测试只验证页级阶段，显式关闭以免改写原断言。
     settings=Settings(database_url=database_url,data_dir=tmp_path,stage_window_pages=10,
-        stage_backlog_pages=20,stage_flush_seconds=.1)
+        stage_backlog_pages=20,stage_flush_seconds=.1,parent_index_mode='off')
     entered,release=Event(),Event()
     calls={'reading':[], 'vision':[]}
     class Reader:
@@ -232,11 +233,12 @@ def test_progress_distinguishes_stage_counts():
     import subprocess
     from dd_agent.config import ROOT
     js="""const {processingView}=require(process.argv[1]); console.log(processingView({status:'running',
-        progress:{scheduler:'stages-v1',total_pages:20,stages:{reading:{succeeded:13},vision:{succeeded:10},embedding:{succeeded:3,paused:true}}}}).text);"""
+        progress:{scheduler:'stages-v1',total_pages:20,chunk_rebuild:{done:4,total:20},stages:{reading:{succeeded:13},vision:{succeeded:10},embedding:{succeeded:3,paused:true}}}}).text);"""
     result=subprocess.run([str(Settings().harness_node),'-e',js,str(ROOT/'src/dd_agent/static/progress.js')],
         capture_output=True,text=True,encoding='utf-8',timeout=10)
     assert result.returncode==0,result.stderr
     assert '基础识别 13' in result.stdout and '向量入库 3' in result.stdout
+    assert '切片重建 4/20 页' in result.stdout
     assert '已保存整批进度' not in result.stdout
 
 

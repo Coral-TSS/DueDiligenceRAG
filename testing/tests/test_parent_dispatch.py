@@ -1,4 +1,5 @@
 """Real work packets consumed by the scheduler without inventing page coverage."""
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -120,7 +121,7 @@ def live_pipeline(db,index,manager,job_id):
     class Automatic:
         def version(self):return 'no-enhancement'
         def process(self,*a,**k):return dict(failed_pages=[])
-    pipeline=ProcessingPipeline(manager.settings,reader=Reader(),automatic=Automatic(),
+    pipeline=ProcessingPipeline(replace(manager.settings,parent_index_mode='off'),reader=Reader(),automatic=Automatic(),
         evidence=EvidenceService(manager.settings,database=db,models=TinyModels()),database=db)
     pipeline.parent_work=ParentWork(index,manager.stages)
     manager.factory=lambda:pipeline

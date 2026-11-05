@@ -65,7 +65,7 @@ class StageScheduler:
                 stages[stage].update(paused=stage in self.paused,waiting_reason=self.waiting[stage],current_page=self.current.get(stage))
             indexed={n for n,s in self.states['embedding'].items() if s=='succeeded'}
             return dict(scheduler='stages-v1',stages=stages,total_pages=self.total,
-                parent_index_mode='shadow' if self.ingestion is not None else 'off',
+                parent_index_mode=self.settings.parent_index_mode if self.ingestion is not None else 'off',
                 processed_pages=len(indexed),failed_pages=sorted(self._failed()),
                 parent_work=dict(self.parent_counts),
                 failed_work_count=self.parent_counts['failed']+self.parent_counts['cancelled'],

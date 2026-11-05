@@ -51,7 +51,9 @@ class ProcessingPipeline:
         不删除已发布向量、尾段或收据，也不切换当前页级检索。
         """
         if self.assembly_ingestion is not None:return self.assembly_ingestion
-        if self.settings.parent_index_mode!='shadow' or str(job['document_id']) not in self.settings.parent_index_documents:
+        mode=self.settings.parent_index_mode
+        selected=mode=='on' or (mode=='shadow' and str(job['document_id']) in self.settings.parent_index_documents)
+        if not selected:
             return None
         from .parent_index import ParentIndex
         from .repair_ingestion import RepairingAssemblyIngestion

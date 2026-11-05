@@ -76,7 +76,9 @@ class Settings:
     stage_backlog_pages: int = 40
     stage_flush_seconds: float = 3.
     # 影子索引必须同时显式开启和指定材料；不允许用 * 启动客户整卷。
-    parent_index_mode: str = 'off'
+    # on：每份材料都建父子索引，检索优先用子片段召回、父片段做上下文。
+    # shadow 仍要指定最多 20 份材料；off 只保留页级索引。
+    parent_index_mode: str = 'on'
     parent_index_documents: tuple[str, ...] = ()
     # 查询与后台建库独立；默认自动发现完整父子材料，可选名单缩小范围。
     search_index_mode: str = 'mixed'
@@ -105,8 +107,8 @@ class Settings:
     harness_node: Path = ROOT / '.local/harness/runtime/node-v22.19.0-win-x64/node.exe'
 
     def __post_init__(self):
-        if self.parent_index_mode not in ('off','shadow'):
-            raise ValueError('跨页索引模式只支持 off 或 shadow。')
+        if self.parent_index_mode not in ('on','off','shadow'):
+            raise ValueError('跨页索引模式只支持 on、off 或 shadow。')
         if not isinstance(self.parent_index_documents,tuple) or len(self.parent_index_documents)>20:
             raise ValueError('跨页试运行材料名单须为最多 20 个 UUID。')
         try:documents=tuple(str(UUID(str(value))) for value in self.parent_index_documents)
@@ -231,7 +233,7 @@ class Settings:
             stage_window_pages=int(os.getenv('DDA_STAGE_WINDOW_PAGES') or '10'),
             stage_backlog_pages=int(os.getenv('DDA_STAGE_BACKLOG_PAGES') or '40'),
             stage_flush_seconds=float(os.getenv('DDA_STAGE_FLUSH_SECONDS') or '3'),
-            parent_index_mode=os.getenv('DDA_PARENT_INDEX_MODE','off').strip().lower(),
+            parent_index_mode=os.getenv('DDA_PARENT_INDEX_MODE','on').strip().lower(),
             parent_index_documents=tuple(value.strip() for value in os.getenv('DDA_PARENT_INDEX_DOCUMENT_IDS','').split(',') if value.strip()),
             search_index_mode=os.getenv('DDA_SEARCH_INDEX_MODE','mixed').strip().lower(),
             search_parent_documents=tuple(value.strip() for value in os.getenv('DDA_SEARCH_PARENT_DOCUMENT_IDS','').split(',') if value.strip()),

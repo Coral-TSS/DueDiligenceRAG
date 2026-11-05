@@ -56,7 +56,7 @@ class Database:
         try:
             with self.connect() as conn:
                 row = conn.execute("SELECT max(version) AS version FROM dd_agent.schema_version").fetchone()
-                if row["version"] != 16:
+                if row["version"] != 17:
                     return {"status": "needs_migration", "message": "数据库版本与应用不符，请检查迁移版本。"}
         except (psycopg.errors.UndefinedTable, psycopg.errors.InvalidSchemaName):
             return {"status": "needs_migration", "message": "数据库已连接，请先运行 python -m dd_agent init-db 初始化表。"}

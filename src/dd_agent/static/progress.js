@@ -68,6 +68,8 @@
      text+="。";
     }
    }
+   const rebuild=p.chunk_rebuild;
+   if(rebuild&&rebuild.total)text+=` 切片重建 ${rebuild.done||0}/${rebuild.total} 页。`;
    text+="这些是阶段处理数量，不表示法律审查或识别质量已通过。";
   }else text+=` 已保存整批进度 ${p.processed_pages||0}/${p.total_pages||"待检测"} 页（不是有效索引覆盖）。`;
   // 批次检查点不是当前有效向量数量，尤其不能当作识别质量或全文审查完成度。
