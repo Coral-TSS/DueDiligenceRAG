@@ -17,7 +17,8 @@ from .db import database_scope
 
 def main():
     parser = argparse.ArgumentParser(description="尽调材料本地工作区")
-    parser.add_argument("command", nargs="?", choices=["serve", "init-db", "check", "harness-check", "inspect-pdf", "import-file", "read-pages", "process-pages", "index-pages", "search", "inventory"], default="serve")
+    parser.add_argument("command", nargs="?", choices=["serve", "init-db", "check", "harness-check", "inspect-pdf", "import-file", "read-pages", "process-pages", "index-pages", "search", "inventory", "reindex-lexical"], default="serve")
+    parser.add_argument('--force', action='store_true', help='reindex-lexical 时重写全部全文索引；默认只补 lexemes 为空的旧片段')
     parser.add_argument('--file', type=Path, help='本地原件绝对路径')
     parser.add_argument('--project-id', type=UUID)
     parser.add_argument('--document-id', type=UUID)
@@ -129,11 +130,23 @@ def dispatch(args, parser, settings, database):
     elif args.command == "init-db":
         # 只有显式初始化命令运行迁移；普通 serve 不自动修改数据库 schema。
         try:
-            database.migrate()
+            counts = database.migrate()
         except (psycopg.Error, ValueError):
             print("初始化失败：请检查数据库连接、账号建表权限及 .env 配置。")
             return 1
         print("数据库表已初始化。")
+        print(f"全文索引已核对：页片段补写 {counts['evidence_chunks']} 条，父子片段补写 {counts['parent_index_children']} 条。")
+    elif args.command == "reindex-lexical":
+        # 只根据已入库的片段正文补写或重建全文词项，不重新 OCR，也不重新嵌入。
+        from .lexical import backfill_lexemes
+        try:
+            database.migrate(lexical=False)
+            counts = backfill_lexemes(database, force=args.force)
+        except (psycopg.Error, ValueError):
+            print("全文索引补建失败：请先确认数据库已初始化，并且当前账号可以更新片段表。")
+            return 1
+        action = "重建" if args.force else "补写"
+        print(f"全文索引已{action}：页片段 {counts['evidence_chunks']} 条，父子片段 {counts['parent_index_children']} 条。")
     elif args.command == "check":
         status = database.health()
         print(status["message"])

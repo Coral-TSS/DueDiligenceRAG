@@ -15,6 +15,7 @@ import tempfile
 from uuid import UUID, uuid4
 
 from .cache import cache_directory, file_entries, resolve_fingerprint, venv_runtime_descriptor
+from .lexical import build_keyword_query, document_tsvector, fuse_for, page_key, prepare_keyword_rows
 from .model_results import ModelResults
 from .model_admission import request_scope, current_control, AdmissionError
 from .control import ProcessingDeferred
@@ -415,9 +416,33 @@ class EvidenceService:
                 (document_id, number, version, snapshot['pipeline_version'], snapshot['updated_at'], snapshot['source_revision']))
             for ordinal, (chunk, vector) in enumerate(zip(chunks, encoded, strict=True)):
                 conn.execute('''INSERT INTO dd_agent.evidence_chunks
-                    (id,document_id,page_number,index_version,ordinal,start_offset,end_offset,text,embedding)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector)''',
-                    (uuid4(), document_id, number, version, ordinal, chunk['start_offset'], chunk['end_offset'], chunk['text'], vector))
+                    (id,document_id,page_number,index_version,ordinal,start_offset,end_offset,text,embedding,lexemes)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector,%s::tsvector)''',
+                    (uuid4(), document_id, number, version, ordinal, chunk['start_offset'], chunk['end_offset'], chunk['text'], vector, document_tsvector(chunk['text'])))
+
+    def _recall(self,queries,project_id,version,query,*,excluded_documents=()):
+        """向量与关键词各自取有界候选，合并后再交给重排。单路开关不再查询另一路。"""
+        control=current_control();control.check()
+        settings=self.settings
+        vector_rows=[]
+        if settings.retrieval_mode!='keyword':
+            def embed():
+                values=self.models.embed([query],query=True)
+                if len(values)!=1:raise RetrievalError('查询向量数量不符。')
+                return values[0]
+            vector=self._model_result('embedding',project_id,query,[],embed,valid_vector)
+            control.check()
+            vector_rows=queries.candidates(project_id,version,valid_vector(vector),
+                excluded_documents=excluded_documents,limit=settings.retrieval_vector_limit)
+        keyword_rows=[]
+        if settings.retrieval_mode!='vector':
+            plan=build_keyword_query(query)
+            if plan.tsquery:
+                found=queries.keyword_candidates(project_id,version,plan.tsquery,plan.needles,
+                    excluded_documents=excluded_documents,limit=settings.retrieval_keyword_limit)
+                keyword_rows=prepare_keyword_rows(found,plan)[:settings.retrieval_keyword_limit]
+        control.check()
+        return fuse_for(settings,vector_rows,keyword_rows,key=page_key)
 
     def _model_result(self,kind,project_id,query,texts,compute,validate):
         control=current_control();control.check()
@@ -459,13 +484,7 @@ class EvidenceService:
         coverage=queries.coverage(project_id,version)
         response=dict(index_version=version,coverage=coverage,results=[],status='not_indexed')
         if not coverage['indexed_pages']:return response
-        def embed():
-            values=self.models.embed([query],query=True)
-            if len(values)!=1:raise RetrievalError('查询向量数量不符。')
-            return values[0]
-        vector=self._model_result('embedding',project_id,query,[],embed,valid_vector)
-        control.check()
-        rows=queries.candidates(project_id,version,valid_vector(vector))
+        rows=self._recall(queries,project_id,version,query)
         if rows:
             texts=[r['text'] for r in rows]
             def validate_scores(scores):

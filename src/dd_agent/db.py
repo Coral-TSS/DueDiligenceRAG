@@ -56,7 +56,7 @@ class Database:
         try:
             with self.connect() as conn:
                 row = conn.execute("SELECT max(version) AS version FROM dd_agent.schema_version").fetchone()
-                if row["version"] != 15:
+                if row["version"] != 16:
                     return {"status": "needs_migration", "message": "数据库版本与应用不符，请检查迁移版本。"}
         except (psycopg.errors.UndefinedTable, psycopg.errors.InvalidSchemaName):
             return {"status": "needs_migration", "message": "数据库已连接，请先运行 python -m dd_agent init-db 初始化表。"}
@@ -64,13 +64,18 @@ class Database:
             return {"status": "database_unavailable", "message": "数据库无法连接或权限不足，请检查服务、账号及 .env 配置后重试。"}
         return {"status": "ready", "message": "材料工作区已就绪。文件和 OCR 处理保存在本机，不调用云端模型。"}
 
-    def migrate(self):
+    def migrate(self, *, lexical=True):
         # 迁移文件按名称执行；数据库锁避免两个应用同时初始化。
         # 当前迁移采用可重复执行的 SQL，而非仅看“文件执行过”就跳过。
+        # 表结构提交后再补写空的全文词项，避免把整库重写放进同一条迁移事务。
         with self.connect() as conn:
             conn.execute("SELECT pg_advisory_xact_lock(74332101)")
             for source in sorted((Path(__file__).parent / 'migrations').glob('*.sql')):
                 conn.execute(source.read_text(encoding='utf-8'))
+        if not lexical:
+            return {'evidence_chunks': 0, 'parent_index_children': 0}
+        from .lexical import backfill_lexemes
+        return backfill_lexemes(self)
 
     def projects(self):
         with self.connect() as conn:

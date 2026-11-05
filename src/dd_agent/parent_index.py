@@ -13,6 +13,7 @@ from .assembly_store import AssemblyStore
 from .config import Settings
 from .db import Database
 from .performance import timed,count
+from .lexical import document_tsvector
 from .retrieval import LocalModels,split_text,valid_vector
 from .stage_publication import StageSuperseded
 from .token_budget import LocalTokenBudget
@@ -258,10 +259,10 @@ class ParentIndex:
                      Jsonb(parent['dependencies']),parent['boundary'],parent['continuation_from']))
             for child,vector in zip(plan['children'],vectors,strict=True):
                 conn.execute('''INSERT INTO dd_agent.parent_index_children
-                    (build_id,parent_id,id,ordinal,start_offset,end_offset,text,source_spans,separators,embedding_tokens,reranker_tokens,embedding)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector)''',
+                    (build_id,parent_id,id,ordinal,start_offset,end_offset,text,source_spans,separators,embedding_tokens,reranker_tokens,embedding,lexemes)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector,%s::tsvector)''',
                     (plan['id'],child['parent_id'],child['id'],child['ordinal'],child['start'],child['end'],child['text'],
-                     Jsonb(child['spans']),Jsonb(child['separators']),child['embedding_tokens'],child['reranker_tokens'],vector))
+                     Jsonb(child['spans']),Jsonb(child['separators']),child['embedding_tokens'],child['reranker_tokens'],vector,document_tsvector(child['text'])))
             for dep in plan['dependencies']:
                 conn.execute('''INSERT INTO dd_agent.parent_index_dependencies
                     (build_id,document_id,page_number,source_revision,readiness,quality) VALUES(%s,%s,%s,%s,%s,%s)''',
