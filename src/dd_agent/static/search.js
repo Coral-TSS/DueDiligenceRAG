@@ -2,6 +2,18 @@
 // 检索页只展示本地召回与重排后的原文候选，不执行生成回答或法律分析。
 // 片段、相关分数、机器文字状态与来源链接分别展示；相关性不能替代事实核实。
 const node = id => document.getElementById(id);
+function recallSuffix(hit) {
+  const recall = hit && hit.recall;
+  if (!recall || !Array.isArray(recall.channels) || !recall.channels.length) return "";
+  const label = {vector: "向量", keyword: "关键词"};
+  const parts = recall.channels.map(channel => {
+    const score = channel === "vector" ? recall.vector_score : recall.keyword_score;
+    const shown = typeof score === "number" ? score.toFixed(3) : "—";
+    return `${label[channel] || channel} ${shown}`;
+  });
+  const fusion = typeof recall.fusion_score === "number" ? ` · 融合 ${recall.fusion_score.toFixed(3)}` : "";
+  return ` · 召回 ${parts.join("、")}${fusion}`;
+}
 let activeSearch = null;
 let resultGeneration = 0;
 const contextReads = new Set();
@@ -53,7 +65,7 @@ function parentResult(hit) {
     link.textContent = `查看第 ${page} 页原件 `; links.append(link);
   }
   const meta = document.createElement("p"); meta.className = "muted";
-  meta.textContent = `跨页原文候选 · 事实未核实 · 相关分数 ${hit.rerank_score.toFixed(3)}`;
+  meta.textContent = `跨页原文候选 · 事实未核实 · 相关分数 ${hit.rerank_score.toFixed(3)}${recallSuffix(hit)}`;
   const details = document.createElement("details"), summary = document.createElement("summary");
   summary.textContent = "展开连续上下文（含补充原文）";
   const body = document.createElement("p"); body.className = "evidence-text";
@@ -102,7 +114,7 @@ node("search-form").onsubmit = async event => {
       const article = document.createElement("article"); article.className = "search-hit";
       const title = document.createElement("a"); title.href = hit.source_url; title.textContent = `${hit.filenames[0]} · PDF 第 ${hit.page_number} 页`;
       const text = document.createElement("p"); text.className = "evidence-text"; text.textContent = hit.text;
-      const meta = document.createElement("p"); meta.className = "muted"; meta.textContent = `${hit.method === "ocr" ? "OCR 来源" : "原生文字来源"} · ${({machine_enhanced:"已自动增强，事实未核实",machine_checked:"机器文字一致，事实未核实",machine_uncertain:"含未知信息"})[hit.verification] || "未核实"} · 相关分数 ${hit.rerank_score.toFixed(3)}`;
+      const meta = document.createElement("p"); meta.className = "muted"; meta.textContent = `${hit.method === "ocr" ? "OCR 来源" : "原生文字来源"} · ${({machine_enhanced:"已自动增强，事实未核实",machine_checked:"机器文字一致，事实未核实",machine_uncertain:"含未知信息"})[hit.verification] || "未核实"} · 相关分数 ${hit.rerank_score.toFixed(3)}${recallSuffix(hit)}`;
       article.append(title, text, meta); node("search-results").append(article);
     }
   } catch (error) {

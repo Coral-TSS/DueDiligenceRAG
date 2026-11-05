@@ -4,6 +4,11 @@
 """
 from contextlib import nullcontext
 
+def _recall_limit(limit):
+    if type(limit) is not int or not 1<=limit<=50:
+        raise ValueError('召回条数无效。')
+
+
 CURRENT = '''FROM dd_agent.indexed_pages i
  JOIN dd_agent.documents d ON d.id=i.document_id
  JOIN dd_agent.effective_document_pages p ON p.document_id=i.document_id AND p.page_number=i.page_number
@@ -41,16 +46,36 @@ class SearchQueries:
               WHERE d.project_id=%s AND d.status='registered') totals''',args).fetchone()
         return dict(row,complete=bool(row['indexed_pages']) and row['indexed_pages']==row['total_pages'] and not row['unread_documents'])
 
-    def candidates(self,project_id,version,vector,*,excluded_documents=()):
+    def candidates(self,project_id,version,vector,*,excluded_documents=(),limit=12):
+        _recall_limit(limit)
         exclude=' AND NOT i.document_id=ANY(%s::uuid[])' if excluded_documents else ''
-        args=(vector,project_id,version)+((list(excluded_documents),) if excluded_documents else ())+(vector,)
+        args=(vector,project_id,version)+((list(excluded_documents),) if excluded_documents else ())+(vector,limit)
         with self.database.connect() as conn:
             return conn.execute('''SELECT c.id,c.document_id,c.page_number,c.text,c.start_offset,c.end_offset,
                 live.method,live.pipeline_version,live.verification,1-(c.embedding <=> %s::public.vector) AS similarity
                 FROM dd_agent.evidence_chunks c
                 JOIN (SELECT i.document_id,i.page_number,i.index_version,p.method,p.pipeline_version,p.verification '''+CURRENT+exclude+''') live
                 ON c.document_id=live.document_id AND c.page_number=live.page_number AND c.index_version=live.index_version
-                ORDER BY c.embedding <=> %s::public.vector,c.id LIMIT 12''',args).fetchall()
+                ORDER BY c.embedding <=> %s::public.vector,c.id LIMIT %s''',args).fetchall()
+
+    def keyword_candidates(self,project_id,version,tsquery,needles,*,excluded_documents=(),limit=12):
+        """全文索引命中。字面包含优先，其次是词项紧密度；条数有上界。"""
+        _recall_limit(limit)
+        if not tsquery:
+            return []
+        needles=tuple(needles)
+        if len(needles)>8:raise ValueError('关键词核对项过多。')
+        exclude=' AND NOT i.document_id=ANY(%s::uuid[])' if excluded_documents else ''
+        exact=('('+' OR '.join(['strpos(lower(c.text),%s)>0']*len(needles))+') DESC,') if needles else ''
+        args=(tsquery,project_id,version)+((list(excluded_documents),) if excluded_documents else ())+needles+(limit,)
+        with self.database.connect() as conn:
+            return conn.execute('''WITH q AS (SELECT %s::tsquery AS tsq), live AS (
+                SELECT i.document_id,i.page_number,i.index_version,p.method,p.pipeline_version,p.verification '''+CURRENT+exclude+''')
+                SELECT c.id,c.document_id,c.page_number,c.text,c.start_offset,c.end_offset,
+                  live.method,live.pipeline_version,live.verification,ts_rank_cd(c.lexemes,q.tsq) AS keyword_score
+                FROM q JOIN dd_agent.evidence_chunks c ON c.lexemes @@ q.tsq
+                JOIN live ON c.document_id=live.document_id AND c.page_number=live.page_number AND c.index_version=live.index_version
+                ORDER BY '''+exact+''' ts_rank_cd(c.lexemes,q.tsq) DESC,c.id LIMIT %s''',args).fetchall()
 
     def finalize(self,project_id,version,ids,*,conn=None,excluded_documents=()):
         if len(ids)>12:raise ValueError('Candidate budget exceeded')

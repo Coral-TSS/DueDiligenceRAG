@@ -88,6 +88,15 @@ class Settings:
     model_max_waiting: int = 8
     model_cpu_threads: int = 4
     search_timeout_seconds: float = 120.
+    # hybrid 同时走向量和关键词；vector / keyword 只留一路，便于对照。融合发生在重排之前。
+    retrieval_mode: str = 'hybrid'
+    retrieval_fusion: str = 'rrf'
+    retrieval_vector_limit: int = 12
+    retrieval_keyword_limit: int = 12
+    retrieval_candidate_limit: int = 12
+    retrieval_rrf_k: int = 60
+    retrieval_vector_weight: float = 1.
+    retrieval_keyword_weight: float = 1.
     harness_python: Path = ROOT / '.venv-harness' / 'Scripts' / 'python.exe'
     # 下面是项目内 Harness 测试基线，与 D:\Tools\Deepseek Harness 桌面版分开。
     harness_home: Path = ROOT / '.local' / 'harness' / 'home'
@@ -117,6 +126,19 @@ class Settings:
             raise ValueError('查询材料 UUID 不能重复。')
         object.__setattr__(self,'search_parent_documents',selected)
         if not math.isfinite(self.search_timeout_seconds) or not .05<=self.search_timeout_seconds<=1200:raise ValueError('查询超时预算无效。')
+        if self.retrieval_mode not in ('hybrid', 'vector', 'keyword'):
+            raise ValueError('检索模式只支持 hybrid、vector 或 keyword。')
+        if self.retrieval_fusion not in ('rrf', 'weighted'):
+            raise ValueError('召回融合只支持 rrf 或 weighted。')
+        if any(type(v) is not int or not 1 <= v <= 50 for v in (self.retrieval_vector_limit, self.retrieval_keyword_limit)):
+            raise ValueError('各路召回条数须为 1–50。')
+        if type(self.retrieval_candidate_limit) is not int or not 1 <= self.retrieval_candidate_limit <= 12:
+            raise ValueError('送入重排的候选条数须为 1–12。')
+        if type(self.retrieval_rrf_k) is not int or not 1 <= self.retrieval_rrf_k <= 1000:
+            raise ValueError('RRF 平滑常数须为 1–1000。')
+        weights = (self.retrieval_vector_weight, self.retrieval_keyword_weight)
+        if any(isinstance(v, bool) or type(v) not in (int, float) or not math.isfinite(v) or not 0 < v <= 100 for v in weights):
+            raise ValueError('召回权重须为大于 0 且不超过 100 的数。')
         if any(not math.isfinite(v) or not .05<=v<=1200 for v in (self.model_idle_seconds,self.model_load_timeout,self.model_queue_timeout)) or type(self.model_max_waiting) is not int or not 1<=self.model_max_waiting<=128 or type(self.model_cpu_threads) is not int or not 1<=self.model_cpu_threads<=16:
             raise ValueError('模型等待、空闲时间或线程预算无效。')
         if type(self.stage_window_pages) is not int or not 1<=self.stage_window_pages<=20 or type(self.stage_backlog_pages) is not int or not self.stage_window_pages<=self.stage_backlog_pages<=200 or not math.isfinite(self.stage_flush_seconds) or not .1<=self.stage_flush_seconds<=30:
@@ -220,6 +242,14 @@ class Settings:
             model_max_waiting=int(os.getenv('DDA_MODEL_MAX_WAITING') or '8'),
             model_cpu_threads=int(os.getenv('DDA_MODEL_CPU_THREADS') or '4'),
             search_timeout_seconds=float(os.getenv('DDA_SEARCH_TIMEOUT_SECONDS') or '120'),
+            retrieval_mode=os.getenv('DDA_RETRIEVAL_MODE', 'hybrid').strip().lower(),
+            retrieval_fusion=os.getenv('DDA_RETRIEVAL_FUSION', 'rrf').strip().lower(),
+            retrieval_vector_limit=int(os.getenv('DDA_RETRIEVAL_VECTOR_LIMIT') or '12'),
+            retrieval_keyword_limit=int(os.getenv('DDA_RETRIEVAL_KEYWORD_LIMIT') or '12'),
+            retrieval_candidate_limit=int(os.getenv('DDA_RETRIEVAL_CANDIDATE_LIMIT') or '12'),
+            retrieval_rrf_k=int(os.getenv('DDA_RETRIEVAL_RRF_K') or '60'),
+            retrieval_vector_weight=float(os.getenv('DDA_RETRIEVAL_VECTOR_WEIGHT') or '1'),
+            retrieval_keyword_weight=float(os.getenv('DDA_RETRIEVAL_KEYWORD_WEIGHT') or '1'),
             harness_python=Path(os.getenv('DDA_HARNESS_PYTHON') or ROOT / '.venv-harness/Scripts/python.exe'),
             harness_home=Path(os.getenv('DDA_HARNESS_HOME') or ROOT / '.local/harness/home'),
             harness_workspace=Path(os.getenv('DDA_HARNESS_WORKSPACE') or ROOT / '.local/harness/workspace'),

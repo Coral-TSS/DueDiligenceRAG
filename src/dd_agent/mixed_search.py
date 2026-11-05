@@ -6,6 +6,7 @@
 import math
 from time import monotonic
 from uuid import UUID
+from .lexical import build_keyword_query, fuse_for, mixed_key, prepare_keyword_rows
 from .model_admission import request_scope,current_control,AdmissionError
 from .parent_coverage import ParentCoverage
 from .parent_search import ParentSearch
@@ -54,18 +55,33 @@ class MixedSearch:
         for doc in documents:
             control.check();state=self.coverage.inspect(project_id,doc,parent_version)
             if state and state['eligible']:selected.append(doc)
-        def embed():
-            values=self.evidence.models.embed([query],query=True)
-            if len(values)!=1:raise RetrievalError('查询向量数量不符。')
-            return values[0]
-        vector=self.evidence._model_result('embedding',project_id,query,[],embed,valid_vector)
-        old=self.pages.candidates(project_id,page_version,valid_vector(vector),excluded_documents=selected)
-        children=self.parent.queries.candidates(project_id,parent_version,vector,documents=selected,
-            current_receipts_only=True) if selected else []
-        rows=[dict(r,index_kind='page') for r in old]+[dict(r,index_kind='parent_child') for r in children]
-        # 相同向量空间的两条有界 SQL 各最多 12 条，合并后统一压到 12，
-        # 避免双轨令重排请求量翻倍。距离只用于候选选择，不能充当重排分数。
-        rows=sorted(rows,key=lambda r:(-r['similarity'],r['index_kind'],str(r['id'])))[:12]
+        settings=self.evidence.settings
+        vector_rows=[]
+        if settings.retrieval_mode!='keyword':
+            def embed():
+                values=self.evidence.models.embed([query],query=True)
+                if len(values)!=1:raise RetrievalError('查询向量数量不符。')
+                return values[0]
+            vector=self.evidence._model_result('embedding',project_id,query,[],embed,valid_vector)
+            old=self.pages.candidates(project_id,page_version,valid_vector(vector),excluded_documents=selected,
+                limit=settings.retrieval_vector_limit)
+            children=self.parent.queries.candidates(project_id,parent_version,vector,documents=selected,
+                current_receipts_only=True,limit=settings.retrieval_vector_limit) if selected else []
+            # 两套索引先按相似度各取有界名单，再合并到该路上限。距离只用于候选选择。
+            vector_rows=sorted([dict(r,index_kind='page') for r in old]+[dict(r,index_kind='parent_child') for r in children],
+                key=lambda r:(-r['similarity'],r['index_kind'],str(r['id'])))[:settings.retrieval_vector_limit]
+        keyword_rows=[]
+        if settings.retrieval_mode!='vector':
+            plan=build_keyword_query(query)
+            if plan.tsquery:
+                old=self.pages.keyword_candidates(project_id,page_version,plan.tsquery,plan.needles,
+                    excluded_documents=selected,limit=settings.retrieval_keyword_limit)
+                children=self.parent.queries.keyword_candidates(project_id,parent_version,plan.tsquery,plan.needles,
+                    documents=selected,current_receipts_only=True,limit=settings.retrieval_keyword_limit) if selected else []
+                keyword_rows=prepare_keyword_rows([dict(r,index_kind='page') for r in old]+[dict(r,index_kind='parent_child') for r in children],plan)
+                keyword_rows=keyword_rows[:settings.retrieval_keyword_limit]
+        # 融合后再交给一次重排，重排条数仍受 candidate_limit 限制，默认不超过原来的 12 条。
+        rows=fuse_for(settings,vector_rows,keyword_rows,key=mixed_key)
         def validate(scores):
             if not isinstance(scores,list) or len(scores)!=len(rows) or any(
                     type(v) not in (int,float) or not math.isfinite(v) or not 0<=v<=1 for v in scores):

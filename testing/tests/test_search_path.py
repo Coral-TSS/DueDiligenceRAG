@@ -114,7 +114,8 @@ def test_search_sql_returns_fixed_rows_for_20_and_649_page_corpora(tmp_path,data
         counters=json.loads(next(folder.glob('*.json')).read_text(encoding='utf-8'))['counters']
         measurements.append((counters['sql.calls'],counters['sql.fetched_rows']))
     assert measurements[0]==measurements[1]
-    assert measurements[0][0]<=6 and measurements[0][1]<=27
+    # 向量召回之外多一次有界关键词查询；20 页和 649 页的调用次数、返回行数仍然相同。
+    assert measurements[0][0]<=7 and measurements[0][1]<=27
 
 
 def test_invalid_model_scores_are_never_cached(tmp_path,database_url):
