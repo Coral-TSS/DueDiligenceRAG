@@ -51,7 +51,7 @@ class SearchQueries:
         exclude=' AND NOT i.document_id=ANY(%s::uuid[])' if excluded_documents else ''
         args=(vector,project_id,version)+((list(excluded_documents),) if excluded_documents else ())+(vector,limit)
         with self.database.connect() as conn:
-            return conn.execute('''SELECT c.id,c.document_id,c.page_number,c.text,c.start_offset,c.end_offset,
+            return conn.execute('''SELECT c.id,c.document_id,c.page_number,c.text,c.start_offset,c.end_offset,c.source_spans,
                 live.method,live.pipeline_version,live.verification,1-(c.embedding <=> %s::public.vector) AS similarity
                 FROM dd_agent.evidence_chunks c
                 JOIN (SELECT i.document_id,i.page_number,i.index_version,p.method,p.pipeline_version,p.verification '''+CURRENT+exclude+''') live
@@ -71,7 +71,7 @@ class SearchQueries:
         with self.database.connect() as conn:
             return conn.execute('''WITH q AS (SELECT %s::tsquery AS tsq), live AS (
                 SELECT i.document_id,i.page_number,i.index_version,p.method,p.pipeline_version,p.verification '''+CURRENT+exclude+''')
-                SELECT c.id,c.document_id,c.page_number,c.text,c.start_offset,c.end_offset,
+                SELECT c.id,c.document_id,c.page_number,c.text,c.start_offset,c.end_offset,c.source_spans,
                   live.method,live.pipeline_version,live.verification,ts_rank_cd(c.lexemes,q.tsq) AS keyword_score
                 FROM q JOIN dd_agent.evidence_chunks c ON c.lexemes @@ q.tsq
                 JOIN live ON c.document_id=live.document_id AND c.page_number=live.page_number AND c.index_version=live.index_version

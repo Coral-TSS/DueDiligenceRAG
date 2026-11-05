@@ -18,7 +18,7 @@ from .retrieval import LocalModels,split_text,valid_vector
 from .stage_publication import StageSuperseded
 from .token_budget import LocalTokenBudget
 
-CHILD_VERSION='parent-child-700-overlap80-token-4096-2048-v1'
+CHILD_VERSION='layout-child-clause-table-v1'
 
 
 class ParentBatchTooLarge(ValueError):

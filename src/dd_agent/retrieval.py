@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import psycopg
+from psycopg.types.json import Jsonb
 from time import monotonic
 import math
 import os
@@ -15,6 +16,7 @@ import tempfile
 from uuid import UUID, uuid4
 
 from .cache import cache_directory, file_entries, resolve_fingerprint, venv_runtime_descriptor
+from .chunks import layout_chunks, split_text
 from .lexical import build_keyword_query, document_tsvector, fuse_for, page_key, prepare_keyword_rows
 from .model_results import ModelResults
 from .model_admission import request_scope, current_control, AdmissionError
@@ -26,7 +28,7 @@ from .reading import worker_records, ReadingError
 from .performance import observed, timed, span, count, mark
 
 
-CHUNK_VERSION = 'page-paragraph-700-overlap80-v1'
+CHUNK_VERSION = 'layout-clause-table-v1'
 # 改变分块规则时同步修改版本，避免相同模型下的新旧分块被视为相同索引。
 # 与 workers/retrieval_worker.py 的 profile() 筛选保持一致：改动任一侧须同步调整。
 PROFILE_SUFFIXES = {'.json', '.safetensors', '.txt'}
@@ -54,35 +56,6 @@ class SearchCancelled(RetrievalError):
 
 class SearchTimeout(RetrievalError):
     pass
-
-
-@timed('chunk')
-def split_text(text):
-    """Prefer paragraph boundaries; preserve exact source slices and long-paragraph overlap."""
-    # 输入是一页有效文字，长度单位是 Python 字符，不是 tokenizer 的 token。
-    # 每块最多 700 字符，优先在后半段的换行处分开；硬切长段落时重叠 80 字符。
-    # start_offset 从 0 起，end_offset 不包含末尾字符，可直接 text[start:end] 回查原文。
-    # 当前不跨页，也没有识别法律条款／表格结构；不要误以为这是语义分块。
-    chunks = []
-    start = 0
-    while start < len(text):
-        while start < len(text) and text[start].isspace():
-            start += 1
-        if start == len(text):
-            break
-        end = min(start + 700, len(text))
-        boundary = text.rfind('\n', start + 350, end)
-        if end < len(text) and boundary > start:
-            end = boundary + 1
-        trimmed = end
-        while trimmed > start and text[trimmed - 1].isspace():
-            trimmed -= 1
-        chunks.append(dict(text=text[start:trimmed], start_offset=start, end_offset=trimmed))
-        if end == len(text):
-            break
-        start = end if text[end - 1].isspace() else end - 80
-    count('chunks.created', len(chunks))
-    return chunks
 
 
 def reuse_vectors(chunks, stored):
@@ -311,9 +284,16 @@ class EvidenceService:
                 if len(page['text']) > 100000:
                     result['failed_pages'].append(number)
                     continue
-                chunks = split_text(page['text'])
-                if chunks: pending[number] = chunks
-                else: empty.append(number)
+                pending[number] = page
+        if pending:
+            grouped = layout_chunks([pending[number] for number in sorted(pending)])
+            for number in list(pending):
+                chunks = grouped.get(number) or []
+                if chunks:
+                    pending[number] = chunks
+                else:
+                    pending.pop(number)
+                    empty.append(number)
         # 空文字页直接发布零片段页状态，不进入 Embedding（PF-08）。
         # 页级发布记录不等于存在可检索的实质文字；不发布会被每批反复重试。
         for number in empty:
@@ -395,6 +375,24 @@ class EvidenceService:
         count('pages.index.failed', len(result['failed_pages']))
         return result
 
+    def reindex_document(self, project_id, document_id, progress=None):
+        """用已保存的正文和行框重新切片、嵌入。不重新 OCR，也不重新做视觉增强。"""
+        project_id, document_id = UUID(str(project_id)), UUID(str(document_id))
+        if self.database.document(project_id, document_id) is None:
+            raise RetrievalError('材料不存在或不属于当前项目。')
+        total = self.database.reading(document_id).get('page_count') or 0
+        if not total:
+            raise RetrievalError('材料尚未阅读，不能只重建切片。')
+        indexed, failed = [], []
+        for start in range(1, total + 1, 20):
+            batch = list(range(start, min(total + 1, start + 20)))
+            outcome = self.index(project_id, document_id, batch)
+            indexed.extend(outcome['indexed_pages'])
+            failed.extend(outcome['failed_pages'])
+            if progress:
+                progress(batch[-1], total)
+        return dict(pages=total, indexed_pages=sorted(set(indexed)), failed_pages=sorted(set(failed)), index_version=self.version())
+
     @timed('index.publish')
     def publish(self, document_id, snapshot, version, chunks, vectors):
         # 原子发布一页：替换该页同索引版本的记录，并写入全部片段。
@@ -415,10 +413,11 @@ class EvidenceService:
                 (document_id,page_number,index_version,pipeline_version,source_updated_at,source_revision) VALUES (%s,%s,%s,%s,%s,%s)''',
                 (document_id, number, version, snapshot['pipeline_version'], snapshot['updated_at'], snapshot['source_revision']))
             for ordinal, (chunk, vector) in enumerate(zip(chunks, encoded, strict=True)):
+                spans = chunk.get('spans') or [dict(page_number=number, start=chunk['start_offset'], end=chunk['end_offset'])]
                 conn.execute('''INSERT INTO dd_agent.evidence_chunks
-                    (id,document_id,page_number,index_version,ordinal,start_offset,end_offset,text,embedding,lexemes)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector,%s::tsvector)''',
-                    (uuid4(), document_id, number, version, ordinal, chunk['start_offset'], chunk['end_offset'], chunk['text'], vector, document_tsvector(chunk['text'])))
+                    (id,document_id,page_number,index_version,ordinal,start_offset,end_offset,text,embedding,lexemes,source_spans)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector,%s::tsvector,%s)''',
+                    (uuid4(), document_id, number, version, ordinal, chunk['start_offset'], chunk['end_offset'], chunk['text'], vector, document_tsvector(chunk['text']), Jsonb(spans)))
 
     def _recall(self,queries,project_id,version,query,*,excluded_documents=()):
         """向量与关键词各自取有界候选，合并后再交给重排。单路开关不再查询另一路。"""

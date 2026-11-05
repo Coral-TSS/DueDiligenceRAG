@@ -17,7 +17,7 @@ from .db import database_scope
 
 def main():
     parser = argparse.ArgumentParser(description="尽调材料本地工作区")
-    parser.add_argument("command", nargs="?", choices=["serve", "init-db", "check", "harness-check", "inspect-pdf", "import-file", "read-pages", "process-pages", "index-pages", "search", "inventory", "reindex-lexical"], default="serve")
+    parser.add_argument("command", nargs="?", choices=["serve", "init-db", "check", "harness-check", "inspect-pdf", "import-file", "read-pages", "process-pages", "index-pages", "reindex-chunks", "search", "inventory", "reindex-lexical"], default="serve")
     parser.add_argument('--force', action='store_true', help='reindex-lexical 时重写全部全文索引；默认只补 lexemes 为空的旧片段')
     parser.add_argument('--file', type=Path, help='本地原件绝对路径')
     parser.add_argument('--project-id', type=UUID)
@@ -75,6 +75,34 @@ def dispatch(args, parser, settings, database):
             print(str(exc));return 1
         except (psycopg.Error,OSError):
             print('自动处理失败，请检查数据库、模型路径和数据目录。');return 1
+    elif args.command == 'reindex-chunks':
+        from .retrieval import EvidenceService, RetrievalError
+        from psycopg.types.json import Jsonb
+        try:
+            if not args.project_id:parser.error('reindex-chunks 需要 --project-id')
+            service = EvidenceService(settings, database=database)
+            documents = [args.document_id] if args.document_id else [row['id'] for row in database.documents(args.project_id)]
+            if not documents:raise RetrievalError('项目里没有可重建的材料。')
+            summaries = []
+            for document_id in documents:
+                def show(done, total, document_id=document_id):
+                    print(f'切片重建 {done}/{total} 页', flush=True)
+                    with database.connect() as conn:
+                        job = conn.execute('''SELECT id,progress,status FROM dd_agent.processing_jobs
+                            WHERE project_id=%s AND document_id=%s ORDER BY created_at DESC LIMIT 1''',
+                            (args.project_id, document_id)).fetchone()
+                        if job and job['status'] not in ('queued', 'running', 'pause_requested'):
+                            progress = dict(job['progress'] or {})
+                            progress['chunk_rebuild'] = dict(done=done, total=total)
+                            conn.execute('UPDATE dd_agent.processing_jobs SET progress=%s, updated_at=clock_timestamp() WHERE id=%s',
+                                (Jsonb(progress), job['id']))
+                summaries.append(dict(document_id=str(document_id), **service.reindex_document(args.project_id, document_id, progress=show)))
+            print(json.dumps(dict(documents=summaries), ensure_ascii=False, default=str))
+            return 1 if any(item['failed_pages'] for item in summaries) else 0
+        except (RetrievalError, ValueError) as exc:
+            print(str(exc));return 1
+        except (psycopg.Error, OSError):
+            print('切片重建失败，请检查数据库和嵌入模型。');return 1
     elif args.command in ('index-pages', 'search'):
         from .retrieval import EvidenceService, RetrievalError
         from .reading import parse_pages
