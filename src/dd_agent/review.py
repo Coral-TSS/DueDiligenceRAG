@@ -3,19 +3,18 @@
 # AutomaticProcessor 复用这里的 LocalVision／recognize() 保存视觉候选，人工版本只读留档。
 # 实际的“采用哪段文字／何时标未知”在 automatic.py，不由本文件替用户确认事实。
 import math
-import hashlib
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
-from .cache import cache_directory, file_entries, resolve_fingerprint
+from .cache import cache_directory, file_entries, package_version, resolve_fingerprint, verified_content_digests
 from .config import Settings, vision_token_ceiling
 from .db import Database
 from .reading import worker_records, ReadingError
 from .retrieval import model_slot, RetrievalError
 from .storage import Storage
-from .performance import timed, observed, count
+from .performance import timed, observed
 from .model_admission import current_control
 from .control import ProcessingDeferred
 
@@ -61,15 +60,18 @@ class LocalVision:
             # 前缀中的 cpu-fp32 是历史指纹，不表示本次推理设备。
             # 设备、精度、注意力和 KV cache 的识别文本已核对一致，不能写进指纹，否则换卡会重跑视觉。
             # 生成长度改的是截断边界，由自动增强版本单独绑定，不放进这份权重指纹。
-            digest=hashlib.sha256(b'vision-region-v1-cpu-fp32')
-            for file in sorted(self.settings.vision_models_dir.glob('*')):
-                if file.suffix in {'.safetensors','.json'}:
-                    digest.update(file.name.encode())
-                    with file.open('rb') as stream:
-                        for block in iter(lambda:stream.read(4*1024*1024),b''):
-                            digest.update(block); count('fingerprint.vision.bytes', len(block))
-            digest.update(str(self.settings.vision_timeout_seconds).encode())
-            return digest.hexdigest()
+            # 同一次读取顺便写下 worker 的 model_version 清单，加载时不再把 1.93GB 再哈希一遍。
+            files = sorted(path for path in self.settings.vision_models_dir.glob('*') if path.suffix in {'.safetensors', '.json'})
+            labeled = [(path.name.encode(), path) for path in files]
+            timeout = str(self.settings.vision_timeout_seconds).encode()
+            jobs = [dict(kind='vision.profile', prefix=b'vision-region-v1-cpu-fp32', suffix=timeout)]
+            torch_version = package_version(self.settings.vision_python, 'torch')
+            transformers_version = package_version(self.settings.vision_python, 'transformers')
+            if torch_version and transformers_version:
+                ceiling = vision_token_ceiling(self.settings)
+                worker_prefix = f'vl-region-ocr-fp32-eager-v1|{torch_version}|{transformers_version}|{ceiling}'.encode()
+                jobs.append(dict(kind='vision.worker', prefix=worker_prefix, suffix=b''))
+            return verified_content_digests(labeled, jobs, cache_directory(self.settings))[0]
         files = sorted(p for p in self.settings.vision_models_dir.glob('*') if p.suffix in {'.safetensors','.json'})
         # 算法本体所在文件参与清单：改动实现即失效，不靠权重目录时间判断。
         entries = file_entries(files + [Path(__file__)])

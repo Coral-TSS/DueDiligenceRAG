@@ -229,6 +229,12 @@ def recognize_batch(payload, engine=None):
     results = [None] * len(items)
     for tokens, indexes in group_items(items, ceiling, payload.get('batch') or 1):
         chunk = [items[index] for index in indexes]
+        count('vision.generate.calls')
+        count('vision.generate.items', len(chunk))
+        if len(chunk) == 1:
+            count('vision.generate.singleton')
+        else:
+            count('vision.generate.batched')
         produced = None
         if len(chunk) > 1:
             try:

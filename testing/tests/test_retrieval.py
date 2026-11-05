@@ -173,8 +173,10 @@ def test_worker_failure_after_first_output_is_not_accepted_as_success(tmp_path, 
         raise m.ReadingError('worker exited unsuccessfully after emitting output')
     monkeypatch.setattr(m, 'worker_records', failed_worker)
     models = m.LocalModels(Settings(data_dir=tmp_path))
+    # verify=True 绕过进程内指纹缓存。--models 里前面的真模型用例会把同一权重路径的摘要留在内存里，
+    # 普通 profile() 会直接命中，不再进入 worker。这里要测的就是 worker 先吐一行再失败。
     with pytest.raises(m.RetrievalError):
-        models.profile()
+        models.profile(verify=True)
 
 
 def test_real_offline_qwen_pgvector_roundtrip(tmp_path, database_url):

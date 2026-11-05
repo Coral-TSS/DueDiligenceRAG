@@ -3,6 +3,7 @@
 # “.venv-docling”是当前环境目录名，实际 pdf_worker 使用 pypdfium2，不等于已接 Docling 全能力。
 import json
 from contextlib import closing
+from contextvars import copy_context
 import hashlib
 import math
 import os
@@ -125,9 +126,7 @@ def ocr_records(settings,manifest,directory):
                 for start in range(0, len(pages), batch):
                     group=pages[start:start+batch]
                     # 一批推理结束后再把结果交给保存，避免发布事务占着模型许可。
-                    number = group[0].get('page_number') if type(group[0].get('page_number')) is int else None
-                    with span('page.ocr', page=number):
-                        ready=list(runtime_records(settings,'ocr','recognize',dict(payload,pages=group)))
+                    ready=list(runtime_records(settings,'ocr','recognize',dict(payload,pages=group)))
                     yield from ready
             else:yield from runtime_records(settings,'ocr','recognize',payload)
         else:
@@ -268,21 +267,37 @@ class Reader:
         def consume():
             # 只跑 OCR。保存和暂停检查留在调用线程，避免检查点异常留在后台线程里出不来。
             group=[]
+            def density(result):
+                rows=result.get('lines') or []
+                texts=[row.get('text') or '' for row in rows if isinstance(row, dict)]
+                return len(texts), sum(len(text) for text in texts)
             def flush():
                 if not group:return
                 pages=list(group); group.clear()
-                with closing(ocr_records(self.settings,{
-                        'models':str(self.settings.ocr_models_dir.resolve()),'pages':pages,
-                        'device':self.settings.ocr_device,'rec_batch':self.settings.ocr_rec_batch,
-                        'page_batch':self.settings.ocr_page_batch,
-                        'threads':self.settings.ocr_cpu_threads or self.settings.model_cpu_threads,
-                        'enable_mkldnn':self.settings.ocr_enable_mkldnn},directory)) as records:
-                    for result in records:
-                        if 'payload' in result:result.update(normalize_ocr(result.pop('payload')))
-                        done.put(result)
+                detail={}
+                number=pages[0].get('page_number') if type(pages[0].get('page_number')) is int else None
+                with span('page.ocr', page=number, detail=detail):
+                    with closing(ocr_records(self.settings,{
+                            'models':str(self.settings.ocr_models_dir.resolve()),'pages':pages,
+                            'device':self.settings.ocr_device,'rec_batch':self.settings.ocr_rec_batch,
+                            'page_batch':self.settings.ocr_page_batch,
+                            'threads':self.settings.ocr_cpu_threads or self.settings.model_cpu_threads,
+                            'enable_mkldnn':self.settings.ocr_enable_mkldnn},directory)) as records:
+                        for result in records:
+                            if 'payload' in result:result.update(normalize_ocr(result.pop('payload')))
+                            lines, chars=density(result)
+                            detail['lines']=detail.get('lines', 0)+lines
+                            detail['chars']=detail.get('chars', 0)+chars
+                            count('ocr.lines', lines)
+                            count('ocr.chars', chars)
+                            if type(result.get('page_number')) is int:
+                                done.put(dict(result, _ocr_lines=lines, _ocr_chars=chars))
+                            else:
+                                done.put(result)
             try:
                 while True:
-                    item=incoming.get()
+                    with span('ocr.render_wait'):
+                        item=incoming.get()
                     if item is None:
                         flush();break
                     group.append(item)
@@ -297,8 +312,13 @@ class Reader:
                 item=done.get()
                 if item is finished:return
                 if isinstance(item, BaseException):raise item
+                lines, chars=item.pop('_ocr_lines', None), item.pop('_ocr_chars', None)
+                number=item.get('page_number') if type(item.get('page_number')) is int else None
+                if type(lines) is int:
+                    with span('ocr.page', page=number, lines=lines, chars=chars if type(chars) is int else 0):
+                        pass
                 persist(item,'ocr')
-        worker=Thread(target=consume, name='ocr-pipeline', daemon=True)
+        worker=Thread(target=copy_context().run, args=(consume,), name='ocr-pipeline', daemon=True)
         worker.start()
         try:
             for number in reuse:

@@ -100,6 +100,11 @@ class Trace:
             safe['page'] = page
         if type(region) is int and region >= 0:
             safe['region'] = region
+        # 行数、字符数、token 数只是数量，供对照页面疏密。不保存正文。
+        for key in ('lines', 'chars', 'tokens'):
+            number = value.get(key)
+            if type(number) is int and number >= 0:
+                safe[key] = number
         pid = value.get('pid')
         peak = value.get('peak_rss_mb')
         with self.lock:
@@ -202,7 +207,7 @@ def worker_process(pid):
 
 
 @contextmanager
-def span(name, *, page=None, region=None):
+def span(name, *, page=None, region=None, lines=None, chars=None, tokens=None, detail=None):
     if not active() and os.environ.get('DDA_WORKER_METRICS') != '1':
         yield; return
     start, status = perf_counter(), 'ok'
@@ -215,6 +220,17 @@ def span(name, *, page=None, region=None):
             value['page'] = page
         if type(region) is int and region >= 0:
             value['region'] = region
+        noted = dict(detail or {})
+        if type(lines) is int:
+            noted['lines'] = lines
+        if type(chars) is int:
+            noted['chars'] = chars
+        if type(tokens) is int:
+            noted['tokens'] = tokens
+        for key in ('lines', 'chars', 'tokens'):
+            number = noted.get(key)
+            if type(number) is int and number >= 0:
+                value[key] = number
         memory = _memory(os.getpid())
         if memory: value['peak_rss_mb'] = memory[1]
         trace = _active.get()

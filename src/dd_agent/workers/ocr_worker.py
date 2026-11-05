@@ -45,6 +45,61 @@ def _page_number(page):
     return page.get('page_number') if type(page.get('page_number')) is int else None
 
 
+def _payload_text(result):
+    payload = result.json
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    output = payload.get('res', payload) if isinstance(payload, dict) else {}
+    texts = output.get('rec_texts') or [] if isinstance(output, dict) else []
+    kept = [text for text in texts if str(text).strip()]
+    return len(kept), sum(len(str(text)) for text in kept)
+
+
+def _watch_submodels(ocr, page):
+    """PaddleOCR 3 把检测和识别放在流水线子模型上。能挂上就分开计时，挂不上仍有 ocr.inference。"""
+    pipe = getattr(ocr, 'paddlex_pipeline', None)
+    if pipe is None:
+        return []
+    restores = []
+    for attr, stage in (('text_det_model', 'ocr.detection'), ('text_rec_model', 'ocr.recognition')):
+        model = getattr(pipe, attr, None)
+        if model is None or not hasattr(model, 'predict'):
+            continue
+        original = model.predict
+        def wrapped(*args, _original=original, _stage=stage, _page=page, **kwargs):
+            with span(_stage, page=_page):
+                return _original(*args, **kwargs)
+        model.predict = wrapped
+        restores.append((model, original))
+    return restores
+
+
+def _restore_submodels(restores):
+    for model, original in restores:
+        model.predict = original
+
+
+def _predict(ocr, data, page):
+    detail = {}
+    restores = _watch_submodels(ocr, page)
+    try:
+        with span('ocr.inference', page=page, detail=detail):
+            results = list(ocr.predict(data))
+            lines = chars = 0
+            for result in results:
+                try:
+                    count_lines, count_chars = _payload_text(result)
+                except Exception:
+                    count_lines = count_chars = 0
+                lines += count_lines
+                chars += count_chars
+            detail['lines'] = lines
+            detail['chars'] = chars
+    finally:
+        _restore_submodels(restores)
+    return results
+
+
 def _decode(page, result):
     payload=result.json
     if isinstance(payload,str):payload=json.loads(payload)
@@ -60,8 +115,8 @@ def _decode(page, result):
 def _one(ocr, page):
     try:
         count('ocr.page.attempts')
-        with redirect_stdout(sys.stderr), span('ocr.inference', page=_page_number(page)):
-            results=list(ocr.predict(page['image_path']))
+        with redirect_stdout(sys.stderr):
+            results=_predict(ocr, page['image_path'], _page_number(page))
         return _decode(page, results[0])
     except Exception:
         return {'page_number':page['page_number'],'error_code':'ocr_page_failed'}
@@ -79,8 +134,8 @@ def recognize_pages(ocr,config):
         group=pages[start:start+batch]
         try:
             count('ocr.page.attempts', len(group))
-            with redirect_stdout(sys.stderr), span('ocr.inference', page=_page_number(group[0])):
-                results=list(ocr.predict([page['image_path'] for page in group]))
+            with redirect_stdout(sys.stderr):
+                results=_predict(ocr, [page['image_path'] for page in group], _page_number(group[0]))
             if len(results)!=len(group):
                 raise ValueError('batch')
             for page, result in zip(group, results):

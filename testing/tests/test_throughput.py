@@ -84,6 +84,43 @@ def test_group_items_batches_by_token_budget_and_keeps_order():
         group_items([{'max_new_tokens': 200}], 128, 2)
 
 
+def test_two_prefixes_hash_the_weight_once(tmp_path):
+    from dd_agent.cache import verified_content_digests
+    from dd_agent.performance import capture
+    weight = tmp_path / 'model.safetensors'
+    weight.write_bytes(b'abc' * 1000)
+    labeled = [(b'model.safetensors', weight)]
+    store = tmp_path / 'cache'
+    with capture(tmp_path / 'perf', 'trial'):
+        profile, worker = verified_content_digests(labeled, [
+            dict(kind='vision.profile', prefix=b'vision-region-v1-cpu-fp32', suffix=b'300'),
+            dict(kind='vision.worker', prefix=b'vl-region-ocr-fp32-eager-v1|2|5|128', suffix=b''),
+        ], store)
+    manual_profile = hashlib.sha256(b'vision-region-v1-cpu-fp32' + b'model.safetensors' + weight.read_bytes() + b'300').hexdigest()
+    manual_worker = hashlib.sha256(b'vl-region-ocr-fp32-eager-v1|2|5|128' + b'model.safetensors' + weight.read_bytes()).hexdigest()
+    assert profile == manual_profile and worker == manual_worker
+    record = json.loads(next((tmp_path / 'perf').glob('*.json')).read_text(encoding='utf-8'))
+    assert record['counters']['fingerprint.weight_bytes'] == weight.stat().st_size
+    with capture(tmp_path / 'again', 'trial'):
+        assert verified_content_digest(b'vl-region-ocr-fp32-eager-v1|2|5|128', labeled, store, 'vision.worker') == worker
+    second = json.loads(next((tmp_path / 'again').glob('*.json')).read_text(encoding='utf-8'))
+    assert second['counters'].get('fingerprint.weight_bytes', 0) == 0
+
+
+def test_page_events_keep_line_counts_and_drop_text(tmp_path):
+    from dd_agent.performance import capture, span
+    with capture(tmp_path, 'trial'):
+        detail = {}
+        with span('page.ocr', page=3, detail=detail):
+            detail['lines'] = 12
+            detail['chars'] = 340
+        with span('ocr.page', page=3, lines=12, chars=340):
+            pass
+    stored = json.loads(next(tmp_path.glob('*.json')).read_text(encoding='utf-8'))
+    assert stored['events'][0]['lines'] == 12 and stored['events'][0]['chars'] == 340
+    assert 'text' not in stored['events'][0]
+
+
 def test_weight_manifest_reuses_digest_until_size_changes(tmp_path):
     weight = tmp_path / 'model.safetensors'
     weight.write_bytes(b'abc' * 1000)
