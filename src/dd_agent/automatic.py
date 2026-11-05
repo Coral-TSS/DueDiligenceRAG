@@ -251,7 +251,7 @@ def choose_region(base,candidate):
         return dict(decision='unknown',text=mask_unknown(base),reason='身份文字、数值／单位、日期或文本对应关系无法消解')
     if normalized(base)==normalized(visual):
         # consistent 只表示两路文字一致，不是人工确认或事实已核实。
-        return dict(decision='consistent',text=base,reason='两路文字一致；仅为机器核对')
+        return dict(decision='consistent',text=base,reason='OCR 与视觉识别相同，事实未核实')
     return dict(decision='enhanced',text=visual,reason='位置与文字对应，数值／单位保护通过')
 
 
