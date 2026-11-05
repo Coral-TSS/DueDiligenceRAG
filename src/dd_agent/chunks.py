@@ -6,7 +6,7 @@ PaddleOCR 入库时已经保存行文字和四点坐标。条款、标题、列�
 """
 import re
 
-from .performance import count
+from .performance import count, timed
 
 
 MAX_CHARS = 700
@@ -172,6 +172,7 @@ def _pack(text, start, end, kind):
     return chunks
 
 
+@timed('chunk')
 def split_text(text, lines=None):
     """把一页切成不超过 700 字、且等于原文切片的片段。"""
     if not text or not str(text).strip():
