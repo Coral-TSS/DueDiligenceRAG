@@ -16,7 +16,7 @@
   if(p.scheduler==="stages-v1"){
    if(p.parent_index_mode==="shadow")text+=" 跨页索引试运行，当前检索使用页级索引。";
    else if(p.parent_index_mode==="off")text+=" 跨页索引未启用，已保存成果保留。";
-   const names={reading:"基础识别",vision:"机器文字",embedding:"向量入库"};
+   const names={reading:"基础识别",vision:"视觉增强",embedding:"向量入库"};
    const waiting={model_resource:"等待模型资源",backpressure:"等待下游释放积压",paused:"已暂停"};
    for(const [name,label] of Object.entries(names)){
     const value=p.stages?.[name]||{};

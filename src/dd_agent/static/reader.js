@@ -5,7 +5,7 @@ const params = new URLSearchParams(location.search);
 const project = params.get("project"), documentId = params.get("document");
 const base = `/api/projects/${project}/documents/${documentId}`;
 const CATALOG_BATCH = 100, POLL_ACTIVE = 3000, POLL_HIDDEN = 15000;
-const outcomes = {base:"基础识别", enhanced:"已自动增强", checked:"两路机器文字一致", uncertain:"存在无法可靠识别的信息"};
+const outcomes = {base:"基础识别", enhanced:"已视觉增强", checked:"OCR 与视觉识别一致", uncertain:"存在无法可靠识别的信息"};
 const state = {
   catalog:new Map(), cursor:null, loaded:false, pageCount:0, readingVersion:"",
   contentRevision:"", statusRevision:"", catalogGeneration:0,
@@ -110,16 +110,16 @@ async function loadSummary(number,token) {
     if (data.source_revision!==revision) throw new Error("该页来源已变化，请刷新结果。");
     state.summaryCache={page:number,revision,data};
     $("machine-regions").replaceChildren();
-    $("route-state").textContent="尚无当前版本的自动增强结果。";
+    $("route-state").textContent="尚无当前版本的视觉增强结果。";
     if (data.current) {
       const result=data.current;
-      $("route-state").textContent=`${outcomes[result.outcome]||result.outcome} · ${result.route?.reason||"自动处理"}。机器处理结果尚不等于已核实事实。`;
+      $("route-state").textContent=`${outcomes[result.outcome]||result.outcome} · ${result.route?.reason||"自动处理"}。识别结果尚不等于已核实事实。`;
       for (const region of result.regions||[]) {
-        const line=paragraph($("machine-regions"),`${region.decision==="unknown" ? "未知" : region.decision==="enhanced" ? "已增强" : "一致"}：${region.reason}`,"div");
+        const line=paragraph($("machine-regions"),`${region.decision==="unknown" ? "未知" : region.decision==="enhanced" ? "已视觉增强" : "一致"}：${region.reason}`,"div");
         line.className="machine-region"; paragraph(line,region.text,"pre");
       }
     }
-    $("history-counts").textContent=`保留视觉候选 ${data.candidate_count||0} 条、历史人工记录 ${data.adoption_count||0} 条；下方按批查看机器增强历史。`;
+    $("history-counts").textContent=`保留视觉候选 ${data.candidate_count||0} 条、历史人工记录 ${data.adoption_count||0} 条；下方按批查看视觉增强历史。`;
   } catch (caught) { if (caught.name!=="AbortError" && current(number,token)) error(caught.message); }
 }
 async function loadRaw(number=state.page,token=state.generation) {
@@ -145,7 +145,7 @@ async function loadHistory(number=state.page,token=state.generation,after=null) 
     if (data.source_revision!==state.pageCache.data.source_revision) throw new Error("历史对应的页面版本已变化，请刷新结果。");
     state.history={page:number,cursor:data.next_cursor};
     $("history-results").replaceChildren();
-    if (!data.items.length) paragraph($("history-results"),"暂无机器增强历史。");
+    if (!data.items.length) paragraph($("history-results"),"暂无视觉增强历史。");
     for (const record of data.items) {
       paragraph($("history-results"),`${new Date(record.created_at).toLocaleString()} · ${record.is_current ? "当前生效" : "历史版本"} · ${record.verification||"未核实"}`);
       paragraph($("history-results"),record.text_preview+(record.preview_truncated ? "…（预览）" : ""),"pre");
@@ -213,7 +213,7 @@ function renderStageControls(job) {
   const container=$("stage-controls");container.replaceChildren();
   container.hidden=!job||!["queued","running","paused","pause_requested"].includes(job.status);
   if(container.hidden)return;
-  for(const [stage,label] of Object.entries({reading:"基础识别",vision:"机器增强",embedding:"向量入库"})){
+  for(const [stage,label] of Object.entries({reading:"基础识别",vision:"视觉增强",embedding:"向量入库"})){
     const button=document.createElement("button"),paused=job.paused_stages?.includes(stage);
     button.className="secondary";button.textContent=`${paused ? "继续" : "暂停"}${label}`;
     button.disabled=controlling||job.status==="pause_requested";

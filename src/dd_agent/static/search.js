@@ -114,7 +114,7 @@ node("search-form").onsubmit = async event => {
       const article = document.createElement("article"); article.className = "search-hit";
       const title = document.createElement("a"); title.href = hit.source_url; title.textContent = `${hit.filenames[0]} · PDF 第 ${hit.page_number} 页`;
       const text = document.createElement("p"); text.className = "evidence-text"; text.textContent = hit.text;
-      const meta = document.createElement("p"); meta.className = "muted"; meta.textContent = `${hit.method === "ocr" ? "OCR 来源" : "原生文字来源"} · ${({machine_enhanced:"已自动增强，事实未核实",machine_checked:"机器文字一致，事实未核实",machine_uncertain:"含未知信息"})[hit.verification] || "未核实"} · 相关分数 ${hit.rerank_score.toFixed(3)}${recallSuffix(hit)}`;
+      const meta = document.createElement("p"); meta.className = "muted"; meta.textContent = `${hit.method === "ocr" ? "OCR 来源" : "原生文字来源"} · ${({machine_enhanced:"已视觉增强，事实未核实",machine_checked:"OCR 与视觉识别一致，事实未核实",machine_uncertain:"含未知信息"})[hit.verification] || "未核实"} · 相关分数 ${hit.rerank_score.toFixed(3)}${recallSuffix(hit)}`;
       article.append(title, text, meta); node("search-results").append(article);
     }
   } catch (error) {

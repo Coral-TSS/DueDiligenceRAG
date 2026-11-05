@@ -238,7 +238,8 @@ def test_progress_distinguishes_stage_counts():
         capture_output=True,text=True,encoding='utf-8',timeout=10)
     assert result.returncode==0,result.stderr
     assert '基础识别 13' in result.stdout and '向量入库 3' in result.stdout
-    assert '切片重建 4/20 页' in result.stdout
+    assert '视觉增强 10/20 页' in result.stdout and '切片重建 4/20 页' in result.stdout
+    assert '机器文字' not in result.stdout
     assert '已保存整批进度' not in result.stdout
 
 
