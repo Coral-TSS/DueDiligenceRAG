@@ -11,7 +11,7 @@
 
 2.15 起的官方 Windows 轮子不再提供 cu126，GTX 1070 不能跟到 2.15。RTX 40 系不要装 cu126 的 2.14 限制。两台机器用同一套 `DDA_*` 配置：`auto` 在 Pascal 上保持 float32，在计算能力 8.0 及以上优先 bfloat16。
 
-8GB 显存不能同时留下视觉和向量。视觉约 3.6GB，向量约 2.5GB，桌面约 1.6GB，OCR 峰值约 341MB。程序仍然只常驻一个模型，换模型时先让前一个进程退出并清空显存，再加载下一个。重排序只计算最后一个 token 的 yes／no，GPU 上一次只排一条，避免整张词表 logits 把显存顶到 8GB。
+8GB 显存不能同时留下视觉和向量。视觉约 3.6GB，向量约 2.5GB，桌面约 1.5GB，OCR 峰值约 341MB。视觉或 OCR 加载前会卸下检索模型。两个 0.6B 的向量和重排序大约各 2.4GB，加上桌面仍低于 8GB，因此长期开着的服务把这两个一起留在显存里，查询时不再来回换入。重排序只计算最后一个 token 的 yes／no，并在 token 预算内一次打完候选，不再在 GPU 上每次只排一条。视觉批大小默认 2：批大小为 1 时整段峰值约 5.6GB，再留大约 1.5GB 给桌面。若本机峰值顶满，把 `DDA_VISION_BATCH` 改为 1。
 
 ## 1. 推荐配置
 
@@ -27,15 +27,28 @@ DDA_EMBEDDING_DTYPE=auto
 DDA_RERANKER_DTYPE=auto
 DDA_VISION_REGIONS_PER_PAGE=1
 DDA_VISION_MAX_NEW_TOKENS=128
+DDA_VISION_TOKENS_LOW=64
+DDA_VISION_TOKENS_VALUE=96
+DDA_VISION_BATCH=2
 DDA_VISION_LOW_SCORE=0.85
+DDA_VISION_VALUE_LINES=1
+DDA_VISION_VALUE_MAX_SCORE=1
+DDA_VISION_KEYWORD_MAX_SCORE=1
 DDA_VISION_TIMEOUT_BUDGET=3
 DDA_VISION_TIMEOUT_SECONDS=300
+DDA_OCR_REC_BATCH=16
+DDA_OCR_PAGE_BATCH=4
+DDA_EMBED_TOKEN_BUDGET=2048
+DDA_EMBED_BATCH_LIMIT=32
+DDA_RERANK_TOKEN_BUDGET=4096
 DDA_OCR_ENABLE_MKLDNN=0
 DDA_OCR_CPU_THREADS=6
 DDA_MODEL_CPU_THREADS=4
 DDA_STAGE_WINDOW_PAGES=10
 DDA_STAGE_BACKLOG_PAGES=40
 ```
+
+上面这组就是 GTX 1070 的建议值，也是程序默认值。低置信区域生成 64 个 token，日期／金额行 96，带数字的关键词行和整页兜底仍是 128。哪些行会触发视觉与改这些长度之前相同：分数上限为 1 表示不按置信度排除日期行或关键词行。要做 A／B 时只改对应的 `DDA_*`，例如把 `DDA_VISION_VALUE_MAX_SCORE` 降到 0.9，或把三个生成长度都设回 128。改阈值或生成长度会让视觉重跑一遍；只改批大小不会。
 
 CPU 回退时 OCR 线程可保持 6（i7-8700K 的物理核数）。oneDNN 默认关闭，原因见下一节。没有 GPU 时不要改这些开关去关掉 KV cache。
 
@@ -98,7 +111,7 @@ Paddle 也可以改用 cu129 索引：`https://www.paddlepaddle.org.cn/packages/
 | `vl-region-ocr-fp32-eager-v1` | 视觉候选里的 `model_version` | 同样保持历史前缀，只随权重、库版本和 `max_new_tokens` 变化 |
 | `qwen-last-token-normalized-fp32-v1` | 向量指纹 | float32 不区分 CPU／GPU，已有索引继续有效。精度离开 float32（例如 Ada 上 auto 得到 bfloat16）才换新前缀，避免把不同数值的向量当成同一索引 |
 
-会让视觉重新跑一遍的，是选择规则本身：低置信或数字行、每页区域数、生成长度、超时预算。这是 `automatic-regions-selective-v3`，不是设备开关。
+会让视觉重新跑一遍的，是选择规则本身：低置信阈值、日期／金额行是否入选及其分数上限、关键词行分数上限、每页区域数、三类生成长度、超时预算。批大小不在其中。权重指纹在大小和修改时间都没变时复用已核对的内容哈希，摘要字节与原来逐文件读取的结果相同，因此不会因为少读一遍盘而让 float32 索引失效。
 
 ## 6. 十页计时
 
@@ -118,7 +131,17 @@ Paddle 也可以改用 cu129 索引：`https://www.paddlepaddle.org.cn/packages/
 | `page.vision.region` | 一个区域；`region` 从 0 起 |
 | `ocr.inference`／`vision.inference` | worker 内的模型时间，同样带 `page` |
 
-顺序应是阅读和索引在前，视觉在后，视觉结束后再有一轮索引。`counters` 里的 `device.ocr.gpu`、`device.vision.cuda`、`dtype.vision.float32` 表示这次实际用的设备和精度。1070 上视觉精度应为 float32。文件不包含页内正文。
+顺序应是阅读和索引在前，视觉在后，视觉结束后再有一轮索引。文本没变的片段不会再加载嵌入模型。`counters` 里看这些选择计数，而不是只看 `pages.automatic.uncertain`：
+
+| 计数 | 含义 |
+| --- | --- |
+| `pages.vision.triggered`／`pages.vision.not_triggered` | 这一页有没有送进视觉 |
+| `vision.regions.selected`／`vision.regions.not_selected` | 实际生成的区域，以及超出每页预算、保留 OCR 的区域 |
+| `vision.reason.low`／`keyword_digit`／`value`／`poor` | 入选原因：低置信、行内关键词加数字、日期或金额、文字不足的整页兜底 |
+| `embedding.chunks.reused`／`embedding.reload_skipped` | 视觉之后复用的片段；整批都没变时跳过第二次加载 |
+| `fingerprint.vision.worker.manifest_hit`／`fingerprint.embedding.manifest_hit` | 权重没有重读 |
+
+`device.ocr.gpu`、`device.vision.cuda`、`dtype.vision.float32` 表示这次实际用的设备和精度。1070 上视觉精度应为 float32。文件不包含页内正文。`python -m dd_agent inventory` 只打印数据目录第一层的占用，不删除文件。
 
 ## 7. 这次实际改变了什么
 

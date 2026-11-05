@@ -218,3 +218,114 @@ def venv_runtime_descriptor(python, packages=('torch', 'transformers', 'tokenize
     except OSError:
         marker = 'nocfg'
     return '|'.join(names) + '#' + marker
+
+
+def package_version(python, name):
+    """从虚拟环境的 dist-info 读版本，不导入 torch。读不到时返回 None。"""
+    interpreter = Path(python)
+    if not interpreter.is_file():
+        return None
+    site = _site_packages(interpreter.resolve())
+    if site is None:
+        return None
+    wanted = _distribution_key(name)
+    try:
+        dists = [path for path in site.glob('*.dist-info') if _distribution_key(path.name) == wanted]
+    except OSError:
+        return None
+    for dist in dists:
+        try:
+            for line in (dist / 'METADATA').read_text(encoding='utf-8', errors='replace').splitlines():
+                if line.startswith('Version:'):
+                    return line.split(':', 1)[1].strip()
+        except OSError:
+            continue
+    return None
+
+
+def _file_stats(labeled_files):
+    stats = []
+    for label, path in labeled_files:
+        target = Path(path)
+        try:
+            stat = target.stat()
+        except OSError:
+            stats.append({'label': label.decode('utf-8', 'surrogateescape'), 'missing': True})
+            continue
+        stats.append({'label': label.decode('utf-8', 'surrogateescape'),
+                      'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns})
+    return stats
+
+
+def _digest_identity(prefix, labeled_files, suffix=b''):
+    identity = {'prefix': prefix.decode('utf-8', 'surrogateescape'), 'files': _file_stats(labeled_files)}
+    if suffix:
+        identity['suffix'] = suffix.decode('utf-8', 'surrogateescape')
+    return identity
+
+
+def _manifest_path(directory, kind, key):
+    return Path(directory) / 'weight-manifests' / kind / (key[:32] + '.json')
+
+
+def _stored_digest(directory, kind, key):
+    if directory is None:
+        return None
+    try:
+        stored = json.loads(_manifest_path(directory, kind, key).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if isinstance(stored, dict) and stored.get('key') == key and isinstance(stored.get('digest'), str) and len(stored['digest']) == 64:
+        return stored['digest']
+    return None
+
+
+def verified_content_digests(labeled_files, jobs, directory=None):
+    """同一批文件只读一遍，同时算出多份前缀不同的摘要。
+
+    jobs 是 {kind, prefix, suffix}。suffix 加在全部文件之后，视觉主指纹用它放超时。
+    每一份摘要在 size+mtime 未变时直接复用。全部命中则不再读权重。
+    """
+    ready = [None] * len(jobs)
+    pending = []
+    for index, job in enumerate(jobs):
+        prefix = job['prefix']
+        suffix = job.get('suffix') or b''
+        kind = job['kind']
+        identity = _digest_identity(prefix, labeled_files, suffix)
+        key = _key(identity)
+        stored = _stored_digest(directory, kind, key)
+        if stored is not None:
+            count('fingerprint.' + kind + '.manifest_hit')
+            ready[index] = stored
+        else:
+            pending.append((index, hashlib.sha256(), prefix, suffix, kind, key))
+    if not pending:
+        return ready
+    for _, digest, prefix, _, _, _ in pending:
+        digest.update(prefix)
+    for label, path in labeled_files:
+        for _, digest, _, _, _, _ in pending:
+            digest.update(label)
+        with Path(path).open('rb') as stream:
+            for block in iter(lambda: stream.read(4 * 1024 * 1024), b''):
+                count('fingerprint.weight_bytes', len(block))
+                for _, digest, _, _, _, _ in pending:
+                    digest.update(block)
+    for index, digest, _, suffix, kind, key in pending:
+        if suffix:
+            digest.update(suffix)
+        value = digest.hexdigest()
+        ready[index] = value
+        if directory is not None:
+            _write(_manifest_path(directory, kind, key), {'key': key, 'digest': value})
+    return ready
+
+
+def verified_content_digest(prefix, labeled_files, directory=None, kind='weights', suffix=b''):
+    """完整内容哈希。size 与 mtime 都未变时复用已核对的哈希，不再重读权重。
+
+    labeled_files 是 (写入摘要的标签字节, 路径)，顺序必须与原先逐文件哈希一致。
+    首次仍读完全部字节；之后只有大小或修改时间变化才重算。没有目录时每次都重算。
+    """
+    return verified_content_digests(labeled_files, [dict(kind=kind, prefix=prefix, suffix=suffix)], directory)[0]

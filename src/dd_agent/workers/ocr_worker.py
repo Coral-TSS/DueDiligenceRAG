@@ -35,31 +35,116 @@ def load_ocr(config):
             doc_orientation_classify_model_name=names[2],doc_orientation_classify_model_dir=str(models/names[2]),
             textline_orientation_model_name=names[3],textline_orientation_model_dir=str(models/names[3]),
             use_doc_orientation_classify=True,use_doc_unwarping=False,use_textline_orientation=True,
-            text_recognition_batch_size=4, **paddle_runtime_kwargs(runtime))
+            text_recognition_batch_size=int(config.get('rec_batch') or 16), **paddle_runtime_kwargs(runtime))
         count('model.ocr.loads')
         # cpu_threads 是单实例内部线程数，不表示 4 个页面同时启动 4 份模型。
     return ocr
 
 
+def _page_number(page):
+    return page.get('page_number') if type(page.get('page_number')) is int else None
+
+
+def _payload_text(result):
+    payload = result.json
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    output = payload.get('res', payload) if isinstance(payload, dict) else {}
+    texts = output.get('rec_texts') or [] if isinstance(output, dict) else []
+    kept = [text for text in texts if str(text).strip()]
+    return len(kept), sum(len(str(text)) for text in kept)
+
+
+def _watch_submodels(ocr, page):
+    """PaddleOCR 3 把检测和识别放在流水线子模型上。能挂上就分开计时，挂不上仍有 ocr.inference。"""
+    pipe = getattr(ocr, 'paddlex_pipeline', None)
+    if pipe is None:
+        return []
+    restores = []
+    for attr, stage in (('text_det_model', 'ocr.detection'), ('text_rec_model', 'ocr.recognition')):
+        model = getattr(pipe, attr, None)
+        if model is None or not hasattr(model, 'predict'):
+            continue
+        original = model.predict
+        def wrapped(*args, _original=original, _stage=stage, _page=page, **kwargs):
+            with span(_stage, page=_page):
+                return _original(*args, **kwargs)
+        model.predict = wrapped
+        restores.append((model, original))
+    return restores
+
+
+def _restore_submodels(restores):
+    for model, original in restores:
+        model.predict = original
+
+
+def _predict(ocr, data, page):
+    detail = {}
+    restores = _watch_submodels(ocr, page)
+    try:
+        with span('ocr.inference', page=page, detail=detail):
+            results = list(ocr.predict(data))
+            lines = chars = 0
+            for result in results:
+                try:
+                    count_lines, count_chars = _payload_text(result)
+                except Exception:
+                    count_lines = count_chars = 0
+                lines += count_lines
+                chars += count_chars
+            detail['lines'] = lines
+            detail['chars'] = chars
+    finally:
+        _restore_submodels(restores)
+    return results
+
+
+def _decode(page, result):
+    payload=result.json
+    if isinstance(payload,str):payload=json.loads(payload)
+    output=payload.get('res',payload)
+    # 行框坐标对应方向校正后的图片，保存匹配图片供后续裁剪；PDF 原件不修改。
+    processed=result.get('doc_preprocessor_res',{}).get('output_img')
+    if processed is not None:
+        from PIL import Image
+        Image.fromarray(processed[:,:,::-1]).save(page['image_path'])
+    return {'page_number':page['page_number'],'payload':output,'image_path':page['image_path']}
+
+
+def _one(ocr, page):
+    try:
+        count('ocr.page.attempts')
+        with redirect_stdout(sys.stderr):
+            results=_predict(ocr, page['image_path'], _page_number(page))
+        return _decode(page, results[0])
+    except Exception:
+        return {'page_number':page['page_number'],'error_code':'ocr_page_failed'}
+
+
 def recognize_pages(ocr,config):
-    for page in config['pages']:
+    pages=list(config['pages'])
+    batch=int(config.get('page_batch') or 1)
+    if batch<=1 or len(pages)<=1:
+        for page in pages:
+            yield _one(ocr, page)
+        return
+    # PaddleOCR 的 predict 可以接收路径列表。不支持或条数对不上时退回逐页，不是可配置的旧模式。
+    for start in range(0, len(pages), batch):
+        group=pages[start:start+batch]
         try:
-            count('ocr.page.attempts')
-            with redirect_stdout(sys.stderr), span('ocr.inference', page=page.get('page_number') if type(page.get('page_number')) is int else None):
-                results=list(ocr.predict(page['image_path']))
-            result=results[0]
-            payload=result.json
-            if isinstance(payload,str):payload=json.loads(payload)
-            output=payload.get('res',payload)
-            # Recognition boxes refer to the preprocessed (orientation-corrected) image.
-            processed=result.get('doc_preprocessor_res',{}).get('output_img')
-            # 行框坐标对应方向校正后的图片，保存匹配图片供后续裁剪；PDF 原件不修改。
-            if processed is not None:
-                from PIL import Image
-                Image.fromarray(processed[:,:,::-1]).save(page['image_path'])
-            yield {'page_number':page['page_number'],'payload':output,'image_path':page['image_path']}
+            count('ocr.page.attempts', len(group))
+            with redirect_stdout(sys.stderr):
+                results=_predict(ocr, [page['image_path'] for page in group], _page_number(group[0]))
+            if len(results)!=len(group):
+                raise ValueError('batch')
+            for page, result in zip(group, results):
+                yield _decode(page, result)
+            count('ocr.page.batched', len(group))
         except Exception:
-            yield {'page_number':page['page_number'],'error_code':'ocr_page_failed'}
+            count('ocr.page.batch_fallback')
+            for page in group:
+                yield _one(ocr, page)
 
 
 def main():

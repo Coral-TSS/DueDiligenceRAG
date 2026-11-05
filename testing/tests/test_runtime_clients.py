@@ -66,23 +66,26 @@ def test_unknown_environment_cannot_reuse_resident_profile(tmp_path,monkeypatch)
 
 
 def test_embedding_stream_releases_admission_before_page_publication(tmp_path,monkeypatch):
-    models=LocalModels(Settings(data_dir=tmp_path));active=[];pages=[]
+    models=LocalModels(Settings(data_dir=tmp_path));active=[];calls=[]
     def records(mode,**payload):
-        active.append(True);pages.append(payload['pages'])
-        try:yield {'page_number':payload['pages'][0]['page_number'],'vectors':[]}
+        active.append(True);calls.append(payload)
+        try:
+            for page in payload['pages']:
+                yield {'page_number':page['page_number'],'vectors':[]}
         finally:active.pop()
     monkeypatch.setattr(models,'records',records)
     result=models.embed_pages([{'page_number':1,'texts':[]},{'page_number':2,'texts':[]}])
     try:
         assert next(result)['page_number']==1 and not active
         assert next(result)['page_number']==2 and not active
-        assert [len(p) for p in pages]==[1,1]
+        assert len(calls)==1 and [page['page_number'] for page in calls[0]['pages']]==[1,2]
+        assert calls[0]['token_budget']==2048 and calls[0]['batch_limit']==32
     finally:result.close()
 
 
 def test_ocr_stream_releases_admission_at_each_saved_page(tmp_path,monkeypatch):
     from dd_agent import model_runtime, reading
-    settings=Settings(data_dir=tmp_path,ocr_models_dir=tmp_path/'weights')
+    settings=Settings(data_dir=tmp_path,ocr_models_dir=tmp_path/'weights',ocr_page_batch=1)
     for name in reading.OCR_MODEL_NAMES:
         folder=settings.ocr_models_dir/name;folder.mkdir(parents=True)
         (folder/'inference.pdiparams').write_bytes(b'fixture')

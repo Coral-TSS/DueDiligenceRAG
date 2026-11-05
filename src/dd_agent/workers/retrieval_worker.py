@@ -2,7 +2,6 @@
 # 由 reading.worker_records() 在 .venv-retrieval 中启动，只接受本地 JSON 清单。
 # mode=profile：模型指纹；embed：一组文字；embed_pages：逐页流式向量；rerank：相关性排序。
 # 模型权重只在本进程内复用，进程退出即释放；本文件不访问 PostgreSQL。
-import hashlib
 from importlib.metadata import version
 import json
 import os
@@ -24,11 +23,10 @@ def emit(value):
 
 
 @timed('fingerprint.embedding.worker')
-def profile(directory, device='auto', dtype='auto'):
-    # 完整读取 Embedding 文件做内容指纹，包含推理规则与关键库版本。
-    # 这比仅看目录名可靠，但每次查询都重算会有较大 I/O 开销，属于 RG-05 优化点。
-    # 设备与注意力不进入指纹：float32 下换 GPU 不应让整卷重新嵌入。
-    # 非 float32（例如 Ada 上 auto 选出的 bfloat16）数值不同，必须换索引版本。
+def profile(directory, device='auto', dtype='auto', manifest_dir=None):
+    # 内容指纹包含推理规则与关键库版本。float32 的字节序列保持不变，已有索引继续有效。
+    # 设备与注意力不进入指纹。非 float32（例如 Ada 上 auto 选出的 bfloat16）必须换索引版本。
+    # size 与 mtime 都未变时复用已存哈希，不再每次重读权重。
     # 主进程已经解析过设备时不要再 import torch，避免指纹进程和常驻模型同时占用显存。
     if device in ('cpu', 'cuda') and dtype in ('float32', 'float16', 'bfloat16'):
         spec = {'device': device, 'dtype': dtype}
@@ -39,19 +37,13 @@ def profile(directory, device='auto', dtype='auto'):
     files = sorted(p for p in path.rglob('*') if p.is_file() and p.suffix in {'.json', '.safetensors', '.txt'} and '.cache' not in p.parts)
     if not any(p.suffix == '.safetensors' for p in files):
         raise ValueError('Local embedding weights missing')
-    digest = hashlib.sha256()
     if spec['dtype'] == 'float32':
         marker = 'qwen-last-token-normalized-fp32-v1|' + INSTRUCTION + '|max4096|' + version('torch') + '|' + version('transformers')
     else:
         marker = f'qwen-last-token-normalized-v2|{spec["dtype"]}|' + INSTRUCTION + '|max4096|' + version('torch') + '|' + version('transformers')
-    digest.update(marker.encode())
-    for file in files:
-        digest.update(file.relative_to(path).as_posix().encode())
-        with file.open('rb') as stream:
-            for block in iter(lambda: stream.read(4 * 1024 * 1024), b''):
-                digest.update(block)
-                count('fingerprint.embedding.bytes', len(block))
-    return digest.hexdigest()
+    labeled = [(file.relative_to(path).as_posix().encode(), file) for file in files]
+    from dd_agent.cache import verified_content_digest
+    return verified_content_digest(marker.encode(), labeled, manifest_dir, 'embedding')
 
 
 def _load_torch(kind, path, device, dtype, factory):
@@ -73,24 +65,41 @@ def embedding_model(path, device='auto', dtype='auto'):
 
 
 @timed('embedding.inference')
-def embed(tokenizer, model, texts):
+def embed(tokenizer, model, texts, token_budget=2048, batch_limit=32):
     # 左填充后每行最后一个位置是真实末 token，取其 hidden state 作为句向量并归一化。
-    # 小批量 4 控制峰值内存；这不是 4 个页面并行 worker。
+    # 按 token 预算跨片段合批，不再固定每页 4 条。
     import torch
     from torch.nn.functional import normalize
+    from dd_agent.batching import pack_ranges
+    if not texts:
+        return []
+    encoded = tokenizer(texts, padding=False, truncation=False, add_special_tokens=True)
+    ids = encoded['input_ids']
+    lengths = [len(row) for row in ids]
+    if any(length > 4096 for length in lengths):
+        raise ValueError('Passage exceeds token budget; split before embedding')
     results = []
     count('embedding.passages', len(texts))
-    for start in range(0, len(texts), 4):
-        inputs = tokenizer(texts[start:start + 4], padding=True, truncation=False, return_tensors='pt').to(model.device)
+    for start, end in pack_ranges(lengths, int(token_budget), int(batch_limit)):
+        inputs = tokenizer.pad({'input_ids': ids[start:end]}, padding=True, return_tensors='pt').to(model.device)
         count('embedding.tokens', int(inputs['attention_mask'].sum()))
         count('embedding.padded_tokens', int(inputs['input_ids'].numel()))
-        if inputs['input_ids'].shape[1] > 4096:
-            # 不允许默默截掉尾部证据；超预算应由上游分块／错误处理解决。
-            raise ValueError('Passage exceeds token budget; split before embedding')
+        count('embedding.batches')
         with torch.inference_mode():
             hidden = model(**inputs, use_cache=False).last_hidden_state[:, -1]
             results.extend(normalize(hidden, p=2, dim=1).tolist())
     return results
+
+
+def embed_pages(tokenizer, model, pages, token_budget=2048, batch_limit=32):
+    """把多页片段摊平后按 token 预算一次算完，再按页交回。"""
+    flat = [(index, text) for index, page in enumerate(pages) for text in page['texts']]
+    vectors = embed(tokenizer, model, [text for _, text in flat], token_budget, batch_limit)
+    grouped = [[] for _ in pages]
+    for (index, _), vector in zip(flat, vectors):
+        grouped[index].append(vector)
+    for page, rows in zip(pages, grouped):
+        yield {'page_number': page['page_number'], 'vectors': rows}
 
 
 @timed('model.reranker.initialize')
@@ -127,23 +136,27 @@ def yes_no_logits(model, inputs, no_id, yes_id):
 
 
 @timed('rerank.worker')
-def rerank_loaded(engine, query, texts):
+def rerank_loaded(engine, query, texts, token_budget=4096):
     import torch
+    from dd_agent.batching import pack_ranges
     tokenizer, model = engine
     prefix = tokenizer.encode(PREFIX, add_special_tokens=False)
     suffix = tokenizer.encode(SUFFIX, add_special_tokens=False)
     yes, no = (tokenizer.convert_tokens_to_ids(word) for word in ('yes', 'no'))
-    results = []
-    # GPU 上一次一条，避免长序列激活和词表 logits 叠到 8GB 上限。CPU 仍两条一批。
-    on_gpu = next(model.parameters()).device.type == 'cuda'
-    batch = 1 if on_gpu else 2
-    for start in range(0, len(texts), batch):
-        pairs = [f'<Instruct>: {INSTRUCTION}\n<Query>: {query}\n<Document>: {text}' for text in texts[start:start + batch]]
-        ids = tokenizer(pairs, add_special_tokens=False, truncation=False)['input_ids']
-        if any(len(row) + len(prefix) + len(suffix) > 4096 for row in ids):
+    rows, lengths = [], []
+    for text in texts:
+        ids = tokenizer(f'<Instruct>: {INSTRUCTION}\n<Query>: {query}\n<Document>: {text}', add_special_tokens=False, truncation=False)['input_ids']
+        if len(ids) + len(prefix) + len(suffix) > 4096:
             raise ValueError('Reranking input exceeds token budget')
-        inputs = tokenizer.pad({'input_ids': [prefix + row + suffix for row in ids]}, padding=True, return_tensors='pt').to(model.device)
-        count('rerank.pairs', len(pairs))
+        row = prefix + ids + suffix
+        rows.append(row)
+        lengths.append(len(row))
+    results = []
+    # 一次查询的候选（例如 12 条）在 token 预算内一次算完，不再按 1 或 2 条切开。
+    for start, end in pack_ranges(lengths, int(token_budget), max(1, len(texts))):
+        inputs = tokenizer.pad({'input_ids': rows[start:end]}, padding=True, return_tensors='pt').to(model.device)
+        count('rerank.pairs', end - start)
+        count('rerank.batches')
         with torch.inference_mode(), span('rerank.inference'):
             chosen = yes_no_logits(model, inputs, no, yes)
             results.extend(chosen.softmax(dim=1)[:, 1].tolist())
@@ -159,25 +172,26 @@ def main():
     mode = payload['mode']
     if mode == 'profile':
         # 仅计算指纹时不加载完整推理模型，但仍会读取权重文件内容。
-        emit({'version': profile(payload['embedding'], payload.get('device', 'auto'), payload.get('dtype', 'auto'))})
+        emit({'version': profile(payload['embedding'], payload.get('device', 'auto'), payload.get('dtype', 'auto'), payload.get('manifest_dir'))})
         return
     import torch
     torch.set_num_threads(int(payload.get('threads') or 4))
     device, dtype = payload.get('device', 'auto'), payload.get('dtype', 'auto')
     if mode == 'rerank':
-        emit({'scores': rerank_loaded(reranker_model(payload['reranker'], device, dtype), payload['query'], payload['texts'])})
+        emit({'scores': rerank_loaded(reranker_model(payload['reranker'], device, dtype), payload['query'], payload['texts'], token_budget=int(payload.get('token_budget') or 4096))})
     elif mode in {'embed', 'embed_pages'}:
         tokenizer, model = embedding_model(payload['embedding'], device, dtype)
+        budget, limit = int(payload.get('token_budget') or 2048), int(payload.get('batch_limit') or 32)
         if mode == 'embed':
             texts = payload['texts']
             if payload.get('query'):
                 # 查询采用检索指令前缀；资料片段本身不追加这个 Query 前缀。
                 texts = [f'Instruct: {INSTRUCTION}\nQuery:{q}' for q in texts]
-            emit({'vectors': embed(tokenizer, model, texts)})
+            emit({'vectors': embed(tokenizer, model, texts, budget, limit)})
         else:
-            # 本批共用同一个 Embedding 实例，一页完成就输出，主进程可马上事务发布。
-            for page in payload['pages']:
-                emit({'page_number': page['page_number'], 'vectors': embed(tokenizer, model, page['texts'])})
+            # 本批共用同一个 Embedding 实例；多页片段按 token 预算合批后再逐页输出。
+            for record in embed_pages(tokenizer, model, payload['pages'], budget, limit):
+                emit(record)
     else:
         raise ValueError('Unknown retrieval operation')
 

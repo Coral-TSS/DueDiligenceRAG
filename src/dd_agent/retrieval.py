@@ -6,6 +6,7 @@
 from contextlib import contextmanager
 import hashlib
 import json
+import psycopg
 from time import monotonic
 import math
 import os
@@ -83,6 +84,33 @@ def split_text(text):
     return chunks
 
 
+def reuse_vectors(chunks, stored):
+    """同一页、同一索引版本里文本完全相同的片段直接复用向量。返回 (向量或 None, 缺失文本, 缺失下标)。"""
+    found = {}
+    for text, vector in stored:
+        found.setdefault(text, vector)
+    vectors, missing_text, missing_at = [], [], []
+    for index, chunk in enumerate(chunks):
+        hit = found.get(chunk['text'])
+        if hit is None:
+            vectors.append(None)
+            missing_text.append(chunk['text'])
+            missing_at.append(index)
+        else:
+            vectors.append(hit)
+    return vectors, missing_text, missing_at
+
+
+def parse_stored_vector(value):
+    if isinstance(value, list):
+        return [float(item) for item in value]
+    text = str(value).strip()
+    if text.startswith('[') and text.endswith(']'):
+        body = text[1:-1].strip()
+        return [] if not body else [float(part) for part in body.split(',')]
+    raise RetrievalError('已保存的向量无法读取。')
+
+
 def valid_vector(values):
     # 维度与数据库 vector(1024) 保持一致；阻止 NaN、无穷及零向量进入距离计算。
     if not isinstance(values, list) or len(values) != 1024:
@@ -155,10 +183,21 @@ class LocalModels:
             dtype = self.settings.reranker_dtype if mode == 'rerank' else self.settings.embedding_dtype
         manifest = dict(mode=mode, embedding=str(self.settings.embedding_dir.resolve()),
                         reranker=str(self.settings.reranker_dir.resolve()), threads=self.settings.model_cpu_threads,
-                        device=device, dtype=dtype, **payload)
+                        device=device, dtype=dtype, manifest_dir=str(cache_directory(self.settings)), **payload)
+        if mode in {'embed', 'embed_pages'}:
+            manifest.setdefault('token_budget', self.settings.embed_token_budget)
+            manifest.setdefault('batch_limit', self.settings.embed_batch_limit)
+        elif mode == 'rerank':
+            manifest.setdefault('token_budget', self.settings.rerank_token_budget)
         try:
             if self.managed and mode!='profile':
-                yield from runtime_records(self.settings,'reranker' if mode=='rerank' else 'embedding',mode,payload)
+                forward = dict(payload)
+                if mode in {'embed', 'embed_pages'}:
+                    forward.setdefault('token_budget', self.settings.embed_token_budget)
+                    forward.setdefault('batch_limit', self.settings.embed_batch_limit)
+                elif mode == 'rerank':
+                    forward.setdefault('token_budget', self.settings.rerank_token_budget)
+                yield from runtime_records(self.settings,'reranker' if mode=='rerank' else 'embedding',mode,forward)
                 return
             with tempfile.TemporaryDirectory(dir=self.settings.data_dir) as directory:
                 if mode=='profile':
@@ -207,20 +246,22 @@ class LocalModels:
         return records[0]
 
     def embed_pages(self, pages):
-        # 按页流式返回向量；上层可以逐页发布，后续页失败不回滚先前已提交页。
-        for page in pages:
-            # A page is a scheduling boundary: keep the resident, release admission.
-            # Consume done before the caller opens its page publication transaction.
-            with span('page.embedding', page=page.get('page_number') if type(page.get('page_number')) is int else None):
-                yield from list(self.records('embed_pages',pages=[page]))
+        # 多页片段一次送进模型，按 token 预算合批。先取完结果再交给发布，避免发布事务占着模型许可。
+        if not pages:
+            return
+        with span('page.embedding', page=pages[0].get('page_number') if type(pages[0].get('page_number')) is int else None):
+            records = list(self.records('embed_pages', pages=list(pages),
+                token_budget=self.settings.embed_token_budget, batch_limit=self.settings.embed_batch_limit))
+        yield from records
 
     @timed('embedding.request')
     def embed(self, texts, query=False):
-        return self.one('embed', texts=texts, query=query)['vectors']
+        return self.one('embed', texts=texts, query=query, token_budget=self.settings.embed_token_budget,
+                       batch_limit=self.settings.embed_batch_limit)['vectors']
 
     @timed('rerank.request')
     def rerank(self, query, texts):
-        return self.one('rerank', query=query, texts=texts)['scores']
+        return self.one('rerank', query=query, texts=texts, token_budget=self.settings.rerank_token_budget)['scores']
 
 
 # Both search and coverage require the current reading AND unchanged source page.
@@ -286,28 +327,68 @@ class EvidenceService:
             result['indexed_pages'] = sorted(result['indexed_pages'])
             count('pages.index.failed', len(result['failed_pages']))
             return result
-        # 只有非空片段页进入模型；requests 不含空页。
-        requests = [dict(page_number=n, texts=[c['text'] for c in chunks]) for n, chunks in pending.items()]
+        # 视觉之后文本没变的片段复用原向量。整批都命中时不再加载嵌入模型。
+        plans = {}
+        requests = []
+        for number, chunks in pending.items():
+            stored = []
+            try:
+                with self.database.connect() as conn:
+                    rows = conn.execute('''SELECT text, embedding::text AS embedding FROM dd_agent.evidence_chunks
+                        WHERE document_id=%s AND page_number=%s AND index_version=%s ORDER BY ordinal''',
+                        (document_id, number, version)).fetchall()
+                for row in rows:
+                    try: stored.append((row['text'], parse_stored_vector(row['embedding'])))
+                    except (RetrievalError, TypeError, ValueError): continue
+            except (OSError, psycopg.Error):
+                stored = []
+            vectors, missing_text, missing_at = reuse_vectors(chunks, stored)
+            plans[number] = (vectors, missing_at)
+            count('embedding.chunks.reused', len(chunks) - len(missing_at))
+            if missing_text:
+                requests.append(dict(page_number=number, texts=missing_text))
+                count('embedding.chunks.missed', len(missing_text))
+        if not requests:
+            count('embedding.reload_skipped')
+
+        def publish_number(number, vectors):
+            try:
+                self.publish(document_id, snapshots[number], version, pending[number], vectors)
+                if pending[number]: mark('index.first_searchable')
+                count('pages.index.published')
+                result['indexed_pages'].append(number)
+                if checkpoint:checkpoint('embedding', number)
+            except RetrievalError:
+                result['failed_pages'].append(number)
+
+        for number, (vectors, missing_at) in plans.items():
+            if not missing_at:
+                publish_number(number, vectors)
+        outputs = None
         try:
-            outputs = self.models.embed_pages(requests) if hasattr(self.models, 'embed_pages') else (
-                dict(page_number=p['page_number'], vectors=self.models.embed(p['texts'])) for p in requests)
-            for output in outputs:
+            if requests:
+                outputs = self.models.embed_pages(requests) if hasattr(self.models, 'embed_pages') else (
+                    dict(page_number=p['page_number'], vectors=self.models.embed(p['texts'])) for p in requests)
+            fresh = {}
+            for output in outputs or []:
                 number = output['page_number']
-                if number not in pending or number in result['indexed_pages']:
+                if number not in plans or number in fresh:
                     raise RetrievalError('向量工作进程返回页码不符。')
-                try:
-                    self.publish(document_id, snapshots[number], version, pending[number], output['vectors'])
-                    if pending[number]: mark('index.first_searchable')
-                    count('pages.index.published')
-                    # publish 已提交本页事务后才检查暂停；单页未发布的向量需下次重算。
-                    result['indexed_pages'].append(number)
-                    if checkpoint:checkpoint('embedding',number)
-                except RetrievalError:
+                fresh[number] = output['vectors']
+            for number, (vectors, missing_at) in plans.items():
+                if not missing_at or number in result['indexed_pages'] or number in result['failed_pages']:
+                    continue
+                rows = fresh.get(number)
+                if rows is None or len(rows) != len(missing_at):
                     result['failed_pages'].append(number)
+                    continue
+                for slot, vector in zip(missing_at, rows):
+                    vectors[slot] = vector
+                publish_number(number, vectors)
         except RetrievalError:
             pass  # Successfully committed pages survive a later worker failure.
         finally:
-            if 'outputs' in locals() and hasattr(outputs,'close'):outputs.close()
+            if outputs is not None and hasattr(outputs,'close'):outputs.close()
         result['failed_pages'] = sorted(set(result['failed_pages']) | (set(pending) - set(result['indexed_pages'])))
         result['indexed_pages'] = sorted(result['indexed_pages'])
         count('pages.index.failed', len(result['failed_pages']))

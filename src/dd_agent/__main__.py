@@ -17,7 +17,7 @@ from .db import database_scope
 
 def main():
     parser = argparse.ArgumentParser(description="尽调材料本地工作区")
-    parser.add_argument("command", nargs="?", choices=["serve", "init-db", "check", "harness-check", "inspect-pdf", "import-file", "read-pages", "process-pages", "index-pages", "search"], default="serve")
+    parser.add_argument("command", nargs="?", choices=["serve", "init-db", "check", "harness-check", "inspect-pdf", "import-file", "read-pages", "process-pages", "index-pages", "search", "inventory"], default="serve")
     parser.add_argument('--file', type=Path, help='本地原件绝对路径')
     parser.add_argument('--project-id', type=UUID)
     parser.add_argument('--document-id', type=UUID)
@@ -30,6 +30,10 @@ def main():
     except ValueError:
         print("配置无效：请检查 .env 中的目录、端口和文件大小上限。")
         return 1
+    if args.command == 'inventory':
+        from .maintenance import inventory
+        print(json.dumps(inventory(settings.data_dir), ensure_ascii=False))
+        return 0
     if args.command == 'serve':
         from .app import create_app
         uvicorn.run(create_app(settings), host='127.0.0.1', port=settings.port)

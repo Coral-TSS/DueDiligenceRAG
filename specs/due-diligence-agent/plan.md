@@ -1,7 +1,7 @@
 # 尽调报告 Agent：SDD 开发计划
 
 日期：2026-10-23  
-状态（2026-10-23）：P1-A 和 P1-B 首条 PDF／RAG 工程链路已实现；当前先完善 RAG 可靠性、覆盖、补读、质量与性能，再接现有 Harness 桌面版。C-T01 项目 SDK 基线与 C-T02-a 材料分页已完成，业务 MCP 未接通；Word／工作文件工具、尽调 skill 与报告闭环暂缓。实际完成情况以 P1 tasks.md 和 testing/records 为准。
+状态（2026-10-23）：P1-A 和 P1-B 首条 PDF／RAG 工程链路已实现；当前先完善 RAG 可靠性、覆盖、补读、质量与性能，再接现有 Harness 桌面版。C-T01 项目 SDK 基线与 C-T02-a 材料分页已完成，业务 MCP 未接通；Word／工作文件工具、尽调 skill 与报告闭环暂缓。实际完成情况以 P1 tasks.md 为准。
 
 2026-10-22 已确认的后续报告架构：报告推理由大模型主导，优先复用 DeepSeek Harness 的运行循环、会话与工具机制；本项目保留现有本地材料处理与 RAG，通过 MCP 暴露检索和证据读取；Word 能力与尽调方法包在恢复报告阶段后接入。首轮不建设完整事实库、知识图谱或独立报告编排引擎。详见 [架构决策与工具边界](../architecture/harness-report-agent.md)。当前执行顺序以第 9 节为准。
 
@@ -57,8 +57,7 @@ specs/
   06-specialties-and-deployment/  # 专项扩展与部署验证
 docs/decisions/                    # 重要技术与业务决策
 testing/tests/                    # 正式测试
-testing/records/                  # 验收及私有样本记录
-testing/runs/                     # 独立运行、隔离测试库及日志
+testing/runs/                     # 独立运行、隔离测试库及日志；验收长文不入库
 ```
 
 真实客户材料保存在应用数据目录，不进入代码仓库或默认测试数据。

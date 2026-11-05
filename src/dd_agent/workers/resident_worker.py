@@ -30,25 +30,30 @@ def infer(engine,operation,payload):
     if kind=='embedding':
         from dd_agent.workers.retrieval_worker import embed, INSTRUCTION
         tokenizer,weights=model
+        budget=int(payload.get('token_budget') or 2048)
+        limit=int(payload.get('batch_limit') or 32)
         if operation=='embed':
             texts=payload['texts']
             if payload.get('query'):texts=[f'Instruct: {INSTRUCTION}\nQuery:{q}' for q in texts]
-            yield {'vectors':embed(tokenizer,weights,texts)}
+            yield {'vectors':embed(tokenizer,weights,texts,budget,limit)}
         elif operation=='embed_pages':
-            for page in payload['pages']:
-                yield {'page_number':page['page_number'],'vectors':embed(tokenizer,weights,page['texts'])}
+            from dd_agent.workers.retrieval_worker import embed_pages
+            yield from embed_pages(tokenizer,weights,payload['pages'],budget,limit)
         else:raise ValueError('Unsupported embedding operation')
     elif kind=='reranker' and operation=='rerank':
         from dd_agent.workers.retrieval_worker import rerank_loaded
-        yield {'scores':rerank_loaded(model,payload['query'],payload['texts'])}
+        yield {'scores':rerank_loaded(model,payload['query'],payload['texts'],token_budget=int(payload.get('token_budget') or 4096))}
     elif kind=='ocr' and operation=='recognize':
         from dd_agent.workers.ocr_worker import recognize_pages
         yield from recognize_pages(model,payload)
-    elif kind=='vision' and operation=='recognize':
-        from dd_agent.workers.vision_worker import recognize
+    elif kind=='vision' and operation in {'recognize','recognize_batch'}:
+        from dd_agent.workers.vision_worker import recognize, recognize_batch
         engine,limit=model
-        if payload['max_new_tokens']!=limit:raise ValueError('Vision profile token budget changed')
-        yield recognize(payload,engine=engine)
+        if int(payload['max_new_tokens'])>limit:raise ValueError('Vision profile token budget changed')
+        if operation=='recognize_batch':
+            yield recognize_batch(dict(payload, max_new_tokens=limit), engine=engine)
+        else:
+            yield recognize(payload,engine=engine)
     else:raise ValueError('Unsupported model')
 
 

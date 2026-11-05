@@ -63,7 +63,7 @@ API 服务商、凭据、发送范围和预算仍是实际外网报告调用的�
 | `tools/word.py`、`tools/workspace.py` | 现有可复用文档能力的薄适配、项目工作目录和引用清单读写 |
 | `agent_runtime.py`（需要嵌入现有应用时） | 薄的 Harness 启动、会话关联、事件转发和停止接口，避免自研模型循环 |
 | `agent_profiles/`、尽调方法包目录 | 固定版本对应的 profile／patch、工具清单和两章 skill；具体格式依选定版本验证，不在本次写未经测试的 YAML |
-| `testing/tests/`、`testing/records/`、`testing/runs/` | 工具隔离、引用、文档幂等、失败／恢复、真实模型两章闭环与 Word 渲染记录 |
+| `testing/tests/`、`testing/runs/` | 工具隔离、引用、文档幂等、失败／恢复和真实模型两章闭环。渲染长文留在本机，不入库 |
 
 执行顺序：版本／profile 小验证 → RAG 和补读 → Word／工作文件 → 尽调 skill → 模型自主两章草稿／引用核对／导出 → 中断恢复与真实小批验收。只接入一个 Agent，不以多 Agent、事实关系服务、专用编辑 UI、全量 649 页或全部多格式完成作为起步条件。
 

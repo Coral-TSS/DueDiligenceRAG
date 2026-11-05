@@ -15,6 +15,11 @@ from .devices import DTYPES, PADDLE_DEVICES, TORCH_DEVICES
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def vision_token_ceiling(settings):
+    """常驻视觉模型允许的最长生成。三类区域可以各自更短，但不能超过加载时的上限。"""
+    return max(settings.vision_max_new_tokens, settings.vision_tokens_low, settings.vision_tokens_value)
+
+
 @dataclass(frozen=True)
 class Settings:
     # repr=False 避免打印配置对象时顺带输出数据库连接凭据。
@@ -37,13 +42,26 @@ class Settings:
     # 扫描卷默认只增强最需要的 1 个区域；需要更密的复核时再调高。
     vision_regions_per_page: int = 1
     vision_max_new_tokens: int = 128
+    # 低置信行、金额／日期行可以单独缩短生成长度；默认金额行更短，关键词行沿用上面的 128。
+    vision_tokens_low: int = 64
+    vision_tokens_value: int = 96
+    vision_batch: int = 2
     vision_low_score: float = 0.85
+    # 1 表示数字／日期／金额行参与选区。分数上限 1 表示不限置信度，和当前规则一致。
+    vision_value_lines: bool = True
+    vision_value_max_score: float = 1.0
+    vision_keyword_max_score: float = 1.0
     # 单次处理里视觉超时达到该次数后，其余区域直接标未知，不再各等满超时。
     vision_timeout_budget: int = 3
     ocr_device: str = 'auto'
     ocr_enable_mkldnn: bool = False
     # 0 表示沿用 model_cpu_threads。oneDNN 默认关闭，见 devices.describe_paddle。
     ocr_cpu_threads: int = 0
+    ocr_rec_batch: int = 16
+    ocr_page_batch: int = 4
+    embed_token_budget: int = 2048
+    embed_batch_limit: int = 32
+    rerank_token_budget: int = 4096
     vision_device: str = 'auto'
     embedding_device: str = 'auto'
     reranker_device: str = 'auto'
@@ -111,8 +129,20 @@ class Settings:
             raise ValueError('模型设备配置无效。OCR 用 cpu 或 gpu:0，PyTorch 模型用 cpu 或 cuda，也可用 auto。')
         if any(v not in DTYPES for v in (self.vision_dtype, self.embedding_dtype, self.reranker_dtype)):
             raise ValueError('模型精度只支持 auto、float32、float16 或 bfloat16。')
-        if type(self.vision_max_new_tokens) is not int or not 16 <= self.vision_max_new_tokens <= 512:
+        if any(type(v) is not int or not 16 <= v <= 512 for v in (self.vision_max_new_tokens, self.vision_tokens_low, self.vision_tokens_value)):
             raise ValueError('视觉生成长度须为 16–512。')
+        if type(self.vision_batch) is not int or not 1 <= self.vision_batch <= 8:
+            raise ValueError('视觉批大小须为 1–8。')
+        if type(self.vision_value_lines) is not bool:
+            raise ValueError('金额行开关无效。')
+        if any(not math.isfinite(v) or not 0 <= v <= 1 for v in (self.vision_value_max_score, self.vision_keyword_max_score)):
+            raise ValueError('视觉分数上限须在 0–1 之间。')
+        if type(self.ocr_rec_batch) is not int or not 1 <= self.ocr_rec_batch <= 64 or type(self.ocr_page_batch) is not int or not 1 <= self.ocr_page_batch <= 16:
+            raise ValueError('OCR 批大小无效。')
+        if type(self.embed_token_budget) is not int or not 128 <= self.embed_token_budget <= 8192 or type(self.embed_batch_limit) is not int or not 1 <= self.embed_batch_limit <= 64:
+            raise ValueError('向量批预算无效。')
+        if type(self.rerank_token_budget) is not int or not 128 <= self.rerank_token_budget <= 8192:
+            raise ValueError('重排序批预算无效。')
         if type(self.vision_timeout_budget) is not int or not 0 <= self.vision_timeout_budget <= 50:
             raise ValueError('视觉超时预算须为 0–50。')
         if not math.isfinite(self.vision_low_score) or not 0 <= self.vision_low_score <= 1:
@@ -150,11 +180,22 @@ class Settings:
             pdf_render_scale=float(os.getenv('DDA_PDF_RENDER_SCALE') or '2'),
             vision_regions_per_page=int(os.getenv('DDA_VISION_REGIONS_PER_PAGE') or '1'),
             vision_max_new_tokens=int(os.getenv('DDA_VISION_MAX_NEW_TOKENS') or '128'),
+            vision_tokens_low=int(os.getenv('DDA_VISION_TOKENS_LOW') or '64'),
+            vision_tokens_value=int(os.getenv('DDA_VISION_TOKENS_VALUE') or '96'),
+            vision_batch=int(os.getenv('DDA_VISION_BATCH') or '2'),
             vision_low_score=float(os.getenv('DDA_VISION_LOW_SCORE') or '0.85'),
+            vision_value_lines=os.getenv('DDA_VISION_VALUE_LINES', '1').strip().lower() not in {'0', 'false', 'no'},
+            vision_value_max_score=float(os.getenv('DDA_VISION_VALUE_MAX_SCORE') or '1'),
+            vision_keyword_max_score=float(os.getenv('DDA_VISION_KEYWORD_MAX_SCORE') or '1'),
             vision_timeout_budget=int(os.getenv('DDA_VISION_TIMEOUT_BUDGET') or '3'),
             ocr_device=os.getenv('DDA_OCR_DEVICE', 'auto').strip().lower(),
             ocr_enable_mkldnn=os.getenv('DDA_OCR_ENABLE_MKLDNN', '0').strip().lower() in {'1', 'true', 'yes'},
             ocr_cpu_threads=int(os.getenv('DDA_OCR_CPU_THREADS') or '0'),
+            ocr_rec_batch=int(os.getenv('DDA_OCR_REC_BATCH') or '16'),
+            ocr_page_batch=int(os.getenv('DDA_OCR_PAGE_BATCH') or '4'),
+            embed_token_budget=int(os.getenv('DDA_EMBED_TOKEN_BUDGET') or '2048'),
+            embed_batch_limit=int(os.getenv('DDA_EMBED_BATCH_LIMIT') or '32'),
+            rerank_token_budget=int(os.getenv('DDA_RERANK_TOKEN_BUDGET') or '4096'),
             vision_device=os.getenv('DDA_VISION_DEVICE', 'auto').strip().lower(),
             embedding_device=os.getenv('DDA_EMBEDDING_DEVICE', 'auto').strip().lower(),
             reranker_device=os.getenv('DDA_RERANKER_DEVICE', 'auto').strip().lower(),
