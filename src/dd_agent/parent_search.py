@@ -7,6 +7,7 @@ import math
 from time import monotonic
 from uuid import UUID
 
+from .lexical import build_keyword_query, fuse_for, prepare_keyword_rows
 from .model_admission import request_scope,current_control,AdmissionError
 from .parent_queries import ParentQueries
 from .parent_references import reference_url
@@ -41,8 +42,19 @@ class ParentSearch:
             values=self.evidence.models.embed([query],query=True)
             if len(values)!=1:raise RetrievalError('查询向量数量不符。')
             return values[0]
-        vector=self.evidence._model_result('embedding',project_id,query,[],embed,valid_vector)
-        rows=self.queries.candidates(project_id,version,vector);control.check()
+        settings=self.evidence.settings
+        vector_rows=[]
+        if settings.retrieval_mode!='keyword':
+            vector=self.evidence._model_result('embedding',project_id,query,[],embed,valid_vector)
+            vector_rows=self.queries.candidates(project_id,version,vector,limit=settings.retrieval_vector_limit)
+        keyword_rows=[]
+        if settings.retrieval_mode!='vector':
+            plan=build_keyword_query(query)
+            if plan.tsquery:
+                found=self.queries.keyword_candidates(project_id,version,plan.tsquery,plan.needles,limit=settings.retrieval_keyword_limit)
+                keyword_rows=prepare_keyword_rows(found,plan)[:settings.retrieval_keyword_limit]
+        rows=fuse_for(settings,vector_rows,keyword_rows,key=lambda row:('parent',str(row['build_id']),str(row['id'])))
+        control.check()
         def validate(scores):
             if not isinstance(scores,list) or len(scores)!=len(rows) or any(
                     type(v) not in (int,float) or not math.isfinite(v) or not 0<=v<=1 for v in scores):
@@ -78,12 +90,12 @@ class ParentSearch:
                     separators=row['separators'],boundary=row['boundary'],continuation_from=row['continuation_from'])))
             group['matched_children'].append(dict(id=row['id'],text=row['text'],
                 start_offset=row['start_offset'],end_offset=row['end_offset'],rerank_score=score,
-                similarity=original['similarity'],
+                similarity=original['similarity'],recall=original.get('recall'),
                 source_spans=self._links(project_id,row['document_id'],row['source_spans'])))
         for group in groups.values():
             group['matched_children'].sort(key=lambda c:(-c['rerank_score'],-c['similarity'],c['id']))
             best=group['matched_children'][0]
-            group.update(rerank_score=best['rerank_score'],similarity=best['similarity'])
+            group.update(rerank_score=best['rerank_score'],similarity=best['similarity'],recall=best.get('recall'))
         results=sorted(groups.values(),key=lambda g:(-g['rerank_score'],-g['similarity'],g['build_id'],g['parent_id']))[:5]
         return results
 

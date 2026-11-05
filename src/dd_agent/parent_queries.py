@@ -1,5 +1,6 @@
 """父子索引查询仓储。每次 SQL 都核实来源；不加载模型或切换活动查询。"""
 from .retrieval import valid_vector
+from .search_queries import _recall_limit
 from contextlib import nullcontext
 from .assembly import VERSION
 
@@ -32,8 +33,9 @@ class ParentQueries:
     def __init__(self,database):
         self.database=database
 
-    def candidates(self,project_id,version,vector,*,documents=None,current_receipts_only=False):
-        """最多 12 个命中子块；向量空间由调用者提供的索引版本隔离。"""
+    def candidates(self,project_id,version,vector,*,documents=None,current_receipts_only=False,limit=12):
+        """有界命中子块；向量空间由调用者提供的索引版本隔离。"""
+        _recall_limit(limit)
         vector=valid_vector(vector)
         where=' AND b.document_id=ANY(%s::uuid[])' if documents is not None else ''
         args=(project_id,version)+((list(documents),) if documents is not None else ())
@@ -44,8 +46,29 @@ class ParentQueries:
                   c.start_offset,c.end_offset,c.source_spans,
                   1-(c.embedding <=> %s::public.vector) AS similarity
                 FROM dd_agent.parent_index_children c JOIN live ON live.id=c.build_id
-                ORDER BY c.embedding <=> %s::public.vector,c.build_id,c.id LIMIT 12''',
-                args+(vector,vector)).fetchall()
+                ORDER BY c.embedding <=> %s::public.vector,c.build_id,c.id LIMIT %s''',
+                args+(vector,vector,limit)).fetchall()
+
+    def keyword_candidates(self,project_id,version,tsquery,needles,*,documents=None,current_receipts_only=False,limit=12):
+        _recall_limit(limit)
+        if not tsquery:
+            return []
+        needles=tuple(needles)
+        if len(needles)>8:raise ValueError('关键词核对项过多。')
+        where=' AND b.document_id=ANY(%s::uuid[])' if documents is not None else ''
+        args=(tsquery,project_id,version)+((list(documents),) if documents is not None else ())
+        if current_receipts_only:where+=MANAGED;args+=(VERSION,)
+        exact=('('+' OR '.join(['strpos(lower(c.text),%s)>0']*len(needles))+') DESC,') if needles else ''
+        args+=needles+(limit,)
+        with self.database.connect() as conn:
+            return conn.execute('''WITH q AS (SELECT %s::tsquery AS tsq),
+                live AS (SELECT b.id,b.document_id '''+LIVE+where+''')
+                SELECT c.build_id,c.id,c.parent_id,live.document_id,c.text,
+                  c.start_offset,c.end_offset,c.source_spans,
+                  ts_rank_cd(c.lexemes,q.tsq) AS keyword_score
+                FROM q JOIN dd_agent.parent_index_children c ON c.lexemes @@ q.tsq
+                JOIN live ON live.id=c.build_id
+                ORDER BY '''+exact+''' ts_rank_cd(c.lexemes,q.tsq) DESC,c.build_id,c.id LIMIT %s''',args).fetchall()
 
     def finalize(self,project_id,version,candidates,*,conn=None,current_receipts_only=False):
         """重排后在单一只读快照核对最多 12 个精确 child 身份及其父块。
