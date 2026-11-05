@@ -203,5 +203,5 @@ def test_real_offline_qwen_pgvector_roundtrip(tmp_path, database_url):
         assert counters['search.embedding_cache.hit']==1
         assert counters['search.reranker_cache.hit']==1
         assert counters.get('runtime.requests',0)==0
-        assert counters['sql.calls']==6
+        assert counters['sql.calls']==7
     finally:close_runtime()

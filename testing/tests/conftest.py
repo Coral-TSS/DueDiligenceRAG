@@ -40,8 +40,10 @@ def pytest_runtest_makereport(item,call):
 
 @pytest.fixture(scope="session")
 def postgres():
-    binaries = Path(os.environ.get("DDA_TEST_POSTGRES_BIN", r"D:\Apps\PostgreSQL\17\bin"))
-    assert (binaries / "initdb.exe").exists(), "Set DDA_TEST_POSTGRES_BIN to PostgreSQL bin"
+    suffix = ".exe" if os.name == "nt" else ""
+    default = r"D:\Apps\PostgreSQL\17\bin" if os.name == "nt" else "/usr/lib/postgresql/16/bin"
+    binaries = Path(os.environ.get("DDA_TEST_POSTGRES_BIN", default))
+    assert (binaries / f"initdb{suffix}").exists(), "Set DDA_TEST_POSTGRES_BIN to PostgreSQL bin"
     run_root = Path(os.environ.get('DDA_TEST_RUN_DIR', Path(__file__).resolve().parents[2] / 'testing/runs/current'))
     root = run_root / 'postgres' / uuid.uuid4().hex
     root.mkdir(parents=True)
@@ -57,15 +59,17 @@ def postgres():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    run("initdb.exe", "-D", data, "-U", "postgres", "-A", "trust", "--encoding=UTF8", "--locale=C")
-    run("pg_ctl.exe", "-D", data, "-l", root / "server.log", "-o", f"-h 127.0.0.1 -p {port}", "-w", "start")
+    run(f"initdb{suffix}", "-D", data, "-U", "postgres", "-A", "trust", "--encoding=UTF8", "--locale=C")
+    # 套接字路径有 107 字节上限；嵌套测试目录放不下，Linux 固定用 /tmp。
+    socket_dir = "" if os.name == "nt" else " -k /tmp"
+    run(f"pg_ctl{suffix}", "-D", data, "-l", root / "server.log", "-o", f"-h 127.0.0.1 -p {port}{socket_dir}", "-w", "start")
     cluster=f"host=127.0.0.1 port={port} user=postgres"
     _cluster_alive[cluster]=True
     try:
         yield cluster
     finally:
         # Many isolated databases can need >60s to sync on this Windows disk.
-        try:run("pg_ctl.exe", "-D", data, "-m", "fast", "-t", "300", "-w", "stop")
+        try:run(f"pg_ctl{suffix}", "-D", data, "-m", "fast", "-t", "300", "-w", "stop")
         finally:_cluster_alive[cluster]=False
 
 
