@@ -29,6 +29,10 @@ class Settings:
     cache_dir: Path | None = None
     max_upload_bytes: int = 100 * 1024 * 1024
     port: int = 8765
+    # MCP 与网页分开监听。默认只绑本机；DDA_MCP_HOST=0.0.0.0 才对局域网开放。
+    mcp_host: str = '127.0.0.1'
+    mcp_port: int = 8766
+    mcp_api_key: str = field(default='', repr=False)
     pdf_python: Path = ROOT / '.venv-docling' / 'Scripts' / 'python.exe'
     ocr_python: Path = ROOT / '.venv-ocr' / 'Scripts' / 'python.exe'
     ocr_models_dir: Path = ROOT / 'models' / 'ocr' / 'official_models'
@@ -149,6 +153,15 @@ class Settings:
             raise ValueError('数据库连接池容量、等待队列或超时配置无效。')
         if self.max_upload_bytes <= 0 or not 1 <= self.port <= 65535 or not 1 <= self.vision_timeout_seconds <= 1200 or not math.isfinite(self.pdf_render_scale) or not 1 <= self.pdf_render_scale <= 4 or not 1<=self.vision_regions_per_page<=10:
             raise ValueError("文件大小上限须大于 0，端口须在 1–65535 之间。")
+        if type(self.mcp_port) is not int or not 1 <= self.mcp_port <= 65535:
+            raise ValueError('MCP 端口须在 1–65535 之间。')
+        if not isinstance(self.mcp_api_key, str):
+            raise ValueError('MCP API 密钥无效。')
+        host = self.mcp_host.strip() if isinstance(self.mcp_host, str) else ''
+        if not host or len(host) > 255 or any(ch.isspace() or ch in '/\\' for ch in host):
+            raise ValueError('MCP 监听地址无效。')
+        object.__setattr__(self, 'mcp_host', host)
+        object.__setattr__(self, 'mcp_api_key', self.mcp_api_key.strip())
         if self.ocr_device not in PADDLE_DEVICES or any(v not in TORCH_DEVICES for v in (self.vision_device, self.embedding_device, self.reranker_device)):
             raise ValueError('模型设备配置无效。OCR 用 cpu 或 gpu:0，PyTorch 模型用 cpu 或 cuda，也可用 auto。')
         if any(v not in DTYPES for v in (self.vision_dtype, self.embedding_dtype, self.reranker_dtype)):
@@ -192,6 +205,9 @@ class Settings:
             cache_dir=cache_path.resolve() if cache_path else None,
             max_upload_bytes=int(os.getenv("DDA_MAX_UPLOAD_MB", "100")) * 1024 * 1024,
             port=int(os.getenv("DDA_PORT", "8765")),
+            mcp_host=os.getenv('DDA_MCP_HOST', '127.0.0.1').strip() or '127.0.0.1',
+            mcp_port=int(os.getenv('DDA_MCP_PORT') or '8766'),
+            mcp_api_key=os.getenv('DDA_MCP_API_KEY', ''),
             pdf_python=Path(os.getenv('DDA_PDF_PYTHON') or ROOT / '.venv-docling' / 'Scripts' / 'python.exe'),
             ocr_python=Path(os.getenv('DDA_OCR_PYTHON') or ROOT / '.venv-ocr' / 'Scripts' / 'python.exe'),
             ocr_models_dir=Path(os.getenv('DDA_OCR_MODELS_DIR') or ROOT / 'models' / 'ocr' / 'official_models'),

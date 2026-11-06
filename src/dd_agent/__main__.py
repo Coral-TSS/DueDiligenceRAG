@@ -1,4 +1,5 @@
 # 命令行入口：python -m dd_agent 默认启动本机 FastAPI 服务。
+# mcp 另起只读 HTTP/SSE 服务，供另一台机器上的 MCP 客户端检索证据。
 # import-file 只登记；read-pages 只做基础阅读；index-pages 只建索引；search 只检索。
 # process-pages 按“基础阅读 -> 先索引 -> 视觉增强 -> 再索引”处理指定小批页。
 # 这些 CLI 诊断命令与网页后台队列不同，不能用网页暂停按钮停止它们。
@@ -17,7 +18,7 @@ from .db import database_scope
 
 def main():
     parser = argparse.ArgumentParser(description="尽调材料本地工作区")
-    parser.add_argument("command", nargs="?", choices=["serve", "init-db", "check", "harness-check", "inspect-pdf", "import-file", "read-pages", "process-pages", "index-pages", "reindex-chunks", "search", "inventory", "reindex-lexical"], default="serve")
+    parser.add_argument("command", nargs="?", choices=["serve", "mcp", "init-db", "check", "harness-check", "inspect-pdf", "import-file", "read-pages", "process-pages", "index-pages", "reindex-chunks", "search", "inventory", "reindex-lexical"], default="serve")
     parser.add_argument('--force', action='store_true', help='reindex-lexical 时重写全部全文索引；默认只补 lexemes 为空的旧片段')
     parser.add_argument('--file', type=Path, help='本地原件绝对路径')
     parser.add_argument('--project-id', type=UUID)
@@ -38,6 +39,14 @@ def main():
     if args.command == 'serve':
         from .app import create_app
         uvicorn.run(create_app(settings), host='127.0.0.1', port=settings.port)
+        return 0
+    if args.command == 'mcp':
+        # 没有密钥就不要监听。密钥只来自环境变量，不从命令行参数读取，避免进进程列表。
+        if not settings.mcp_api_key:
+            print('请在环境变量 DDA_MCP_API_KEY 中设置本机 MCP 密钥后再启动。')
+            return 1
+        from .mcp_server import create_mcp_app
+        uvicorn.run(create_mcp_app(settings), host=settings.mcp_host, port=settings.mcp_port)
         return 0
     try:
         with database_scope(settings) as database:

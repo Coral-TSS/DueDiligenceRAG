@@ -69,6 +69,43 @@ DDA_SEARCH_PARENT_DOCUMENT_IDS=
 
 如需完全回退页级查询，设置 `DDA_SEARCH_INDEX_MODE=page` 并重启；父子成果和有效引用保留，无需重建数据。模式配置在重启后生效，切换前先让在途后台安全保存。当前仍只有语义召回，关键词检索和全卷质量／性能验收保留后续。默认混合与初版接入都已在工程上验证：未填名单时自动发现完整父子成果，其余材料回退页级。
 
+## 远程 MCP（HTTP/SSE）
+
+只读服务，给另一台机器上的 MCP 客户端列项目、列材料、做混合检索。它复用现有项目／材料列表和向量＋关键词＋RRF 检索，不重新排序，也不提供上传、OCR、入库或原件下载。项目之间没有单独的访问控制，持有 `DDA_MCP_API_KEY` 的调用方可以检索本机全部项目。不要把该端口暴露到公网。
+
+在工程根目录、已经配置 `DDA_DATABASE_URL` 的前提下：
+
+```powershell
+$env:DDA_MCP_API_KEY = '换成一串只保存在本机的长随机密钥'
+$env:DDA_MCP_HOST = '0.0.0.0'   # 仅本机使用时省略；默认 127.0.0.1
+$env:DDA_MCP_PORT = '8766'      # 可省略
+.\.venv-dev\Scripts\python.exe -m dd_agent mcp
+```
+
+Linux 上把 `$env:名称 = '值'` 换成 `export 名称=值`。未设置 `DDA_MCP_API_KEY` 时进程直接退出，不会开始监听。修改密钥或地址后需重启。
+
+客户端连接 `http://<这台机器的地址>:8766/sse`。SSE 连接和随后的消息 POST 都要带同一个头：
+
+```http
+Authorization: Bearer <DDA_MCP_API_KEY>
+```
+
+也接受 `X-API-Key: <DDA_MCP_API_KEY>`。密钥不要写进 URL。远程 MCP 配置示例（字段名以该客户端的 SSE 传输为准）：
+
+```json
+{
+  "mcpServers": {
+    "dd-evidence": {
+      "type": "sse",
+      "url": "http://192.168.1.20:8766/sse",
+      "headers": {"Authorization": "Bearer <DDA_MCP_API_KEY>"}
+    }
+  }
+}
+```
+
+工具只有三个：`list_projects`、`list_documents`（参数 `project_id`）、`search_evidence`（参数 `project_id`、`query`，可选 `document_id`）。检索默认沿用 `DDA_RETRIEVAL_MODE=hybrid` 和 `DDA_RETRIEVAL_FUSION=rrf`。返回的是证据片段及页码／位置；有召回或融合信息时一并返回。没有命中时 `results` 为空数组。这不是 DeepSeek 专用的函数调用适配，任何会说 MCP HTTP/SSE 的客户端都可以连。
+
 ## 配置和数据
 
 `.env` 只在本机保存，不纳入版本控制，也不要在问题记录中粘贴密码。所有材料处理和检索均为本地执行，不会自动联网下载模型或调用云端模型。外网报告生成接口留待 P1-C。
@@ -90,7 +127,10 @@ DDA_SEARCH_PARENT_DOCUMENT_IDS=
 | `DDA_MODEL_CPU_THREADS` | 单模型计算线程数，默认 4，允许 1–16；不是模型并发数 |
 | `DDA_DATA_DIR` | 工程 `.local/data`，业务原件、页面图和工作记录 |
 | `DDA_MAX_UPLOAD_MB` | 默认 100；本机样例配置为 500 |
-| `DDA_PORT` | 8765 |
+| `DDA_PORT` | 8765；网页服务，只监听 127.0.0.1 |
+| `DDA_MCP_API_KEY` | 无默认值。`python -m dd_agent mcp` 必须设置；每个 MCP 请求都要带同一密钥 |
+| `DDA_MCP_HOST` | `127.0.0.1`。局域网访问设为 `0.0.0.0` |
+| `DDA_MCP_PORT` | `8766`；与网页端口分开 |
 | `DDA_PDF_PYTHON` | `.venv-docling/Scripts/python.exe`，目前用 PDFium 提取／渲染 |
 | `DDA_OCR_PYTHON` | `.venv-ocr/Scripts/python.exe` |
 | `DDA_OCR_MODELS_DIR` | `models/ocr/official_models` |

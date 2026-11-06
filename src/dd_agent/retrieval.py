@@ -419,7 +419,7 @@ class EvidenceService:
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector,%s::tsvector,%s)''',
                     (uuid4(), document_id, number, version, ordinal, chunk['start_offset'], chunk['end_offset'], chunk['text'], vector, document_tsvector(chunk['text']), Jsonb(spans)))
 
-    def _recall(self,queries,project_id,version,query,*,excluded_documents=()):
+    def _recall(self,queries,project_id,version,query,*,excluded_documents=(),included_documents=None):
         """向量与关键词各自取有界候选，合并后再交给重排。单路开关不再查询另一路。"""
         control=current_control();control.check()
         settings=self.settings
@@ -432,13 +432,13 @@ class EvidenceService:
             vector=self._model_result('embedding',project_id,query,[],embed,valid_vector)
             control.check()
             vector_rows=queries.candidates(project_id,version,valid_vector(vector),
-                excluded_documents=excluded_documents,limit=settings.retrieval_vector_limit)
+                excluded_documents=excluded_documents,included_documents=included_documents,limit=settings.retrieval_vector_limit)
         keyword_rows=[]
         if settings.retrieval_mode!='vector':
             plan=build_keyword_query(query)
             if plan.tsquery:
                 found=queries.keyword_candidates(project_id,version,plan.tsquery,plan.needles,
-                    excluded_documents=excluded_documents,limit=settings.retrieval_keyword_limit)
+                    excluded_documents=excluded_documents,included_documents=included_documents,limit=settings.retrieval_keyword_limit)
                 keyword_rows=prepare_keyword_rows(found,plan)[:settings.retrieval_keyword_limit]
         control.check()
         return fuse_for(settings,vector_rows,keyword_rows,key=page_key)
@@ -456,9 +456,11 @@ class EvidenceService:
         return value
 
     @observed('search')
-    def search(self,project_id,query,*,cancel=None):
+    def search(self,project_id,query,*,cancel=None,document_id=None):
         project_id=UUID(str(project_id));query=query.strip()
         if not 1<=len(query)<=500:raise ValueError('查询须为 1–500 个字符。')
+        # document_id 只收窄召回范围，融合与重排仍走原路径。
+        if document_id is not None:document_id=UUID(str(document_id))
         try:
             with request_scope('interactive',cancel=cancel,deadline=monotonic()+self.settings.search_timeout_seconds):
                 current_control().check()
@@ -468,22 +470,23 @@ class EvidenceService:
                     from .parent_index import ParentIndex
                     from .mixed_search import MixedSearch
                     index=ParentIndex(self.settings,database=self.database,models=self.models)
-                    return MixedSearch(self,index,self.settings.search_parent_documents)._search(project_id,query)
-                return self._search(project_id,query)
+                    return MixedSearch(self,index,self.settings.search_parent_documents)._search(project_id,query,document_id=document_id)
+                return self._search(project_id,query,document_id=document_id)
         except AdmissionError as exc:
             if exc.code=='cancelled':raise SearchCancelled('查询已取消。') from None
             if exc.code=='deadline':raise SearchTimeout('本次查询超时，请稍后重试。') from None
             raise RetrievalBusy('本地模型繁忙，请稍后重试。') from None
 
-    def _search(self,project_id,query,*,project_checked=False):
+    def _search(self,project_id,query,*,project_checked=False,document_id=None):
         control=current_control();control.check()
         if not project_checked and not self.database.project_exists(project_id):raise RetrievalError('项目不存在。')
+        included=self._included_document(project_id,document_id)
         version=self.version();control.check()
         queries=SearchQueries(self.database)
         coverage=queries.coverage(project_id,version)
         response=dict(index_version=version,coverage=coverage,results=[],status='not_indexed')
         if not coverage['indexed_pages']:return response
-        rows=self._recall(queries,project_id,version,query)
+        rows=self._recall(queries,project_id,version,query,included_documents=included)
         if rows:
             texts=[r['text'] for r in rows]
             def validate_scores(scores):
@@ -505,3 +508,10 @@ class EvidenceService:
         response.update(coverage=coverage,results=sorted(current,key=lambda r:(-r['rerank_score'],-r['similarity'],str(r['id'])))[:5],
             status='candidates' if current else 'no_matches')
         return response
+
+    def _included_document(self,project_id,document_id):
+        if document_id is None:return None
+        document_id=UUID(str(document_id))
+        if self.database.document(project_id,document_id) is None:
+            raise RetrievalError('材料不存在或不属于当前项目。')
+        return (document_id,)
