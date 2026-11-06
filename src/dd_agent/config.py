@@ -1,5 +1,5 @@
 # 全部本机配置的集中入口：Settings() 采用默认值，Settings.from_env() 读取项目 .env。
-# 主应用、PDF、OCR、视觉、检索、Harness 使用不同 Python 环境，避免依赖冲突。
+# 主应用、PDF、OCR、视觉、检索使用不同 Python 环境，避免依赖冲突。
 # 模型目录配置只指向本地权重，不表示本模块会下载模型或立即加载它们。
 from dataclasses import dataclass, field
 import os
@@ -103,12 +103,6 @@ class Settings:
     retrieval_rrf_k: int = 60
     retrieval_vector_weight: float = 1.
     retrieval_keyword_weight: float = 1.
-    harness_python: Path = ROOT / '.venv-harness' / 'Scripts' / 'python.exe'
-    # 下面是项目内 Harness 测试基线，与 D:\Tools\Deepseek Harness 桌面版分开。
-    harness_home: Path = ROOT / '.local' / 'harness' / 'home'
-    harness_workspace: Path = ROOT / '.local' / 'harness' / 'workspace'
-    harness_dsh_bin: Path = ROOT / '.local/harness/cli/node_modules/.bin/dsh.cmd'
-    harness_node: Path = ROOT / '.local/harness/runtime/node-v22.19.0-win-x64/node.exe'
 
     def __post_init__(self):
         if self.parent_index_mode not in ('on','off','shadow'):
@@ -268,9 +262,4 @@ class Settings:
             retrieval_rrf_k=int(os.getenv('DDA_RETRIEVAL_RRF_K') or '60'),
             retrieval_vector_weight=float(os.getenv('DDA_RETRIEVAL_VECTOR_WEIGHT') or '1'),
             retrieval_keyword_weight=float(os.getenv('DDA_RETRIEVAL_KEYWORD_WEIGHT') or '1'),
-            harness_python=Path(os.getenv('DDA_HARNESS_PYTHON') or ROOT / '.venv-harness/Scripts/python.exe'),
-            harness_home=Path(os.getenv('DDA_HARNESS_HOME') or ROOT / '.local/harness/home'),
-            harness_workspace=Path(os.getenv('DDA_HARNESS_WORKSPACE') or ROOT / '.local/harness/workspace'),
-            harness_dsh_bin=Path(os.getenv('DDA_HARNESS_DSH_BIN') or ROOT / '.local/harness/cli/node_modules/.bin/dsh.cmd'),
-            harness_node=Path(os.getenv('DDA_HARNESS_NODE') or ROOT / '.local/harness/runtime/node-v22.19.0-win-x64/node.exe'),
         )

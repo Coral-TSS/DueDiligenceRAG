@@ -234,7 +234,8 @@ def test_progress_distinguishes_stage_counts():
     from dd_agent.config import ROOT
     js="""const {processingView}=require(process.argv[1]); console.log(processingView({status:'running',
         progress:{scheduler:'stages-v1',total_pages:20,chunk_rebuild:{done:4,total:20},stages:{reading:{succeeded:13},vision:{succeeded:10},embedding:{succeeded:3,paused:true}}}}).text);"""
-    result=subprocess.run([str(Settings().harness_node),'-e',js,str(ROOT/'src/dd_agent/static/progress.js')],
+    from node_bin import node_executable
+    result=subprocess.run([str(node_executable()),'-e',js,str(ROOT/'src/dd_agent/static/progress.js')],
         capture_output=True,text=True,encoding='utf-8',timeout=10)
     assert result.returncode==0,result.stderr
     assert '基础识别 13' in result.stdout and '向量入库 3' in result.stdout

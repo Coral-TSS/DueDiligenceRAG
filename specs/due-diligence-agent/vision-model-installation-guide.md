@@ -2,7 +2,7 @@
 
 核对日期：2026-10-20。候选：PaddleOCR-VL-1.6，官方称 0.9B。
 
-状态更新（2026-10-20）：用户已按步骤安装并实际试读，反馈识别准确但较慢，确定仅在困难场景使用。此前已核对本机存在独立环境、权重和试读脚本。下列步骤保留为安装参考；用户试用反馈不替代 B-Q 固定样本质量／性能验收，模型尚未正式接入应用。
+状态：应用通过 `DDA_VISION_PYTHON` 与 `DDA_VISION_MODELS_DIR` 调用该模型，默认是 `.venv-vision` 和 `models/vision/PaddleOCR-VL-1.6`。下列步骤是 Windows CPU 安装参考。GPU 轮子见 [GPU 安装](./gpu-setup.md)，不要把这份 CPU 版 torch 装进已经使用 GPU 的环境。试用反馈不替代固定样本质量验收。
 
 ## 选择及用途
 
@@ -75,7 +75,7 @@ $env:HF_HOME = Join-Path $PWD '.local\hf-vision'
 
 先准备一张清晰的小块文字截图，保存为项目 `testing\records\vision-test.png`。第一张用可辨认的印刷文字验证运行，第二张再用原件中的手写疑难区域。不要直接把 649 页 PDF 输入模型。
 
-将下列示例保存为 `testing\scripts\legacy\vision-smoke.py`。这是安装诊断探针；应用目前通过独立 vision_worker 接入自动区域增强，日常处理不需要运行该脚本。
+需要离线试读时，把下列示例保存为 `testing\scripts\legacy\vision-smoke.py`。该目录和试读图片已被忽略，不要提交。日常处理走 `vision_worker`，不需要运行这个脚本。
 
 ```python
 import torch
@@ -115,7 +115,7 @@ $env:TRANSFORMERS_OFFLINE = '1'
 
 生成长度 256 仅用于小块文字冒烟检查；触顶导致截断时须记录，不能当作完整页面结果。CPU 首次加载与生成可能较慢，尚无本机速度测量。此探针不包含任何云端识别调用。
 
-## 5. 接入前验收
+## 5. 质量核对
 
 安装成功、模型能输出文字、识别准确率达标是三个不同检查点。先完成小图片离线试读，再按 `specs/01-evidence-to-report/tasks.md` 的 B-Q01／B-Q04 做同一原图对比，记录姓名、日期、金额等字段错误、遗漏、耗时和内存。结果作为候选保留，冲突不自动覆盖基础 OCR；不能用参考报告答案修补识别输出。
 

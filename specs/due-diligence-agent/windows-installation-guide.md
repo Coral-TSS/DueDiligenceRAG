@@ -1,5 +1,7 @@
 # Windows 原生安装：版本与目录建议
 
+> 当前安装以仓库根目录 README 为准。本文是 2026-10-18 的候选清单。其中的 LangGraph、docxtpl 没有进入 `pyproject.toml`；主环境目录是 `.venv-dev`。不要按本文单独再装一套主应用依赖。
+
 核对日期：2026-10-18  
 关联文档：[准备清单](./preparation-checklist.md) · [产品规格](./spec.md)
 
