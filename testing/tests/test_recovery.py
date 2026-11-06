@@ -9,6 +9,7 @@ import pytest
 from psycopg.types.json import Jsonb
 
 from dd_agent.config import ROOT
+from node_bin import node_executable
 from dd_agent.pipeline import JobManager
 from test_retrieval import setup
 
@@ -112,7 +113,7 @@ def test_two_processes_resume_once_and_reuse_saved_vectors(tmp_path,database_url
 def test_progress_view_distinguishes_saved_batches_from_recheck_position():
     script=ROOT/'src/dd_agent/static/progress.js'
     assert script.is_file(),'Progress view is missing'
-    node=ROOT/'.local/harness/runtime/node-v22.19.0-win-x64/node.exe'
+    node=node_executable()
     js="""const {processingView}=require(process.argv[1]);
     const job={status:'running',execution_state:'running',worker_present:true,
         progress:{processed_pages:15,total_pages:649,stage:'reading',current_page:1}};

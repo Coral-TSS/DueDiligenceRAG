@@ -6,7 +6,6 @@
 | --- | --- | --- |
 | `tests/` | 当前正式自动测试，应保留 | 应用启动不依赖；修改代码后用它回归 |
 | `scripts/quality/` | 图像质量试验脚本；样本输出只留本机，不入库 | 不参与日常业务流程 |
-| `scripts/harness/` | 本机模拟模型端点配套的 SDK／MCP／恢复验证 | 不参与报告生成，不接触客户材料 |
 | `scripts/performance/` | 两页合成样本与真实／快速性能基线 | 仅独立测试，结果写 runs/ |
 | `runs/` | 新测试产生的日志、XML、临时图片、隔离测试 PostgreSQL | 可重建；只应在对应测试库已停止后清理 |
 | `cache/` | pytest 缓存与测试 Python 字节码 | 可重建，不是测试代码或客户原件 |
@@ -38,4 +37,4 @@
 
 阶段基线可运行 `.\.venv-dev\Scripts\python.exe testing/scripts/performance/baseline.py`；加 `--models` 使用真实 OCR／视觉／向量／重排模型。仅处理两页合成样本并使用隔离库。2026-10-26 的结果是完整回归 88 passed／2 skipped，真实模型 1 passed；同版本复用时 OCR 调用为零。
 
-阅读器行为回归位于 `tests/test_reader_regressions.py`，执行 `scripts/frontend/reader-regression.cjs`，默认使用项目已有的 `.local/harness/runtime/node-v22.19.0-win-x64/node.exe`；其他电脑可通过 `DDA_TEST_NODE` 指定 Node.js 22+。这组用真实前端脚本与受控 DOM／网络响应验证缓存失效、按需读取、失败切页和请求竞态，不需要安装浏览器或模型。修复前的旧探针已移出仓库，不作为验收入口。
+阅读器行为回归位于 `tests/test_reader_regressions.py`，执行 `scripts/frontend/reader-regression.cjs`。需要 Node.js 22+：`node` 在 `PATH` 上，或设置 `DDA_TEST_NODE`。这组用真实前端脚本与受控 DOM／网络响应验证缓存失效、按需读取、失败切页和请求竞态，不需要安装浏览器或模型。

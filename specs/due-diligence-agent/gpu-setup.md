@@ -60,14 +60,14 @@ CPU 回退时 OCR 线程可保持 6（i7-8700K 的物理核数）。oneDNN 默�
 
 在各自已有的虚拟环境里执行，不要装进主应用的 `.venv-dev`。下列命令只安装推理包，不下载模型权重。
 
+下面的命令就是安装入口。仓库不再附带单独的 CUDA 约束文件。
+
 视觉与检索（两个环境各做一次）。torch 必须低于 2.15：
 
 ```powershell
 .\.venv-vision\Scripts\python.exe -m pip install --upgrade "torch>=2.14,<2.15" --index-url https://download.pytorch.org/whl/cu126
 .\.venv-retrieval\Scripts\python.exe -m pip install --upgrade "torch>=2.14,<2.15" --index-url https://download.pytorch.org/whl/cu126
 ```
-
-对应约束文件是 `requirements-torch-cu126.txt`。
 
 OCR。`nvidia-cudnn-cu11==8.9.4.19` 在 PyPI 上已被标记为 yanked，依赖解析不会自动选它，但 paddlepaddle-gpu 3.3.1 需要它，精确版本仍可安装：
 
@@ -76,7 +76,7 @@ OCR。`nvidia-cudnn-cu11==8.9.4.19` 在 PyPI 上已被标记为 yanked，依赖�
 .\.venv-ocr\Scripts\python.exe -m pip install "paddlepaddle-gpu>=3.3,<3.4" -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
 ```
 
-对应文件是 `requirements-paddle-cu118.txt`。若解析器因为 yanked 拒绝 cuDNN，先单独安装上面的精确版本，再装 Paddle。
+若解析器因为 yanked 拒绝 cuDNN，先单独安装上面的精确版本，再装 Paddle。
 
 核对：
 
@@ -98,7 +98,7 @@ OCR。`nvidia-cudnn-cu11==8.9.4.19` 在 PyPI 上已被标记为 yanked，依赖�
 .\.venv-ocr\Scripts\python.exe -m pip install "paddlepaddle-gpu>=3.3,<3.4" -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 ```
 
-Paddle 也可以改用 cu129 索引：`https://www.paddlepaddle.org.cn/packages/stable/cu129/`。约束文件是 `requirements-torch-cu128.txt`、`requirements-paddle-cu126.txt`、`requirements-paddle-cu129.txt`。装完后用同一组核对命令；4070 的计算能力应为 `(8, 9)`。应用配置保持 `auto`，不要为这台机器改代码。
+Paddle 也可以改用 cu129 索引：`https://www.paddlepaddle.org.cn/packages/stable/cu129/`。cu126 与 cu129 二选一。装完后用同一组核对命令；4070 的计算能力应为 `(8, 9)`。应用配置保持 `auto`。
 
 ## 5. 版本戳：什么会重跑，什么不会
 

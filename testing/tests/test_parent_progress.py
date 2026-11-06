@@ -2,12 +2,13 @@
 import json
 import subprocess
 
-from dd_agent.config import ROOT,Settings
+from dd_agent.config import ROOT
+from node_bin import node_executable
 
 
 def view(job):
     code='const {processingView}=require(process.argv[1]); console.log(processingView(JSON.parse(process.argv[2])).text);'
-    result=subprocess.run([str(Settings().harness_node),'-e',code,
+    result=subprocess.run([str(node_executable()),'-e',code,
         str(ROOT/'src/dd_agent/static/progress.js'),json.dumps(job)],
         capture_output=True,text=True,encoding='utf-8',timeout=10)
     assert result.returncode==0,result.stderr

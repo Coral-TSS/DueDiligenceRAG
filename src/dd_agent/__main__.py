@@ -18,7 +18,7 @@ from .db import database_scope
 
 def main():
     parser = argparse.ArgumentParser(description="尽调材料本地工作区")
-    parser.add_argument("command", nargs="?", choices=["serve", "mcp", "init-db", "check", "harness-check", "inspect-pdf", "import-file", "read-pages", "process-pages", "index-pages", "reindex-chunks", "search", "inventory", "reindex-lexical"], default="serve")
+    parser.add_argument("command", nargs="?", choices=["serve", "mcp", "init-db", "check", "inspect-pdf", "import-file", "read-pages", "process-pages", "index-pages", "reindex-chunks", "search", "inventory", "reindex-lexical"], default="serve")
     parser.add_argument('--force', action='store_true', help='reindex-lexical 时重写全部全文索引；默认只补 lexemes 为空的旧片段')
     parser.add_argument('--file', type=Path, help='本地原件绝对路径')
     parser.add_argument('--project-id', type=UUID)
@@ -57,15 +57,7 @@ def main():
 
 
 def dispatch(args, parser, settings, database):
-    if args.command == 'harness-check':
-        # 只验证独立 Harness 运行环境，不请求生成模型，也不代表业务 MCP 已接通。
-        from .agent_runtime import check_harness, HarnessError
-        try:
-            print(json.dumps(check_harness(settings),ensure_ascii=False))
-            return 0
-        except HarnessError as exc:
-            print(str(exc));return 1
-    elif args.command == 'process-pages':
+    if args.command == 'process-pages':
         # 用已存在的项目和材料 ID 操作，不会把 --file 临时内容直接当作已登记证据。
         from .pipeline import ProcessingPipeline
         from .reading import PdfWorker, parse_pages, ReadingError
