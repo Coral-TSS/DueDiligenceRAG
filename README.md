@@ -71,4 +71,4 @@ GPU 包装进对应的 OCR、视觉或检索环境，不要装进 `.venv-dev`。
 
 测试使用隔离的 PostgreSQL，不读取业务连接。前端脚本回归需要 Node.js 22+：`node` 在 `PATH` 上，或设置 `DDA_TEST_NODE`。说明见 [testing/README.md](testing/README.md)。
 
-`specs/` 保留行为说明和上面两份安装附录。早期任务清单和方案记录不能代替本文的安装与启动步骤。
+`specs/` 保留行为说明和上面两份安装附录。任务状态以 [specs/01-evidence-to-report/tasks.md](specs/01-evidence-to-report/tasks.md) 为准。2026-11-07 的项目中心规格、测试设计和方案与它放在同一目录，确认前还没有对应功能。早期任务清单和方案记录不能代替本文的安装与启动步骤。
