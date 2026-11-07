@@ -15,6 +15,8 @@
 
 2026-10-23 当前优先范围：先让本地 RAG 在异常恢复、覆盖说明、有界原文补读、真实质量和性能方面可验证，再接入用户已有 Agent 桌面工具。Word／工作文件工具、尽调 skill 和报告生成暂缓，不删除长期产品要求；Word 优先复用已有能力，必要时补实际缺口。阶段要求与验收见 [P1 规格 RS-01–07](../01-evidence-to-report/spec.md)。
 
+2026-11-07：项目中心增量见 [project-center-spec.md](../01-evidence-to-report/project-center-spec.md)，任务状态只以 [tasks.md](../01-evidence-to-report/tasks.md) 为准。DeepSeek Harness 编排和报告生成改由另一教学 Bot 负责。本仓库提供 MCP 与对接验收，不恢复已删除的 harness-runtime。
+
 本规格说明“做什么、何时算完成”。数据库、模型和程序库等实现选择见开发计划及准备清单。
 
 ## 2. 已确认要求与工作假设
