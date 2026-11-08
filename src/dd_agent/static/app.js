@@ -21,7 +21,7 @@ function controls() {
   $("files").disabled = !ready || !selected || uploading;
   $("upload").disabled = !ready || !selected || uploading || !$("files").files.length;
   $("upload").textContent = uploading ? "正在逐个导入…" : "导入所选文件";
-  document.querySelectorAll(".project").forEach(b => b.disabled = uploading);
+  document.querySelectorAll(".project").forEach(b => { b.disabled = false; });
 }
 function renderProjects() {
   $("projects").replaceChildren();
@@ -33,8 +33,16 @@ function renderProjects() {
   }
   controls();
 }
+function rememberProject(id) {
+  const url = new URL(location.href);
+  if (id) url.searchParams.set("project", id);
+  else url.searchParams.delete("project");
+  history.replaceState(null, "", url);
+  const link = $("search-link");
+  if (link) link.href = id ? `/search?project=${id}` : "/search";
+}
 async function selectProject(id) {
-  selected = id; generation++; $("files").value = ""; $("upload-results").replaceChildren();
+  selected = id; rememberProject(id); generation++; $("files").value = ""; $("upload-results").replaceChildren();
   $("project-title").textContent = projects.find(p => p.id === id)?.name || "选择或创建一个项目";
   renderProjects(); await loadMaterials({reset: true});
 }
@@ -101,7 +109,8 @@ async function refresh() {
     $("upload-help").textContent = `可多选；逐个导入，单个失败不会中断其他文件。单文件上限 ${size(limit)}。`;
     if (ready) {
       projects = await api("/api/projects");
-      if (!projects.some(p => p.id === selected)) selected = projects[0]?.id || null;
+      const requested = new URLSearchParams(location.search).get("project");
+      selected = projects.some(p => p.id === requested) ? requested : null;
       await selectProject(selected);
     }
   } catch (error) { ready = false; $("health-title").textContent = "暂时无法连接"; $("health-message").textContent = error.message; }
@@ -118,20 +127,26 @@ $("project-form").onsubmit = async (event) => {
 $("files").onchange = controls;
 $("upload-form").onsubmit = async (event) => {
   event.preventDefault(); if (uploading || !selected) return;
-  const files = Array.from($("files").files), project = selected;
+  const files = Array.from($("files").files), project = selected, token = generation;
   uploading = true; controls(); $("retry").disabled = true; $("upload-results").replaceChildren();
   try {
     for (let i = 0; i < files.length; i++) {
       const file = files[i], line = document.createElement("div"); line.className = "upload-result";
-      line.textContent = `${i+1}/${files.length} · ${file.name}：正在导入…`; $("upload-results").append(line);
+      if (token === generation) {
+        line.textContent = `${i+1}/${files.length} · ${file.name}：正在导入…`; $("upload-results").append(line);
+      }
       try {
         if (file.size > limit) throw new Error(`超过 ${size(limit)} 上限，未上传。`);
         const data = new FormData(); data.append("file", file);
         const result = await api(`/api/projects/${project}/documents`, {method:"POST", body:data});
+        if (token !== generation) continue;
         line.textContent = `${file.name}：${result.duplicate ? "内容重复，已保留来源名" : statusLabels[result.document.status]}`;
-      } catch (error) { line.classList.add("failed"); line.textContent = `${file.name}：${error.message}`; }
+      } catch (error) {
+        if (token !== generation) continue;
+        line.classList.add("failed"); line.textContent = `${file.name}：${error.message}`;
+      }
     }
-    await loadMaterials({reset: true});
+    if (token === generation) await loadMaterials({reset: true});
   } finally { uploading = false; $("files").value = ""; controls(); $("retry").disabled = false; }
 };
 $("retry").onclick = refresh;

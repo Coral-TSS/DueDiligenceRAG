@@ -37,14 +37,18 @@ async function request(path, options) {
 async function init() {
   try {
     const projects = await request("/api/projects");
+    const select = node("search-project");
+    select.replaceChildren();
+    const blank = document.createElement("option"); blank.value = ""; blank.textContent = "请选择项目";
+    select.append(blank);
     for (const p of projects) {
       const option = document.createElement("option"); option.value = p.id; option.textContent = p.name;
-      node("search-project").append(option);
+      select.append(option);
     }
     const selected = new URLSearchParams(location.search).get("project");
-    if (projects.some(p => p.id === selected)) node("search-project").value = selected;
-    node("submit-search").disabled = !projects.length;
-    node("search-state").textContent = projects.length ? "输入问题后查询；CPU 模型加载和排序可能需要数十秒。" : "尚无项目，请先返回工作区创建并导入材料。";
+    select.value = projects.some(p => p.id === selected) ? selected : "";
+    node("submit-search").disabled = !select.value;
+    node("search-state").textContent = select.value ? "输入问题后查询；CPU 模型加载和排序可能需要数十秒。" : (projects.length ? "请先选择项目。未选择时不会搜索。" : "尚无项目，请先返回工作区创建并导入材料。");
   } catch (error) { node("search-error").textContent = error.message; node("search-state").textContent = "项目暂时无法读取，请刷新页面重试。"; }
 }
 function parentResult(hit) {
@@ -90,15 +94,21 @@ function parentResult(hit) {
   };
   article.append(links, meta, details); return article;
 }
-node("search-project").onchange = () => { clearResults(); node("search-error").textContent = ""; node("search-state").textContent = "已切换项目，请重新查询。"; };
+node("search-project").onchange = () => {
+  if (activeSearch) activeSearch.abort();
+  clearResults();
+  node("submit-search").disabled = !node("search-project").value;
+  node("search-error").textContent = "";
+  node("search-state").textContent = node("search-project").value ? "已切换项目，请重新查询。" : "请先选择项目。未选择时不会搜索。";
+};
 node("search-form").onsubmit = async event => {
  // 查询期间锁定项目选择，避免旧项目的响应出现在新项目中；失败不沿用旧查询结果。
   event.preventDefault();
-  if (node("submit-search").disabled) return;
   const project = node("search-project").value;
+  if (!project || node("submit-search").disabled) return;
   const controller = new AbortController(); activeSearch = controller;
   node("cancel-search").hidden = false; node("cancel-search").disabled = false;
-  node("submit-search").disabled = true; node("search-project").disabled = true;
+  node("submit-search").disabled = true;
   node("submit-search").textContent = "查找中…";
   clearResults(); node("search-error").textContent = "";
   node("search-state").textContent = "正在本地查找并排序，请等待…";
@@ -124,7 +134,7 @@ node("search-form").onsubmit = async event => {
   finally {
     if (activeSearch === controller) {
       activeSearch = null; node("cancel-search").hidden = true;
-      node("submit-search").disabled = false; node("search-project").disabled = false; node("submit-search").textContent = "查找";
+      node("submit-search").disabled = !node("search-project").value; node("submit-search").textContent = "查找";
     }
   }
 };

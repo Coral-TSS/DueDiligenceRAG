@@ -7,7 +7,7 @@ const nodes=new Map();
 const node=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
 node('search-project').value='project-1';node('query').value='资本';
 let pending,signal;
-const context={document:{getElementById:node,createElement:()=>new Element()},location:{search:''},
+const context={document:{getElementById:node,createElement:()=>new Element()},location:{search:'?project=project-1'},
  URLSearchParams,AbortController,console,addEventListener(){},fetch:async(url,options)=>{
   if(!options)return {ok:true,json:async()=>[{id:'project-1',name:'项目'}]};
   signal=options.signal;
