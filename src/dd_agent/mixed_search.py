@@ -47,7 +47,8 @@ class MixedSearch:
             documents=discovered['documents'];limited=discovered['limited'];project_checked=True
         if not documents:
             response=self.evidence._search(project_id,query,project_checked=True,document_id=document_id)
-            for hit in response['results']:hit['index_kind']='page'
+            for hit in response['results']:
+                if hit.get('index_kind')!='source_unit':hit['index_kind']='page'
             return dict(response,index_kind='page',parent_documents=[],selection_changed=False,parent_selection_limited=False)
         if not project_checked and not self.evidence.database.project_exists(project_id):raise RetrievalError('项目不存在。')
         parent_version=self.index.version();page_version=self.evidence.version();control.check()

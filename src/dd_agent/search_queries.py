@@ -51,8 +51,10 @@ class SearchQueries:
         if conn is None:
             with self.database.connect() as connection:return self.coverage(project_id,version,conn=connection,excluded_documents=excluded_documents)
         exclude=' AND NOT i.document_id=ANY(%s::uuid[])' if excluded_documents else ''
-        args=(project_id,version)+((list(excluded_documents),) if excluded_documents else ())+(project_id,)
-        row=conn.execute('''SELECT totals.*, (SELECT count(*) '''+CURRENT+exclude+''')::integer AS indexed_pages
+        args=(project_id,version)+((list(excluded_documents),) if excluded_documents else ())+(project_id,project_id)
+        row=conn.execute('''SELECT totals.*, (SELECT count(*) '''+CURRENT+exclude+''')::integer AS indexed_pages,
+            (SELECT count(*) FROM dd_agent.source_unit_chunks c
+              JOIN dd_agent.documents od ON od.id=c.document_id WHERE od.project_id=%s)::integer AS office_chunks
             FROM (SELECT coalesce(sum(r.page_count),0)::integer AS total_pages,
               count(*) FILTER (WHERE r.page_count IS NULL)::integer AS unread_documents
               FROM dd_agent.documents d LEFT JOIN dd_agent.document_readings r ON r.document_id=d.id

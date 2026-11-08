@@ -419,7 +419,7 @@ class EvidenceService:
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector,%s::tsvector,%s)''',
                     (uuid4(), document_id, number, version, ordinal, chunk['start_offset'], chunk['end_offset'], chunk['text'], vector, document_tsvector(chunk['text']), Jsonb(spans)))
 
-    def _recall(self,queries,project_id,version,query,*,excluded_documents=(),included_documents=None):
+    def _recall(self,queries,project_id,version,query,*,excluded_documents=(),included_documents=None,include_office=False):
         """向量与关键词各自取有界候选，合并后再交给重排。单路开关不再查询另一路。"""
         control=current_control();control.check()
         settings=self.settings
@@ -441,8 +441,11 @@ class EvidenceService:
                     excluded_documents=excluded_documents,included_documents=included_documents,limit=settings.retrieval_keyword_limit)
                 keyword_rows=prepare_keyword_rows(found,plan)[:settings.retrieval_keyword_limit]
         control.check()
-        office_rows=self._office_rows(project_id, query, included_documents)
-        return fuse_for(settings, vector_rows+office_rows['vector'], keyword_rows+office_rows['keyword'], key=page_key)
+        if include_office:
+            office_rows=self._office_rows(project_id, query, included_documents)
+            vector_rows=list(vector_rows)+office_rows['vector']
+            keyword_rows=list(keyword_rows)+office_rows['keyword']
+        return fuse_for(settings, vector_rows, keyword_rows, key=page_key)
 
     def _model_result(self,kind,project_id,query,texts,compute,validate):
         control=current_control();control.check()
@@ -486,10 +489,9 @@ class EvidenceService:
         queries=SearchQueries(self.database)
         coverage=queries.coverage(project_id,version)
         response=dict(index_version=version,coverage=coverage,results=[],status='not_indexed')
-        office_version=self._office().version()
-        if not coverage['indexed_pages'] and not self._office().count_chunks(project_id, office_version):
+        if not coverage['indexed_pages'] and not coverage['office_chunks']:
             return response
-        rows=self._recall(queries,project_id,version,query,included_documents=included)
+        rows=self._recall(queries,project_id,version,query,included_documents=included,include_office=bool(coverage['office_chunks']))
         if rows:
             texts=[r['text'] for r in rows]
             def validate_scores(scores):
