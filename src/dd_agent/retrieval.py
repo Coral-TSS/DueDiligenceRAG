@@ -441,7 +441,8 @@ class EvidenceService:
                     excluded_documents=excluded_documents,included_documents=included_documents,limit=settings.retrieval_keyword_limit)
                 keyword_rows=prepare_keyword_rows(found,plan)[:settings.retrieval_keyword_limit]
         control.check()
-        return fuse_for(settings,vector_rows,keyword_rows,key=page_key)
+        office_rows=self._office_rows(project_id, query, included_documents)
+        return fuse_for(settings, vector_rows+office_rows['vector'], keyword_rows+office_rows['keyword'], key=page_key)
 
     def _model_result(self,kind,project_id,query,texts,compute,validate):
         control=current_control();control.check()
@@ -485,7 +486,9 @@ class EvidenceService:
         queries=SearchQueries(self.database)
         coverage=queries.coverage(project_id,version)
         response=dict(index_version=version,coverage=coverage,results=[],status='not_indexed')
-        if not coverage['indexed_pages']:return response
+        office_version=self._office().version()
+        if not coverage['indexed_pages'] and not self._office().count_chunks(project_id, office_version):
+            return response
         rows=self._recall(queries,project_id,version,query,included_documents=included)
         if rows:
             texts=[r['text'] for r in rows]
@@ -501,6 +504,9 @@ class EvidenceService:
         control.check()
         current=[]
         for row in rows:
+            if row.get('index_kind')=='source_unit':
+                current.append(row)
+                continue
             if row['id'] not in live:continue
             row.update(live[row['id']])
             row['source_url']=f"/reader?project={project_id}&document={row['document_id']}&page={row['page_number']}"
@@ -508,6 +514,47 @@ class EvidenceService:
         response.update(coverage=coverage,results=sorted(current,key=lambda r:(-r['rerank_score'],-r['similarity'],str(r['id'])))[:5],
             status='candidates' if current else 'no_matches')
         return response
+
+    def index_office(self, project_id, document_id):
+        return self._office().index(project_id, document_id)
+
+    def _office(self):
+        from .office import OfficeIndex
+        return OfficeIndex(self.settings, self.database, self.models)
+
+    def _office_rows(self, project_id, query, included):
+        from .lexical import build_keyword_query
+        office=self._office()
+        version=office.version()
+        vector_rows=[]
+        if self.settings.retrieval_mode!='keyword':
+            def embed():
+                values=self.models.embed([query],query=True)
+                if len(values)!=1:raise RetrievalError('查询向量数量不符。')
+                return values[0]
+            vector=self._model_result('embedding',project_id,query,[],embed,valid_vector)
+            vector_rows=office.candidates(project_id, version, vector=valid_vector(vector), included=included,
+                                          limit=self.settings.retrieval_vector_limit)
+        keyword_rows=[]
+        if self.settings.retrieval_mode!='vector':
+            plan=build_keyword_query(query)
+            if plan.tsquery:
+                keyword_rows=office.candidates(project_id, version, tsquery=plan.tsquery, needles=plan.needles,
+                                               included=included, limit=self.settings.retrieval_keyword_limit)
+        names=self._office_names(project_id, [row['document_id'] for row in vector_rows+keyword_rows])
+        for row in vector_rows+keyword_rows:
+            row.update(names.get(row['document_id'], {'filenames': []}))
+            row['source_url']=f"/api/projects/{project_id}/documents/{row['document_id']}/source-units/{row['unit_id']}?index_version={version}"
+        return {'vector': vector_rows, 'keyword': keyword_rows}
+
+    def _office_names(self, project_id, documents):
+        if not documents:
+            return {}
+        with self.database.connect() as conn:
+            rows=conn.execute('''SELECT d.id AS document_id, array_agg(s.filename ORDER BY s.first_seen_at, s.filename) AS filenames
+                FROM dd_agent.documents d JOIN dd_agent.document_sources s ON s.document_id=d.id
+                WHERE d.project_id=%s AND d.id=ANY(%s::uuid[]) GROUP BY d.id''', (project_id, list(set(documents)))).fetchall()
+        return {row['document_id']: row for row in rows}
 
     def _included_document(self,project_id,document_id):
         if document_id is None:return None

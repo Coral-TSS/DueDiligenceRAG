@@ -57,7 +57,11 @@ class Storage:
                 output.flush()
                 os.fsync(output.fileno())
             filename = clean_filename(filename)
-            if size == 0:
+            from .office import classify_saved_file
+            office = classify_saved_file(filename, temporary)
+            if office is not None:
+                status, reason = office
+            elif size == 0:
                 # 登记阶段只做空文件、扩展名和 PDF 头部筛查。
                 # 文件能否打开、是否加密、是否扫描件，由后续 PDF 预检确定。
                 status, reason = "invalid", "文件为空，请检查原件。"
