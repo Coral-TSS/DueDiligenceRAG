@@ -1,10 +1,10 @@
 # 项目任务清单
 
-更新：2026-11-08。基线是默认分支 `6bb8c8e`（PR #10 已合并，其后无新提交）。本轮只整理文档，没有实现授权，不改业务代码、测试或数据库。
+更新：2026-11-09。基线是默认分支 `b06c693`（含已合并的项目中心与 PC 增量）。本轮只改任务表与材料元数据规格文档，没有实现授权，不改业务代码、测试或数据库。
 
-本文件只有下面这一张表。状态、顺序和依赖只改这张表，不再另开章节、阶段表或“下一步”列表。细节见 [spec.md](./spec.md)、[plan.md](./plan.md)、[project-center-spec.md](./project-center-spec.md)、[project-center-plan.md](./project-center-plan.md)、[project-center-test-design.md](./project-center-test-design.md)。回归数字和过程在 [tasks-history.md](./tasks-history.md)；那份说明**不是**任务清单，也不维护当前状态。
+本文件只有下面这一张表。状态、顺序和依赖只改这张表，不再另开章节、阶段表或“下一步”列表。细节见 [spec.md](./spec.md)、[plan.md](./plan.md)、[project-center-spec.md](./project-center-spec.md)、[project-center-plan.md](./project-center-plan.md)、[project-center-test-design.md](./project-center-test-design.md)、[material-metadata-spec.md](./material-metadata-spec.md)、[material-metadata-test-design.md](./material-metadata-test-design.md)。回归数字和过程在 [tasks-history.md](./tasks-history.md)；那份说明**不是**任务清单，也不维护当前状态。
 
-读表顺序：待做、待核实、待确认、暂缓、放弃、移交、已完成。同一状态内看“顺序”。工程完成不等于客户整卷或真实模型质量验收。迁移文件到 `017_chunk_spans.sql`，健康检查要求 schema 17。
+读表顺序：待做、待核实、待确认、暂缓、放弃、移交、已完成。同一状态内看“顺序”。工程完成不等于客户整卷或真实模型质量验收。迁移文件到 `018_source_units.sql`，健康检查要求 schema 18。MM-01 实施时再增 019。
 
 | 顺序 | ID | 目标 | 状态 | 依赖 | 验收／证据 |
 | --- | --- | --- | --- | --- | --- |
@@ -12,8 +12,9 @@
 | 2 | PC-UI | 项目列表到工作台、进度、检索、补读共用显式当前项目；无项目不搜索、不默认最新项目；切换、刷新和迟到响应不串项目 | 待做 | 无。与 PC-ISO 可并行。别名：显式当前项目、切换与旧响应 | [规格 A](./project-center-spec.md)、[TD-A](./project-center-test-design.md) |
 | 3 | RG-02 | 当前项目的覆盖缺口清单：未处理、失败、未知、空文本、待重建。别名 C-T02-b 覆盖部分 | 待做 | PC-UI | [RS-02](./spec.md)、[TD-D01](./project-center-test-design.md)。搜索摘要已有，不等于本项完成 |
 | 4 | RG-03 | 按证据标识或来源范围补读，并提供必填项目的 MCP 工具。别名 C-T02-b 补读部分 | 待做 | PC-UI。可与 RG-02 并行 | [RS-03](./spec.md)、[TD-D02](./project-center-test-design.md)、[TD-D03](./project-center-test-design.md)。单页和父块 HTTP 已有，不计入本项完成 |
-| 5 | RG-06 | 当前项目内的材料与来源范围过滤（HTTP 与页面）。别名：RG-06 其余。不含 RG-06a／b／c，也不含固定集 | 待做 | PC-UI | [RS-06](./spec.md)、[TD-D04](./project-center-test-design.md)。hybrid 已完成，见 RG-06c |
-| 6 | RG-04 | 冻结开发／保留集并分开记录 OCR、召回、重排、来源和未知。至少 60 个可判读字段 | 待做 | 无。不阻塞 1–5。质量数字只来自真实模型运行 | [RS-04](./spec.md)、[B-Q](./spec.md#b-q-的首轮验收门槛)、[TD-D05](./project-center-test-design.md) |
+| 5 | MM-01 | 材料元数据：类别（默认表）、项目主体、日期／期间；单份与批量人工录入；列表与 MCP 投影。建议迁移 019。不含自动分类、可信度／管理字段；主体首批只改名不删除 | 待做 | PC-UI | [material-metadata-spec](./material-metadata-spec.md)、[TD-M／TD-I](./material-metadata-test-design.md)。2026-11-09 规格第 10 节已确认 |
+| 6 | RG-06 | 当前项目内材料多选、PDF 页范围、类别／主体／日期过滤（HTTP、页面、MCP）。字段间 AND、字段内 OR；未填维默认排除并给计数。别名：RG-06 其余。不含 RG-06a／b／c、不含固定集、不含 Office 定位过滤（设页范围时排除无页码单元） | 待做 | PC-UI、MM-01 | [RS-06](./spec.md)、[material-metadata-spec §7](./material-metadata-spec.md)、[TD-F／TD-C](./material-metadata-test-design.md)、[TD-D04](./project-center-test-design.md)。hybrid 已完成，见 RG-06c |
+| 7 | RG-04 | 冻结开发／保留集并分开记录 OCR、召回、重排、来源和未知。至少 60 个可判读字段 | 待做 | 无。不阻塞 1–6。质量数字只来自真实模型运行 | [RS-04](./spec.md)、[B-Q](./spec.md#b-q-的首轮验收门槛)、[TD-D05](./project-center-test-design.md) |
 | 20 | RG-07 | 本仓库只做 MCP 对接验收：遍历、覆盖、检索、补读、拒绝跨项目。编排和报告不在此行 | 待做 | RG-02、RG-03；对方教学 Bot 冻结调用（仓库外） | [RS-07](./spec.md)。检索 MCP 已交付，见 MCP-SSE |
 | 7 | RG-05k | 核对渲染与 OCR 重叠是否已达到原定验收。2026-11-04 仍列为后续；代码有渲染计划与 OCR 等待，本轮未重跑 | 待核实 | RG-05b、RG-05e | [plan 的 RG-05k](./plan.md#rg-05k统一图像产物与坐标)。未重跑前不标完成 |
 | 8 | RG-05l | 核对只读盘点 l1 与 8MB 日志备份 l2 的验收。别名 l1、l2 | 待核实 | 无 | `maintenance.py`。l3／l4 是 RG-05l3、RG-05l4，不并进本项完成 |
