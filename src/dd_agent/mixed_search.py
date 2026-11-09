@@ -47,7 +47,8 @@ class MixedSearch:
             documents=discovered['documents'];limited=discovered['limited'];project_checked=True
         if not documents:
             response=self.evidence._search(project_id,query,project_checked=True,document_id=document_id)
-            for hit in response['results']:hit['index_kind']='page'
+            for hit in response['results']:
+                if hit.get('index_kind')!='source_unit':hit['index_kind']='page'
             return dict(response,index_kind='page',parent_documents=[],selection_changed=False,parent_selection_limited=False)
         if not project_checked and not self.evidence.database.project_exists(project_id):raise RetrievalError('项目不存在。')
         parent_version=self.index.version();page_version=self.evidence.version();control.check()
@@ -90,6 +91,9 @@ class MixedSearch:
                 keyword_rows=prepare_keyword_rows([dict(r,index_kind='page') for r in old]+[dict(r,index_kind='parent_child') for r in children],plan)
                 keyword_rows=keyword_rows[:settings.retrieval_keyword_limit]
         # 融合后再交给一次重排，重排条数仍受 candidate_limit 限制，默认不超过原来的 12 条。
+        office_rows=self.evidence._office_rows(project_id, query, page_included)
+        vector_rows=list(vector_rows)+office_rows['vector']
+        keyword_rows=list(keyword_rows)+office_rows['keyword']
         rows=fuse_for(settings,vector_rows,keyword_rows,key=mixed_key)
         def validate(scores):
             if not isinstance(scores,list) or len(scores)!=len(rows) or any(
@@ -127,6 +131,9 @@ class MixedSearch:
             row.update(live_old[row['id']])
             row['source_url']=f"/reader?project={project_id}&document={row['document_id']}&page={row['page_number']}"
             results.append(row)
+        for row in rows:
+            if row.get('index_kind')=='source_unit':
+                results.append(row)
         # 同一材料可能在推理期间重建完毕，最终仍具备资格，但本次评分的
         # 旧 child 已退出当前谱系。资格相同不代表候选快照相同。
         changed=valid!=selected or len(live_children)!=len(children)

@@ -8,7 +8,7 @@
 <div class="layout">
 <aside class="card"><h2>尽调项目</h2><form id="project-form"><label for="project-name">新建项目</label><div class="create-row"><input id="project-name" name="name" maxlength="200" placeholder="例如：某公司并购尽调" required><button id="create-project" type="submit">创建</button></div><p id="project-error" class="error" role="alert"></p></form><nav id="projects" aria-label="项目列表"></nav></aside>
 <section class="card workspace" aria-labelledby="project-title"><div class="section-heading"><div><span class="eyebrow">项目材料</span><h2 id="project-title">选择或创建一个项目</h2></div><span id="document-count" class="muted"></span></div>
-<p class="notice">导入后先登记原件。已读页面建立索引后，可进入<a href="/search">证据检索</a>；报告生成将在后续阶段加入。</p>
+<p class="notice">导入后先登记原件。已读页面建立索引后，可进入<a id="search-link" href="/search">证据检索</a>；报告生成将在后续阶段加入。</p>
 <form id="upload-form"><label for="files">导入材料</label><div class="upload-box"><input id="files" type="file" multiple aria-describedby="upload-help"><button id="upload" type="submit" disabled>导入所选文件</button></div><p id="upload-help" class="muted">可多选；逐个导入，单个失败不会中断其他文件。</p></form>
 <div id="upload-results" role="status" aria-live="polite"></div><p id="list-error" class="error" role="alert"></p>
 <div id="empty" class="empty">先创建项目，再将收集到的材料导入这里。</div>

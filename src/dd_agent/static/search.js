@@ -37,14 +37,18 @@ async function request(path, options) {
 async function init() {
   try {
     const projects = await request("/api/projects");
+    const select = node("search-project");
+    select.replaceChildren();
+    const blank = document.createElement("option"); blank.value = ""; blank.textContent = "请选择项目";
+    select.append(blank);
     for (const p of projects) {
       const option = document.createElement("option"); option.value = p.id; option.textContent = p.name;
-      node("search-project").append(option);
+      select.append(option);
     }
     const selected = new URLSearchParams(location.search).get("project");
-    if (projects.some(p => p.id === selected)) node("search-project").value = selected;
-    node("submit-search").disabled = !projects.length;
-    node("search-state").textContent = projects.length ? "输入问题后查询；CPU 模型加载和排序可能需要数十秒。" : "尚无项目，请先返回工作区创建并导入材料。";
+    select.value = projects.some(p => p.id === selected) ? selected : "";
+    node("submit-search").disabled = !select.value;
+    node("search-state").textContent = select.value ? "输入问题后查询；CPU 模型加载和排序可能需要数十秒。" : (projects.length ? "请先选择项目。未选择时不会搜索。" : "尚无项目，请先返回工作区创建并导入材料。");
   } catch (error) { node("search-error").textContent = error.message; node("search-state").textContent = "项目暂时无法读取，请刷新页面重试。"; }
 }
 function parentResult(hit) {
@@ -90,15 +94,21 @@ function parentResult(hit) {
   };
   article.append(links, meta, details); return article;
 }
-node("search-project").onchange = () => { clearResults(); node("search-error").textContent = ""; node("search-state").textContent = "已切换项目，请重新查询。"; };
+node("search-project").onchange = () => {
+  if (activeSearch) activeSearch.abort();
+  clearResults();
+  node("submit-search").disabled = !node("search-project").value;
+  node("search-error").textContent = "";
+  node("search-state").textContent = node("search-project").value ? "已切换项目，请重新查询。" : "请先选择项目。未选择时不会搜索。";
+};
 node("search-form").onsubmit = async event => {
  // 查询期间锁定项目选择，避免旧项目的响应出现在新项目中；失败不沿用旧查询结果。
   event.preventDefault();
-  if (node("submit-search").disabled) return;
   const project = node("search-project").value;
+  if (!project || node("submit-search").disabled) return;
   const controller = new AbortController(); activeSearch = controller;
   node("cancel-search").hidden = false; node("cancel-search").disabled = false;
-  node("submit-search").disabled = true; node("search-project").disabled = true;
+  node("submit-search").disabled = true;
   node("submit-search").textContent = "查找中…";
   clearResults(); node("search-error").textContent = "";
   node("search-state").textContent = "正在本地查找并排序，请等待…";
@@ -112,7 +122,8 @@ node("search-form").onsubmit = async event => {
     for (const hit of data.results) {
       if (hit.index_kind === "parent_child") { node("search-results").append(parentResult(hit)); continue; }
       const article = document.createElement("article"); article.className = "search-hit";
-      const title = document.createElement("a"); title.href = hit.source_url; title.textContent = `${hit.filenames[0]} · PDF 第 ${hit.page_number} 页`;
+      const title = document.createElement("a"); title.href = hit.source_url || '#';
+      title.textContent = hit.locator_label ? `${hit.filenames[0]} · ${hit.locator_label}` : `${hit.filenames[0]} · PDF 第 ${hit.page_number} 页`;
       const text = document.createElement("p"); text.className = "evidence-text"; text.textContent = hit.text;
       const meta = document.createElement("p"); meta.className = "muted"; meta.textContent = `${hit.method === "ocr" ? "OCR 来源" : "原生文字来源"} · ${({machine_enhanced:"已视觉增强，事实未核实",machine_checked:"OCR 与视觉识别一致，事实未核实",machine_uncertain:"含未知信息"})[hit.verification] || "未核实"} · 相关分数 ${hit.rerank_score.toFixed(3)}${recallSuffix(hit)}`;
       article.append(title, text, meta); node("search-results").append(article);
@@ -124,7 +135,7 @@ node("search-form").onsubmit = async event => {
   finally {
     if (activeSearch === controller) {
       activeSearch = null; node("cancel-search").hidden = true;
-      node("submit-search").disabled = false; node("search-project").disabled = false; node("submit-search").textContent = "查找";
+      node("submit-search").disabled = !node("search-project").value; node("submit-search").textContent = "查找";
     }
   }
 };

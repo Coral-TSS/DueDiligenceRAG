@@ -26,6 +26,7 @@ from .automatic import AutomaticProcessor
 from .pipeline import ProcessingPipeline, JobManager
 from .materials import MaterialCatalog
 from .page_queries import PageReader, PageQueryError, ERROR_STATUS
+from .office import OfficeIndex
 from .parent_references import ParentReferences, ParentReferenceError
 
 
@@ -303,6 +304,13 @@ def create_app(settings=None):
         except ParentReferenceError as exc:
             return JSONResponse({'detail':str(exc),'error_code':exc.code},
                                 status_code=404 if exc.code=='not_found' else 409)
+
+    @app.get('/api/projects/{project_id}/documents/{document_id}/source-units/{unit_id}')
+    def source_unit(project_id: UUID, document_id: UUID, unit_id: UUID, index_version: str = Query(min_length=64, max_length=64)):
+        row = OfficeIndex(settings, database, app.state.evidence.models).read(project_id, document_id, unit_id, index_version)
+        if row is None:
+            raise HTTPException(404, '材料不存在或不属于当前项目。')
+        return {k: v for k, v in row.items() if k != 'storage_key'}
 
     @app.get('/api/projects/{project_id}/documents/{document_id}/page-catalog')
     def page_catalog(project_id: UUID, document_id: UUID,

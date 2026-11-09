@@ -299,6 +299,16 @@ class JobManager:
             self._save(job,'failed',progress,'local_processing_failed')
 
     def _run_staged(self, job, pipeline):
+        from .office import _extension, _PACKAGE
+        doc = self._document(job['project_id'], job['document_id'])
+        if any(_extension(name) in _PACKAGE for name in doc.get('filenames') or []):
+            try:
+                self._save(job, 'running', {})
+                outcome = pipeline.evidence.index_office(job['project_id'], doc['id'])
+                self._save(job, 'partial' if outcome['failed_units'] else 'completed', outcome)
+            except Exception:
+                self._save(job, 'failed', {}, 'local_processing_failed')
+            return
         from .stage_scheduler import StageScheduler
         scheduler=StageScheduler(self,job,pipeline)
         try:

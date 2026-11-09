@@ -12,7 +12,7 @@ const parent={index_kind:'parent_child',document_id:'doc',filenames:['工商档�
  reference:{url:'/api/parent',params:{index_version:'v'}}};
 const page={text:'页级片段',filenames:['其他.pdf'],source_url:'/reader?page=3',page_number:3,method:'text',rerank_score:.8};
 let resolveRead,readSignal;
-const context={document:{getElementById:node,createElement:tag=>new Element(tag)},location:{search:''},
+const context={document:{getElementById:node,createElement:tag=>new Element(tag)},location:{search:'?project=project-1'},
  URLSearchParams,AbortController,console,addEventListener(){},fetch:async(url,options)=>{
   if(url==='/api/projects')return {ok:true,json:async()=>[{id:'project-1',name:'项目'}]};
   if(options?.method==='POST')return {ok:true,json:async()=>({selection_changed:true,parent_selection_limited:true,
