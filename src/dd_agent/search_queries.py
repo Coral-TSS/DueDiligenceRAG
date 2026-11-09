@@ -3,6 +3,7 @@
 保持页级当前来源契约；未来父子块接入时在此替换依赖查询，不能跳过复验。
 """
 from contextlib import nullcontext
+from .material_metadata import metadata_sql, page_sql
 
 def _recall_limit(limit):
     if type(limit) is not int or not 1<=limit<=50:
@@ -61,19 +62,21 @@ class SearchQueries:
               WHERE d.project_id=%s AND d.status='registered') totals''',args).fetchone()
         return dict(row,complete=bool(row['indexed_pages']) and row['indexed_pages']==row['total_pages'] and not row['unread_documents'])
 
-    def candidates(self,project_id,version,vector,*,excluded_documents=(),included_documents=None,limit=12):
+    def candidates(self,project_id,version,vector,*,excluded_documents=(),included_documents=None,limit=12,scope=None):
         _recall_limit(limit)
         clause,extra=_document_scope(excluded_documents,included_documents)
-        args=(vector,project_id,version)+extra+(vector,limit)
+        meta,meta_args=metadata_sql(scope,'d')
+        pages,page_args=page_sql(scope,'i.page_number')
+        args=(vector,project_id,version)+extra+meta_args+page_args+(vector,limit)
         with self.database.connect() as conn:
             return conn.execute('''SELECT c.id,c.document_id,c.page_number,c.text,c.start_offset,c.end_offset,c.source_spans,
                 live.method,live.pipeline_version,live.verification,1-(c.embedding <=> %s::public.vector) AS similarity
                 FROM dd_agent.evidence_chunks c
-                JOIN (SELECT i.document_id,i.page_number,i.index_version,p.method,p.pipeline_version,p.verification '''+CURRENT+clause+''') live
+                JOIN (SELECT i.document_id,i.page_number,i.index_version,p.method,p.pipeline_version,p.verification '''+CURRENT+clause+meta+pages+''') live
                 ON c.document_id=live.document_id AND c.page_number=live.page_number AND c.index_version=live.index_version
                 ORDER BY c.embedding <=> %s::public.vector,c.id LIMIT %s''',args).fetchall()
 
-    def keyword_candidates(self,project_id,version,tsquery,needles,*,excluded_documents=(),included_documents=None,limit=12):
+    def keyword_candidates(self,project_id,version,tsquery,needles,*,excluded_documents=(),included_documents=None,limit=12,scope=None):
         """全文索引命中。字面包含优先，其次是词项紧密度；条数有上界。"""
         _recall_limit(limit)
         if not tsquery:
@@ -81,11 +84,13 @@ class SearchQueries:
         needles=tuple(needles)
         if len(needles)>8:raise ValueError('关键词核对项过多。')
         clause,extra=_document_scope(excluded_documents,included_documents)
+        meta,meta_args=metadata_sql(scope,'d')
+        pages,page_args=page_sql(scope,'i.page_number')
         exact=('('+' OR '.join(['strpos(lower(c.text),%s)>0']*len(needles))+') DESC,') if needles else ''
-        args=(tsquery,project_id,version)+extra+needles+(limit,)
+        args=(tsquery,project_id,version)+extra+meta_args+page_args+needles+(limit,)
         with self.database.connect() as conn:
             return conn.execute('''WITH q AS (SELECT %s::tsquery AS tsq), live AS (
-                SELECT i.document_id,i.page_number,i.index_version,p.method,p.pipeline_version,p.verification '''+CURRENT+clause+''')
+                SELECT i.document_id,i.page_number,i.index_version,p.method,p.pipeline_version,p.verification '''+CURRENT+clause+meta+pages+''')
                 SELECT c.id,c.document_id,c.page_number,c.text,c.start_offset,c.end_offset,c.source_spans,
                   live.method,live.pipeline_version,live.verification,ts_rank_cd(c.lexemes,q.tsq) AS keyword_score
                 FROM q JOIN dd_agent.evidence_chunks c ON c.lexemes @@ q.tsq

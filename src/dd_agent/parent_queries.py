@@ -3,6 +3,7 @@ from .retrieval import valid_vector
 from .search_queries import _recall_limit
 from contextlib import nullcontext
 from .assembly import VERSION
+from .material_metadata import metadata_sql, span_page_sql
 
 
 # 与 ParentIndex.metadata 的有效性定义一致，包含缺页边界和接纳谱系。
@@ -33,23 +34,28 @@ class ParentQueries:
     def __init__(self,database):
         self.database=database
 
-    def candidates(self,project_id,version,vector,*,documents=None,current_receipts_only=False,limit=12):
+    def candidates(self,project_id,version,vector,*,documents=None,current_receipts_only=False,limit=12,scope=None):
         """有界命中子块；向量空间由调用者提供的索引版本隔离。"""
         _recall_limit(limit)
         vector=valid_vector(vector)
         where=' AND b.document_id=ANY(%s::uuid[])' if documents is not None else ''
         args=(project_id,version)+((list(documents),) if documents is not None else ())
         if current_receipts_only:where+=MANAGED;args+=(VERSION,)
+        meta,meta_args=metadata_sql(scope,'d')
+        where+=meta
+        args+=meta_args
+        pages,page_args=span_page_sql(scope)
+        outer=(' WHERE TRUE'+pages) if pages else ''
         with self.database.connect() as conn:
             return conn.execute('''WITH live AS (SELECT b.id,b.document_id '''+LIVE+where+''')
                 SELECT c.build_id,c.id,c.parent_id,live.document_id,c.text,
                   c.start_offset,c.end_offset,c.source_spans,
                   1-(c.embedding <=> %s::public.vector) AS similarity
-                FROM dd_agent.parent_index_children c JOIN live ON live.id=c.build_id
+                FROM dd_agent.parent_index_children c JOIN live ON live.id=c.build_id'''+outer+'''
                 ORDER BY c.embedding <=> %s::public.vector,c.build_id,c.id LIMIT %s''',
-                args+(vector,vector,limit)).fetchall()
+                args+(vector,)+page_args+(vector,limit)).fetchall()
 
-    def keyword_candidates(self,project_id,version,tsquery,needles,*,documents=None,current_receipts_only=False,limit=12):
+    def keyword_candidates(self,project_id,version,tsquery,needles,*,documents=None,current_receipts_only=False,limit=12,scope=None):
         _recall_limit(limit)
         if not tsquery:
             return []
@@ -58,8 +64,13 @@ class ParentQueries:
         where=' AND b.document_id=ANY(%s::uuid[])' if documents is not None else ''
         args=(tsquery,project_id,version)+((list(documents),) if documents is not None else ())
         if current_receipts_only:where+=MANAGED;args+=(VERSION,)
+        meta,meta_args=metadata_sql(scope,'d')
+        where+=meta
+        args+=meta_args
+        pages,page_args=span_page_sql(scope)
+        outer=(' WHERE TRUE'+pages) if pages else ''
         exact=('('+' OR '.join(['strpos(lower(c.text),%s)>0']*len(needles))+') DESC,') if needles else ''
-        args+=needles+(limit,)
+        args+=page_args+needles+(limit,)
         with self.database.connect() as conn:
             return conn.execute('''WITH q AS (SELECT %s::tsquery AS tsq),
                 live AS (SELECT b.id,b.document_id '''+LIVE+where+''')
@@ -67,7 +78,7 @@ class ParentQueries:
                   c.start_offset,c.end_offset,c.source_spans,
                   ts_rank_cd(c.lexemes,q.tsq) AS keyword_score
                 FROM q JOIN dd_agent.parent_index_children c ON c.lexemes @@ q.tsq
-                JOIN live ON live.id=c.build_id
+                JOIN live ON live.id=c.build_id'''+outer+'''
                 ORDER BY '''+exact+''' ts_rank_cd(c.lexemes,q.tsq) DESC,c.build_id,c.id LIMIT %s''',args).fetchall()
 
     def finalize(self,project_id,version,candidates,*,conn=None,current_receipts_only=False):

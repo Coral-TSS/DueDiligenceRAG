@@ -4,6 +4,7 @@
 # 上传成功只是保存／登记；自动处理接口返回 202 也只是任务已接受，不表示全卷完成。
 from pathlib import Path
 from contextlib import asynccontextmanager
+from datetime import date
 from typing import Literal
 from uuid import UUID
 from threading import Event
@@ -25,6 +26,7 @@ from .review import ReviewService, ReviewError, ReviewConflict, ReviewNotFound
 from .automatic import AutomaticProcessor
 from .pipeline import ProcessingPipeline, JobManager
 from .materials import MaterialCatalog
+from .material_metadata import MetadataError, parse_filters, validate_category, validate_date_fields
 from .page_queries import PageReader, PageQueryError, ERROR_STATUS
 from .office import OfficeIndex
 from .parent_references import ParentReferences, ParentReferenceError
@@ -51,7 +53,17 @@ class ProjectInput(BaseModel):
 
 class SearchInput(BaseModel):
     # 限制问题长度；当前查询返回候选证据，不是调用生成模型写回答。
+    # 新过滤字段都可选。旧客户端只传 query 时行为不变。
     query: str
+    document_id: UUID | None = None
+    document_ids: list[UUID] | None = None
+    page_from: int | None = None
+    page_to: int | None = None
+    categories: list[str] | None = None
+    subject_ids: list[UUID] | None = None
+    date_point: date | None = None
+    period_start: date | None = None
+    period_end: date | None = None
 
     @field_validator('query')
     @classmethod
@@ -60,6 +72,49 @@ class SearchInput(BaseModel):
         if not 1 <= len(value) <= 500:
             raise ValueError('查询须为 1–500 个字符。')
         return value
+
+
+class SubjectInput(BaseModel):
+    name: str
+    role: str | None = None
+
+
+class SubjectRenameInput(BaseModel):
+    name: str
+
+
+class SingleMetadataInput(BaseModel):
+    category: str
+    subject_id: UUID | None = None
+    date_kind: str
+    point_date: date | None = None
+    period_start: date | None = None
+    period_end: date | None = None
+
+
+class FlaggedCategory(BaseModel):
+    set: bool = False
+    value: str | None = None
+
+
+class FlaggedSubject(BaseModel):
+    set: bool = False
+    value: UUID | None = None
+
+
+class FlaggedDate(BaseModel):
+    set: bool = False
+    kind: str | None = None
+    point_date: date | None = None
+    period_start: date | None = None
+    period_end: date | None = None
+
+
+class BatchMetadataInput(BaseModel):
+    document_ids: list[UUID]
+    category: FlaggedCategory | None = None
+    subject: FlaggedSubject | None = None
+    date: FlaggedDate | None = None
 
 
 
@@ -170,6 +225,10 @@ def create_app(settings=None):
         return JSONResponse({'detail': str(exc), 'code': exc.code},
                             status_code=ERROR_STATUS.get(exc.code, 503))
 
+    @app.exception_handler(MetadataError)
+    async def metadata_error(request, exc):
+        return JSONResponse({'detail': str(exc), 'fields': exc.fields}, status_code=exc.status)
+
     @app.get("/api/health")
     def health():
         return {**database.health(), "max_upload_bytes": settings.max_upload_bytes}
@@ -184,7 +243,12 @@ def create_app(settings=None):
         cancelled=Event();result=None;error=None
         def execute():
             require_project(project_id)
-            return app.state.evidence.search(project_id,body.query,cancel=cancelled)
+            scope = parse_filters(
+                document_id=body.document_id, document_ids=body.document_ids,
+                page_from=body.page_from, page_to=body.page_to, categories=body.categories,
+                subject_ids=body.subject_ids, date_point=body.date_point,
+                period_start=body.period_start, period_end=body.period_end)
+            return app.state.evidence.search(project_id, body.query, cancel=cancelled, scope=scope)
         async def disconnected():
             while True:
                 # FastAPI has already consumed/validated the JSON body. Wait on
@@ -230,12 +294,69 @@ def create_app(settings=None):
         return [{**public_document(d), 'reading': database.reading(d['id'])} for d in database.documents(project_id)]
 
     @app.get('/api/projects/{project_id}/material-catalog')
-    def material_catalog(project_id: UUID, limit: int = Query(default=50,ge=1,le=100), after: UUID | None = None):
+    def material_catalog(project_id: UUID, limit: int = Query(default=50,ge=1,le=100), after: UUID | None = None,
+                         categories: list[str] | None = Query(default=None),
+                         subject_ids: list[UUID] | None = Query(default=None),
+                         date_point: date | None = Query(default=None),
+                         period_start: date | None = Query(default=None),
+                         period_end: date | None = Query(default=None)):
         # 这里只列登记信息和已知阅读版本，不扫描全文，也不等于有效索引覆盖统计。
+        # 类别、主体、日期过滤写在目录 SQL 的 WHERE 里。页范围不属于列表。
         try:
-            return MaterialCatalog(database,project_id).list_materials(limit,after)
+            scope = parse_filters(purpose='list', categories=categories, subject_ids=subject_ids,
+                                  date_point=date_point, period_start=period_start, period_end=period_end)
+            return MaterialCatalog(database,project_id).list_materials(limit,after,scope)
         except LookupError as exc:
             raise HTTPException(404,str(exc)) from None
+
+    @app.get('/api/projects/{project_id}/subjects')
+    def list_subjects(project_id: UUID):
+        require_project(project_id)
+        return database.subjects(project_id)
+
+    @app.post('/api/projects/{project_id}/subjects', status_code=201)
+    def create_subject(project_id: UUID, body: SubjectInput):
+        require_project(project_id)
+        return database.create_subject(project_id, body.name, body.role)
+
+    @app.patch('/api/projects/{project_id}/subjects/{subject_id}')
+    def rename_subject(project_id: UUID, subject_id: UUID, body: SubjectRenameInput):
+        require_project(project_id)
+        try:
+            return database.rename_subject(project_id, subject_id, body.name)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+
+    def metadata_changes(body: SingleMetadataInput):
+        changes = validate_date_fields(body.date_kind, body.point_date, body.period_start, body.period_end)
+        changes['category'] = validate_category(body.category)
+        changes['subject_id'] = body.subject_id
+        return changes
+
+    @app.patch('/api/projects/{project_id}/documents/{document_id}/metadata')
+    def update_metadata(project_id: UUID, document_id: UUID, body: SingleMetadataInput):
+        require_project(project_id)
+        try:
+            updated = database.apply_metadata(project_id, [document_id], metadata_changes(body))
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+        return {'document': public_document(updated[0])}
+
+    @app.post('/api/projects/{project_id}/documents/metadata')
+    def update_metadata_batch(project_id: UUID, body: BatchMetadataInput):
+        require_project(project_id)
+        changes = {}
+        if body.category is not None and body.category.set:
+            changes['category'] = validate_category(body.category.value)
+        if body.subject is not None and body.subject.set:
+            changes['subject_id'] = body.subject.value
+        if body.date is not None and body.date.set:
+            changes.update(validate_date_fields(body.date.kind, body.date.point_date, body.date.period_start, body.date.period_end))
+        try:
+            updated = database.apply_metadata(project_id, body.document_ids, changes)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+        return {'documents': [public_document(row) for row in updated]}
 
     @app.post("/api/projects/{project_id}/documents")
     def register(project_id: UUID, file: UploadFile):

@@ -243,12 +243,19 @@ class OfficeIndex:
                     uuid4(), unit_id, document_id, version, unit['text'], vector,
                     document_tsvector(unit['text']), Jsonb(unit['locator'])))
 
-    def candidates(self, project_id, version, *, vector=None, tsquery=None, needles=(), included=None, limit=12):
+    def candidates(self, project_id, version, *, vector=None, tsquery=None, needles=(), included=None, limit=12, scope=None):
+        from .material_metadata import metadata_sql
         clause = ''
         args = [project_id, version]
         if included is not None:
             clause = ' AND c.document_id=ANY(%s::uuid[])'
             args.append(list(included))
+        meta, meta_args = metadata_sql(scope, 'd')
+        clause += meta
+        args.extend(meta_args)
+        # 来源单元没有物理页码。设了页范围就整段排除，不用定位里的幻灯片号或行号冒充页码。
+        if scope is not None and scope.page_from is not None:
+            clause += ' AND FALSE'
         rows = []
         with self.database.connect() as conn:
             if vector is not None:

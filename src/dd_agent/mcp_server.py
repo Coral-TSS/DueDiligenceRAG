@@ -22,6 +22,7 @@ from .app import public_document
 from .config import Settings
 from .db import Database
 from .db_connections import ConnectionProvider, DatabaseBusy
+from .material_metadata import MetadataError, parse_filters
 from .retrieval import EvidenceService, RetrievalError
 
 
@@ -37,10 +38,21 @@ TOOLS = (
     },
     {
         'name': 'list_documents',
-        'description': '列出指定项目里的材料标识、文件名、登记状态和阅读进度。不返回原件、页面图或存储路径。',
+        'description': (
+            '列出指定项目里的材料标识、文件名、登记状态、阅读进度，以及类别、所属主体和日期或期间。'
+            '可按类别、主体、日期重叠筛选。不返回原件、页面图或存储路径。'
+            '只传 project_id 时仍列出该项目的全部材料。'
+        ),
         'inputSchema': {
             'type': 'object',
-            'properties': {'project_id': {'type': 'string', 'description': '项目 UUID'}},
+            'properties': {
+                'project_id': {'type': 'string', 'description': '项目 UUID'},
+                'categories': {'type': 'array', 'items': {'type': 'string'}, 'description': '可选。类别代码，字段内为 OR'},
+                'subject_ids': {'type': 'array', 'items': {'type': 'string'}, 'description': '可选。主体 UUID，字段内为 OR'},
+                'date_point': {'type': 'string', 'description': '可选。日历日 YYYY-MM-DD，按重叠匹配'},
+                'period_start': {'type': 'string', 'description': '可选。期间起日，须与 period_end 同时给出'},
+                'period_end': {'type': 'string', 'description': '可选。期间止日'},
+            },
             'required': ['project_id'],
             'additionalProperties': False,
         },
@@ -49,15 +61,25 @@ TOOLS = (
         'name': 'search_evidence',
         'description': (
             '在指定项目中检索证据片段。复用现有混合召回：向量、关键词、RRF 融合，再重排。'
-            '可选 document_id 把召回限制在一份材料内。返回片段文字、项目／材料标识、页码或位置，'
-            '以及结果里已有的召回和融合信息。这是候选证据，不是已核实事实，也不返回 PDF 原件。'
+            '结果是候选证据，不是已核实事实，也不返回 PDF 原件。过滤后无命中不等于材料不存在。'
+            '可选 document_id 把召回限制在一份材料内。也可传 document_ids、PDF 页范围、类别、主体和日期。'
+            '字段之间为 AND，同一字段的多个值为 OR。未传的维度不限制；空数组无效。'
+            '不能同时传 document_id 与 document_ids。设了页范围时，没有物理页码的材料不会进入结果。'
         ),
         'inputSchema': {
             'type': 'object',
             'properties': {
                 'project_id': {'type': 'string', 'description': '项目 UUID'},
                 'query': {'type': 'string', 'description': '检索问题，1–500 字'},
-                'document_id': {'type': 'string', 'description': '可选。只在这一份材料内召回'},
+                'document_id': {'type': 'string', 'description': '可选。只在这一份材料内召回。不要和 document_ids 同时传'},
+                'document_ids': {'type': 'array', 'items': {'type': 'string'}, 'description': '可选。材料 UUID 列表，字段内为 OR'},
+                'page_from': {'type': 'integer', 'minimum': 1, 'description': '可选。PDF 物理起页，含端点，须与 page_to 同时给出'},
+                'page_to': {'type': 'integer', 'minimum': 1, 'description': '可选。PDF 物理止页，含端点'},
+                'categories': {'type': 'array', 'items': {'type': 'string'}, 'description': '可选。类别代码，字段内为 OR'},
+                'subject_ids': {'type': 'array', 'items': {'type': 'string'}, 'description': '可选。主体 UUID，字段内为 OR'},
+                'date_point': {'type': 'string', 'description': '可选。日历日 YYYY-MM-DD，按重叠匹配'},
+                'period_start': {'type': 'string', 'description': '可选。期间起日，须与 period_end 同时给出'},
+                'period_end': {'type': 'string', 'description': '可选。期间止日'},
             },
             'required': ['project_id', 'query'],
             'additionalProperties': False,
@@ -235,7 +257,7 @@ def _initialize(session, params):
         'protocolVersion': session['protocol'],
         'capabilities': {'tools': {'listChanged': False}},
         'serverInfo': dict(SERVER_INFO),
-        'instructions': '只读尽调证据服务。先 list_projects，再 list_documents，然后用 search_evidence 取片段。结果是候选证据，不是已核实事实。',
+        'instructions': '只读尽调证据服务。先 list_projects，再 list_documents，然后用 search_evidence 取片段。结果是候选证据，不是已核实事实。过滤后无命中不等于材料不存在。',
     }
 
 
@@ -248,13 +270,14 @@ def _call_tool(app, params):
             _arguments(params, (), ())
             payload = _list_projects(app.state.database)
         elif name == 'list_documents':
-            arguments = _arguments(params, ('project_id',), ('project_id',))
-            payload = _list_documents(app.state.database, _uuid(arguments['project_id'], '项目标识'))
+            arguments = _arguments(params, (
+                'project_id', 'categories', 'subject_ids', 'date_point', 'period_start', 'period_end'), ('project_id',))
+            payload = _list_documents(app.state.database, _uuid(arguments['project_id'], '项目标识'), arguments)
         else:
-            arguments = _arguments(params, ('project_id', 'query', 'document_id'), ('project_id', 'query'))
-            document_id = arguments.get('document_id')
-            payload = _search(app.state.evidence, _uuid(arguments['project_id'], '项目标识'), arguments['query'],
-                              None if document_id is None else _uuid(document_id, '材料标识'))
+            arguments = _arguments(params, (
+                'project_id', 'query', 'document_id', 'document_ids', 'page_from', 'page_to',
+                'categories', 'subject_ids', 'date_point', 'period_start', 'period_end'), ('project_id', 'query'))
+            payload = _search(app.state.evidence, _uuid(arguments['project_id'], '项目标识'), arguments['query'], arguments)
     except ToolFailure:
         raise
     except (RetrievalError, LookupError, ValueError) as exc:
@@ -293,20 +316,37 @@ def _list_projects(database):
     return {'projects': projects}
 
 
-def _list_documents(database, project_id):
+def _list_documents(database, project_id, arguments):
     if not database.project_exists(project_id):
         raise ToolFailure('项目不存在。')
+    try:
+        scope = parse_filters(
+            purpose='list', categories=arguments.get('categories'), subject_ids=arguments.get('subject_ids'),
+            date_point=arguments.get('date_point'), period_start=arguments.get('period_start'),
+            period_end=arguments.get('period_end'))
+    except MetadataError as exc:
+        raise ToolFailure(f'请求无效（{exc.status}）：{exc}') from None
     documents = []
-    for row in database.documents(project_id):
-        # 与网页材料列表同一投影：去掉存储键，附上阅读进度，不读原件。
+    for row in database.documents(project_id, scope=scope):
+        # 与网页材料列表同一投影：去掉存储键，附上阅读进度和业务元数据，不读原件。
         documents.append({**public_document(row), 'reading': database.reading(row['id'])})
     return {'documents': documents}
 
 
-def _search(evidence, project_id, query, document_id):
+def _search(evidence, project_id, query, arguments):
     if not isinstance(query, str):
         raise ToolFailure('查询须为文本。')
-    found = evidence.search(project_id, query, document_id=document_id)
+    try:
+        scope = parse_filters(
+            document_id=arguments.get('document_id'), document_ids=arguments.get('document_ids'),
+            page_from=arguments.get('page_from'), page_to=arguments.get('page_to'),
+            categories=arguments.get('categories'), subject_ids=arguments.get('subject_ids'),
+            date_point=arguments.get('date_point'), period_start=arguments.get('period_start'),
+            period_end=arguments.get('period_end'))
+    except MetadataError as exc:
+        raise ToolFailure(f'请求无效（{exc.status}）：{exc}') from None
+    found = evidence.search(project_id, query, scope=scope)
+    document_id = arguments.get('document_id')
     chunks = []
     for hit in found.get('results') or []:
         if hit.get('matched_children'):
@@ -323,6 +363,11 @@ def _search(evidence, project_id, query, document_id):
     }
     if 'coverage' in found:
         payload['coverage'] = found['coverage']
+    for key in ('excluded_uncategorized', 'excluded_unsubjected', 'excluded_undated', 'message'):
+        if key in found:
+            payload[key] = found[key]
+    if arguments.get('document_ids') is not None:
+        payload['document_ids'] = arguments.get('document_ids')
     return payload
 
 
