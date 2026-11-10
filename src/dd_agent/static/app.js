@@ -5,6 +5,8 @@ const $ = (id) => document.getElementById(id);
 let selected = null, projects = [], ready = false, uploading = false, generation = 0, limit = 0;
 // 材料清单按 material-catalog 分批读取：每批 50 份，续读用游标，避免一次取回整个项目。
 let materials = [], materialCursor = null, materialTotal = 0, loadingMaterials = false;
+let coverageItems = [], coverageCursor = null;
+const GAP_LABELS = {unprocessed: "未处理", failed: "失败", unknown: "未知", empty_text: "空文本", pending_rebuild: "待重建"};
 const statusLabels = {registered: "已登记 · 待解析", unsupported: "暂不支持", invalid: "文件无效"};
 const CATEGORIES = [
   ["uncategorized", "未分类"], ["business_license", "营业执照"], ["articles", "公司章程"],
@@ -172,6 +174,59 @@ function checkedDocumentIds() {
   walk($("documents"));
   return ids;
 }
+function clearCoverage(message) {
+  coverageItems = []; coverageCursor = null;
+  const summary = $("coverage-summary"), gaps = $("coverage-gaps"), error = $("coverage-error"), more = $("more-gaps");
+  const definition = $("coverage-definition");
+  if (summary) summary.textContent = message;
+  if (gaps) gaps.replaceChildren();
+  if (error) error.textContent = "";
+  if (definition) definition.textContent = "";
+  if (more) more.hidden = true;
+}
+function renderCoverage(data, append) {
+  const summary = $("coverage-summary"), gaps = $("coverage-gaps"), more = $("more-gaps");
+  const definition = $("coverage-definition");
+  if (!summary || !gaps) return;
+  if (!append) coverageItems = [];
+  coverageItems = coverageItems.concat(data.items || []);
+  coverageCursor = data.next_cursor || null;
+  const counts = data.counts || {};
+  const lines = Object.entries(GAP_LABELS).map(([key, label]) => `${label} ${counts[key] ?? 0}`);
+  const verdict = data.complete ? "当前口径下没有缺口。" : "当前项目不能视为全文可检索。空项目、页数未知和空文本都不算全文可检索。";
+  summary.textContent = `${verdict} 已知页数 ${counts.known_pages ?? 0}。${lines.join("，")}。这些数字不能相加。`;
+  if (definition) definition.textContent = data.definition || "";
+  gaps.replaceChildren();
+  for (const item of coverageItems) {
+    const row = document.createElement("li");
+    const kinds = (item.kinds || []).map(kind => GAP_LABELS[kind] || kind).join("、");
+    const where = item.page_number ? `第 ${item.page_number} 页` : (item.locator && item.locator.kind ? item.locator.kind : "整份材料");
+    const name = (item.filenames && item.filenames[0]) || item.document_id;
+    row.textContent = `${name} · ${where} · ${kinds}`;
+    gaps.append(row);
+  }
+  if (!coverageItems.length) {
+    const row = document.createElement("li");
+    row.textContent = data.complete ? "没有缺口条目。" : "没有可分页的缺口条目，但当前项目仍不能视为全文可检索。";
+    gaps.append(row);
+  }
+  if (more) more.hidden = !coverageCursor;
+}
+async function loadCoverage(project, token, cursor) {
+  const error = $("coverage-error");
+  if (!project) { clearCoverage("先选择项目，再查看覆盖缺口。不按全库统计。"); return; }
+  if (!cursor) clearCoverage("正在读取覆盖缺口…");
+  try {
+    const query = new URLSearchParams({limit: "50"});
+    if (cursor) query.set("cursor", cursor);
+    const data = await api(`/api/projects/${project}/coverage?${query}`);
+    if (token !== generation || project !== selected) return;
+    if (error) error.textContent = "";
+    renderCoverage(data, Boolean(cursor));
+  } catch (errorValue) {
+    if (token === generation && error) error.textContent = errorValue.message;
+  }
+}
 async function loadMaterials({reset = false} = {}) {
   // 保存本次项目与请求代次，丢弃切换项目后才返回的旧响应。
   const current = selected, token = ++generation;
@@ -179,7 +234,9 @@ async function loadMaterials({reset = false} = {}) {
     materials = []; materialCursor = null; materialTotal = 0;
     $("empty").hidden = false; $("empty").textContent = "先创建项目，再将收集到的材料导入这里。";
     $("documents-table").hidden = true; $("batch-panel").hidden = true; $("editor-panel").hidden = true;
-    $("more-materials").hidden = true; $("document-count").textContent = ""; return;
+    $("more-materials").hidden = true; $("document-count").textContent = "";
+    clearCoverage("先选择项目，再查看覆盖缺口。不按全库统计。");
+    return;
   }
   if (reset) { materials = []; materialCursor = null; materialTotal = 0; $("documents").replaceChildren(); }
   $("list-error").textContent = ""; $("empty").hidden = materials.length > 0;
@@ -195,7 +252,12 @@ async function loadMaterials({reset = false} = {}) {
     await loadSubjects(current, token);
   } catch (error) {
     if (token === generation) { $("list-error").textContent = error.message; $("empty").textContent = "材料暂时无法读取，请检查连接后重试。"; }
-  } finally { if (token === generation) { loadingMaterials = false; $("more-materials").disabled = false; } }
+  } finally {
+    if (token === generation) {
+      loadingMaterials = false; $("more-materials").disabled = false;
+      await loadCoverage(current, token);
+    }
+  }
 }
 async function refresh() {
   // 先检查数据库／配置是否就绪，再读取项目；不把连接正常等同于模型已加载。
@@ -215,6 +277,7 @@ async function refresh() {
   } catch (error) { ready = false; $("health-title").textContent = "暂时无法连接"; $("health-message").textContent = error.message; }
   finally { controls(); $("retry").disabled = false; }
 }
+$("more-gaps").onclick = () => { if (selected && coverageCursor) loadCoverage(selected, generation, coverageCursor); };
 $("project-form").onsubmit = async (event) => {
   event.preventDefault(); $("project-error").textContent = ""; $("create-project").disabled = true;
   try {

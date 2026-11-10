@@ -28,6 +28,8 @@ from .pipeline import ProcessingPipeline, JobManager
 from .materials import MaterialCatalog
 from .material_metadata import MetadataError, parse_filters, validate_category, validate_date_fields
 from .page_queries import PageReader, PageQueryError, ERROR_STATUS
+from .coverage_gaps import CoverageGaps
+from .evidence_read import EvidenceReader
 from .office import OfficeIndex
 from .parent_references import ParentReferences, ParentReferenceError
 
@@ -309,6 +311,15 @@ def create_app(settings=None):
         except LookupError as exc:
             raise HTTPException(404,str(exc)) from None
 
+    @app.get('/api/projects/{project_id}/coverage')
+    def coverage_gaps(project_id: UUID, kind: str | None = Query(default=None, max_length=32),
+                      limit: int = Query(default=50, ge=1, le=100),
+                      cursor: str | None = Query(default=None, max_length=120)):
+        # 不经过检索。统计只读当前项目，索引版本只看已有指纹，不在这里启动模型。
+        require_project(project_id)
+        return jsonable_encoder(bounded_call(lambda: CoverageGaps(database, app.state.evidence).page(
+            project_id, kind=kind, limit=limit, cursor=cursor)))
+
     @app.get('/api/projects/{project_id}/subjects')
     def list_subjects(project_id: UUID):
         require_project(project_id)
@@ -425,6 +436,29 @@ def create_app(settings=None):
         except ParentReferenceError as exc:
             return JSONResponse({'detail':str(exc),'error_code':exc.code},
                                 status_code=404 if exc.code=='not_found' else 409)
+
+    @app.get('/api/projects/{project_id}/evidence/{evidence_id}')
+    def read_evidence(project_id: UUID, evidence_id: UUID,
+                      offset: int = Query(default=0, ge=0),
+                      limit: int = Query(default=4000, ge=1, le=8000),
+                      index_version: str | None = Query(default=None, min_length=64, max_length=64)):
+        reader = EvidenceReader(database, settings)
+        return jsonable_encoder(bounded_call(lambda: reader.by_id(
+            project_id, evidence_id, offset=offset, limit=limit, index_version=index_version)))
+
+    @app.get('/api/projects/{project_id}/documents/{document_id}/evidence-range')
+    def read_evidence_range(project_id: UUID, document_id: UUID,
+                            page_from: int | None = Query(default=None, ge=1),
+                            page_to: int | None = Query(default=None, ge=1),
+                            resume_page: int | None = Query(default=None, ge=1),
+                            offset: int = Query(default=0, ge=0),
+                            limit: int = Query(default=4000, ge=1, le=8000),
+                            source_revision: str | None = Query(default=None, max_length=64),
+                            resume_unit: UUID | None = None):
+        reader = EvidenceReader(database, settings)
+        return jsonable_encoder(bounded_call(lambda: reader.by_range(
+            project_id, document_id, page_from=page_from, page_to=page_to, resume_page=resume_page,
+            offset=offset, limit=limit, source_revision=source_revision, resume_unit=resume_unit)))
 
     @app.get('/api/projects/{project_id}/documents/{document_id}/source-units/{unit_id}')
     def source_unit(project_id: UUID, document_id: UUID, unit_id: UUID, index_version: str = Query(min_length=64, max_length=64)):

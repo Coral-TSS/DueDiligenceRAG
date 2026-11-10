@@ -21,3 +21,8 @@ def test_workspace_keeps_the_url_project_and_drops_late_materials():
 def test_search_does_not_default_to_the_newest_project_and_drops_late_hits():
     result = _run('search-project-regression.cjs')
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_coverage_panel_stays_on_the_current_project():
+    result = _run('coverage-gaps-regression.cjs')
+    assert result.returncode == 0, result.stdout + result.stderr

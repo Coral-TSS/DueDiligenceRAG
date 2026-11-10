@@ -1,0 +1,17 @@
+{
+  "format": "rg04-manifest-v1",
+  "set": "holdout",
+  "synthetic": true,
+  "customer_data": false,
+  "note": "合成样例，只核对保留集格式。调参不得使用保留集。不是客户材料。",
+  "items": [
+    {
+      "item_id": "hold-synthetic-1",
+      "content_family": "synthetic-license-b",
+      "page": 1,
+      "kind": "handwritten",
+      "cases": ["unknown", "no_answer", "cross_project"],
+      "field_ids": ["f059"]
+    }
+  ]
+}

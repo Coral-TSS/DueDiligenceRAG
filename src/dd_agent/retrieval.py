@@ -191,26 +191,41 @@ class LocalModels:
         except ReadingError:
             raise RetrievalError('本地检索模型运行失败；请检查模型路径、环境或缩小批次后重试。') from None
 
-    @timed('fingerprint.embedding')
-    def profile(self, verify=False):
-        # worker 会读取权重计算指纹；它可防止版本混用，但每次重算都要启动进程并读全量权重。
-        # 这里按“worker 环境依赖版本＋权重文件清单”缓存；命中时不启动 worker（RG-05b／K01）。
+    def _profile_request(self):
         # float32 的缓存键不包含设备：GPU 与 CPU 共用已有索引。只有实际精度离开 float32 才换键。
         from .devices import describe_torch, probe_torch
         probed = probe_torch(self.settings.retrieval_python)
         capability = tuple(probed['capability']) if probed.get('capability') else None
         spec = describe_torch(self.settings.embedding_device, self.settings.embedding_dtype, cuda_available=probed['cuda'],
                               capability=capability, bf16_supported=bool(probed.get('bf16')))
-        def compute():
-            return self.one('profile', device=spec['device'], dtype=spec['dtype'])['version']
         parameters = dict(embedding=str(self.settings.embedding_dir.resolve()))
         if spec['dtype'] != 'float32':
             parameters['dtype'] = spec['dtype']
         # worker 脚本参与清单：指纹算法改动即失效；环境版本无法识别时退化为完整复验。
         entries = file_entries(model_files(self.settings) + [WORKER_SCRIPT, Path(__file__)])
-        return resolve_fingerprint('embedding_weights', venv_runtime_descriptor(self.settings.retrieval_python),
-            'embedding-profile-v1', parameters,
+        runtime = venv_runtime_descriptor(self.settings.retrieval_python)
+
+        def compute():
+            return self.one('profile', device=spec['device'], dtype=spec['dtype'])['version']
+
+        return runtime, parameters, entries, compute
+
+    @timed('fingerprint.embedding')
+    def profile(self, verify=False):
+        # worker 会读取权重计算指纹；它可防止版本混用，但每次重算都要启动进程并读全量权重。
+        # 这里按“worker 环境依赖版本＋权重文件清单”缓存；命中时不启动 worker（RG-05b／K01）。
+        runtime, parameters, entries, compute = self._profile_request()
+        return resolve_fingerprint('embedding_weights', runtime, 'embedding-profile-v1', parameters,
             entries, compute, verify=verify, directory=cache_directory(self.settings))['value']
+
+    def cached_profile(self):
+        """只读已有指纹。没有缓存时返回 None，覆盖统计不能为此启动检索模型。"""
+        runtime, parameters, entries, _compute = self._profile_request()
+        if runtime is None:
+            return None
+        found = resolve_fingerprint('embedding_weights', runtime, 'embedding-profile-v1', parameters,
+            entries, lambda: None, verify=False, directory=cache_directory(self.settings), allow_compute=False)
+        return None if found is None else found['value']
 
     def one(self, mode, **payload):
         # 不只取第一条输出：必须确认进程完整退出，防止成功一行后崩溃仍被当作完成。

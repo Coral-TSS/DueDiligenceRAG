@@ -1,0 +1,778 @@
+{
+  "format": "rg04-fields-v1",
+  "purpose": "字段判读槽位。至少 60 个结构，不是已填写的参考答案。",
+  "customer_data": false,
+  "fields": [
+    {
+      "field_id": "f001",
+      "group": "主体登记",
+      "name": "公司名称",
+      "aliases": [
+        "企业名称",
+        "公司名称"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f002",
+      "group": "主体登记",
+      "name": "公司别名",
+      "aliases": [
+        "字号",
+        "简称"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f003",
+      "group": "主体登记",
+      "name": "统一社会信用代码",
+      "aliases": [
+        "统一社会信用代码",
+        "信用代码"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f004",
+      "group": "主体登记",
+      "name": "旧注册号",
+      "aliases": [
+        "注册号"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f005",
+      "group": "主体登记",
+      "name": "企业类型",
+      "aliases": [
+        "企业类型",
+        "公司类型"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f006",
+      "group": "主体登记",
+      "name": "法定代表人",
+      "aliases": [
+        "法定代表人",
+        "负责人"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f007",
+      "group": "主体登记",
+      "name": "住所",
+      "aliases": [
+        "住所",
+        "注册地址"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f008",
+      "group": "主体登记",
+      "name": "经营范围",
+      "aliases": [
+        "经营范围"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f009",
+      "group": "主体登记",
+      "name": "成立日期",
+      "aliases": [
+        "成立日期",
+        "设立日期"
+      ],
+      "value_kind": "date",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f010",
+      "group": "主体登记",
+      "name": "营业期限起",
+      "aliases": [
+        "营业期限自"
+      ],
+      "value_kind": "date",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f011",
+      "group": "主体登记",
+      "name": "营业期限止",
+      "aliases": [
+        "营业期限至"
+      ],
+      "value_kind": "date",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f012",
+      "group": "资本与股权",
+      "name": "注册资本",
+      "aliases": [
+        "注册资本",
+        "注册资金"
+      ],
+      "value_kind": "amount",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f013",
+      "group": "资本与股权",
+      "name": "实收资本",
+      "aliases": [
+        "实收资本"
+      ],
+      "value_kind": "amount",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f014",
+      "group": "资本与股权",
+      "name": "股东名称",
+      "aliases": [
+        "股东名称",
+        "投资人"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f015",
+      "group": "资本与股权",
+      "name": "认缴出资额",
+      "aliases": [
+        "认缴出资"
+      ],
+      "value_kind": "amount",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f016",
+      "group": "资本与股权",
+      "name": "实缴出资额",
+      "aliases": [
+        "实缴出资"
+      ],
+      "value_kind": "amount",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f017",
+      "group": "资本与股权",
+      "name": "出资方式",
+      "aliases": [
+        "出资方式"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f018",
+      "group": "资本与股权",
+      "name": "持股比例",
+      "aliases": [
+        "持股比例",
+        "股权比例"
+      ],
+      "value_kind": "ratio",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f019",
+      "group": "资本与股权",
+      "name": "出资时间",
+      "aliases": [
+        "出资时间"
+      ],
+      "value_kind": "date",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f020",
+      "group": "资本与股权",
+      "name": "股东标识",
+      "aliases": [
+        "股东证件号",
+        "证照号"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f021",
+      "group": "资本与股权",
+      "name": "出资币种",
+      "aliases": [
+        "币种"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f022",
+      "group": "设立及变更",
+      "name": "历史名称",
+      "aliases": [
+        "曾用名"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f023",
+      "group": "设立及变更",
+      "name": "名称预先核准文号",
+      "aliases": [
+        "名称预先核准"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f024",
+      "group": "设立及变更",
+      "name": "设立登记日期",
+      "aliases": [
+        "设立登记"
+      ],
+      "value_kind": "date",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f025",
+      "group": "设立及变更",
+      "name": "变更事项",
+      "aliases": [
+        "变更事项"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f026",
+      "group": "设立及变更",
+      "name": "变更前内容",
+      "aliases": [
+        "变更前"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f027",
+      "group": "设立及变更",
+      "name": "变更后内容",
+      "aliases": [
+        "变更后"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f028",
+      "group": "设立及变更",
+      "name": "核准日期",
+      "aliases": [
+        "核准日期",
+        "准予"
+      ],
+      "value_kind": "date",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f029",
+      "group": "设立及变更",
+      "name": "登记日期",
+      "aliases": [
+        "登记日期"
+      ],
+      "value_kind": "date",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f030",
+      "group": "设立及变更",
+      "name": "变更依据文号",
+      "aliases": [
+        "依据文号"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f031",
+      "group": "设立及变更",
+      "name": "章程修正案标识",
+      "aliases": [
+        "章程修正"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f032",
+      "group": "合并分立及资本变化",
+      "name": "事件类型",
+      "aliases": [
+        "合并",
+        "分立",
+        "增资",
+        "减资"
+      ],
+      "value_kind": "enum",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f033",
+      "group": "合并分立及资本变化",
+      "name": "对方主体",
+      "aliases": [
+        "合并对方",
+        "分立主体"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f034",
+      "group": "合并分立及资本变化",
+      "name": "事件前资本",
+      "aliases": [
+        "变更前注册资本"
+      ],
+      "value_kind": "amount",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f035",
+      "group": "合并分立及资本变化",
+      "name": "事件后资本",
+      "aliases": [
+        "变更后注册资本"
+      ],
+      "value_kind": "amount",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f036",
+      "group": "合并分立及资本变化",
+      "name": "资产承接",
+      "aliases": [
+        "资产承继",
+        "资产承接"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f037",
+      "group": "合并分立及资本变化",
+      "name": "债务承接",
+      "aliases": [
+        "债务承继",
+        "债务承接"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f038",
+      "group": "合并分立及资本变化",
+      "name": "股东会决议日期",
+      "aliases": [
+        "股东会决议"
+      ],
+      "value_kind": "date",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f039",
+      "group": "合并分立及资本变化",
+      "name": "公告日期",
+      "aliases": [
+        "公告",
+        "债权人通知"
+      ],
+      "value_kind": "date",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f040",
+      "group": "出资支持材料",
+      "name": "验资机构",
+      "aliases": [
+        "验资机构"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f041",
+      "group": "出资支持材料",
+      "name": "验资报告文号",
+      "aliases": [
+        "验资报告"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f042",
+      "group": "出资支持材料",
+      "name": "评估机构",
+      "aliases": [
+        "评估机构"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f043",
+      "group": "出资支持材料",
+      "name": "评估报告文号",
+      "aliases": [
+        "评估报告"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f044",
+      "group": "出资支持材料",
+      "name": "出资资产描述",
+      "aliases": [
+        "非货币出资"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f045",
+      "group": "出资支持材料",
+      "name": "银行询证函标识",
+      "aliases": [
+        "银行询证函"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f046",
+      "group": "相关主体及权利限制",
+      "name": "控股股东",
+      "aliases": [
+        "控股股东"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f047",
+      "group": "相关主体及权利限制",
+      "name": "实际控制人",
+      "aliases": [
+        "实际控制人"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f048",
+      "group": "相关主体及权利限制",
+      "name": "股权出质登记号",
+      "aliases": [
+        "股权出质",
+        "质押"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f049",
+      "group": "相关主体及权利限制",
+      "name": "质权人",
+      "aliases": [
+        "质权人"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f050",
+      "group": "相关主体及权利限制",
+      "name": "冻结文号",
+      "aliases": [
+        "冻结"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f051",
+      "group": "相关主体及权利限制",
+      "name": "分支机构名称",
+      "aliases": [
+        "分公司",
+        "分支机构"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f052",
+      "group": "治理",
+      "name": "董事姓名",
+      "aliases": [
+        "董事"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f053",
+      "group": "治理",
+      "name": "监事姓名",
+      "aliases": [
+        "监事"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f054",
+      "group": "治理",
+      "name": "经理姓名",
+      "aliases": [
+        "经理",
+        "总经理"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f055",
+      "group": "治理",
+      "name": "股东会决议文号",
+      "aliases": [
+        "股东会决议"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f056",
+      "group": "治理",
+      "name": "董事会决议文号",
+      "aliases": [
+        "董事会决议"
+      ],
+      "value_kind": "identifier",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f057",
+      "group": "版面",
+      "name": "印章主体",
+      "aliases": [
+        "印章",
+        "公章"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f058",
+      "group": "版面",
+      "name": "印章日期",
+      "aliases": [
+        "骑缝章日期"
+      ],
+      "value_kind": "date",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f059",
+      "group": "版面",
+      "name": "手写签名人",
+      "aliases": [
+        "签名",
+        "手写"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f060",
+      "group": "版面",
+      "name": "表格单元格坐标",
+      "aliases": [
+        "单元格"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f061",
+      "group": "版面",
+      "name": "来源位置",
+      "aliases": [
+        "页码",
+        "段落",
+        "幻灯片"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    },
+    {
+      "field_id": "f062",
+      "group": "版面",
+      "name": "未知原因",
+      "aliases": [
+        "无法辨认",
+        "冲突"
+      ],
+      "value_kind": "text",
+      "readable": true,
+      "expected": null,
+      "note": "参考答案留空。本机对照原件填写，仓库不预填客户事实，空值也不算达标。"
+    }
+  ]
+}
