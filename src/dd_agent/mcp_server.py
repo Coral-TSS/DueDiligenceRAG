@@ -27,7 +27,7 @@ from .coverage_gaps import CoverageGaps
 from .db import Database
 from .db_connections import ConnectionProvider, DatabaseBusy
 from .evidence_read import EvidenceReader
-from .material_metadata import MetadataError, parse_filters
+from .material_metadata import MetadataError, material_view, parse_filters
 from .page_queries import PageQueryError
 from .retrieval import EvidenceService, RetrievalError
 
@@ -82,6 +82,7 @@ TOOLS = (
             '可选 document_id 把召回限制在一份材料内。也可传 document_ids、PDF 页范围、类别、主体和日期。'
             '字段之间为 AND，同一字段的多个值为 OR。未传的维度不限制；空数组无效。'
             '不能同时传 document_id 与 document_ids。设了页范围时，没有物理页码的材料不会进入结果。'
+            '每条命中都带材料的类别、主体和日期；没有值的字段为 null。Office 命中另有定位。'
         ),
         'inputSchema': {
             'type': 'object',
@@ -127,6 +128,7 @@ TOOLS = (
             '按证据标识，或按材料加来源范围，补读指定项目里的原文。必须提供 project_id。'
             '有长度上限和续读位置。过期引用不会换成新正文。'
             '其他项目的证据标识会拒绝，且不说明该标识是否存在。'
+            '响应附带该材料的类别、主体和日期；没有值的字段为 null。'
         ),
         'inputSchema': {
             'type': 'object',
@@ -142,6 +144,22 @@ TOOLS = (
                 'source_revision': {'type': 'string', 'description': '可选。绑定起始页的来源版本，不一致则拒绝且不返回新正文'},
                 'resume_unit': {'type': 'string', 'description': '可选。没有物理页码时，从该来源单元继续（含本单元）'},
                 'index_version': {'type': 'string', 'description': '可选。证据上的索引版本，不一致则拒绝'},
+            },
+            'required': ['project_id'],
+            'additionalProperties': False,
+        },
+    },
+    {
+        'name': 'list_subjects',
+        'description': (
+            '列出指定项目的全部主体：标识、名称、角色和创建时间。'
+            '没有绑定任何材料的主体也会返回。只读，不含材料正文。'
+            '必须提供 project_id，只返回该项目的主体。'
+        ),
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'project_id': {'type': 'string', 'description': '项目 UUID'},
             },
             'required': ['project_id'],
             'additionalProperties': False,
@@ -497,7 +515,7 @@ def _initialize(session, params):
         'capabilities': {'tools': {'listChanged': False}},
         'serverInfo': dict(SERVER_INFO),
         'instructions': (
-            '只读尽调证据服务。先 list_projects，再 list_documents。'
+            '只读尽调证据服务。先 list_projects，再 list_documents 或 list_subjects。'
             'coverage_gaps 查看当前项目的缺口，search_evidence 取候选片段，read_evidence 按证据标识或来源范围补读。'
             '每次调用都要带 project_id。结果是候选证据，不是已核实事实。过滤后无命中不等于材料不存在。'
         ),
@@ -516,6 +534,9 @@ def _call_tool(app, params):
             arguments = _arguments(params, (
                 'project_id', 'categories', 'subject_ids', 'date_point', 'period_start', 'period_end'), ('project_id',))
             payload = _list_documents(app.state.database, _uuid(arguments['project_id'], '项目标识'), arguments)
+        elif name == 'list_subjects':
+            arguments = _arguments(params, ('project_id',), ('project_id',))
+            payload = _list_subjects(app.state.database, _uuid(arguments['project_id'], '项目标识'))
         elif name == 'coverage_gaps':
             arguments = _arguments(params, ('project_id', 'kind', 'limit', 'cursor'), ('project_id',))
             payload = _coverage(app, _uuid(arguments['project_id'], '项目标识'), arguments)
@@ -582,6 +603,21 @@ def _list_documents(database, project_id, arguments):
         # 与网页材料列表同一投影：去掉存储键，附上阅读进度和业务元数据，不读原件。
         documents.append({**public_document(row), 'reading': database.reading(row['id'])})
     return {'documents': documents}
+
+
+def _list_subjects(database, project_id):
+    # subjects() 在项目不存在时抛 LookupError，与 list_documents 的「项目不存在。」同一句。
+    # 标识沿用材料上的 subject_id。角色仍叫 role，与主体表和现有主体接口一致。
+    subjects = []
+    for row in database.subjects(project_id):
+        subjects.append({
+            'subject_id': row['id'],
+            'project_id': row['project_id'],
+            'name': row['name'],
+            'role': row['role'],
+            'created_at': row['created_at'],
+        })
+    return {'subjects': subjects}
 
 
 def _optional_int(arguments, name):
@@ -657,6 +693,7 @@ def _search(evidence, project_id, query, arguments):
             payload[key] = found[key]
     if arguments.get('document_ids') is not None:
         payload['document_ids'] = arguments.get('document_ids')
+    _attach_material(evidence.database, project_id, chunks)
     return payload
 
 
@@ -689,7 +726,122 @@ def _chunk(project_id, hit, source):
     for key in ('parent_id', 'build_id'):
         if hit.get(key) is not None:
             item[key] = hit[key]
+    if item['index_kind'] == 'source_unit':
+        item.update(_office_locator(hit, source))
+    elif item['index_kind'] == 'parent_child':
+        # 父子块的索引版本已经在引用参数里，不必再查库。一条子块可以跨页，没有单一 source_revision。
+        version = _reference_version(hit)
+        if version:
+            item['index_version'] = version
     return item
+
+
+def _office_locator(hit, source):
+    def pick(name):
+        if source.get(name) is not None:
+            return source.get(name)
+        return hit.get(name)
+
+    # formula_state 的空字符串是库里的合法状态（没有公式标记），字段仍保留，不改成省略。
+    return {
+        'locator': pick('locator'),
+        'locator_label': pick('locator_label'),
+        'unit_id': pick('unit_id'),
+        'formula_state': pick('formula_state'),
+    }
+
+
+def _reference_version(hit):
+    reference = hit.get('reference')
+    if not isinstance(reference, dict):
+        return None
+    params = reference.get('params')
+    if not isinstance(params, dict):
+        return None
+    version = params.get('index_version')
+    if isinstance(version, str) and version:
+        return version
+    return None
+
+
+def _as_uuid(value):
+    try:
+        return value if isinstance(value, UUID) else UUID(str(value).strip())
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _attach_material(database, project_id, chunks):
+    """一次连接里按材料、页级片段、Office 片段各查一批。不按命中逐条查库。"""
+    if not chunks:
+        return
+    documents, pages, offices = [], [], []
+    seen_documents = set()
+    for chunk in chunks:
+        document_id = _as_uuid(chunk.get('document_id'))
+        if document_id is not None and document_id not in seen_documents:
+            seen_documents.add(document_id)
+            documents.append(document_id)
+        chunk_id = _as_uuid(chunk.get('chunk_id'))
+        if chunk_id is None:
+            continue
+        if chunk.get('index_kind') == 'source_unit':
+            offices.append(chunk_id)
+        elif chunk.get('index_kind') == 'page':
+            pages.append(chunk_id)
+    blank = material_view({})
+    with database.connect() as conn:
+        materials = _material_rows(conn, project_id, documents) if documents else {}
+        page_versions = _page_versions(conn, project_id, pages) if pages else {}
+        office_versions = _office_versions(conn, project_id, offices) if offices else {}
+    for chunk in chunks:
+        chunk.update(materials.get(str(chunk.get('document_id')), blank))
+        # 只有页级命中能对上当前页的单一 source_revision。Office 没有这份修订；父子块可以跨页。
+        if chunk.get('index_kind') == 'page':
+            extra = page_versions.get(str(chunk.get('chunk_id')))
+            if not extra:
+                continue
+            if extra.get('index_version'):
+                chunk['index_version'] = extra['index_version']
+            if extra.get('source_revision'):
+                chunk['source_revision'] = extra['source_revision']
+        elif chunk.get('index_kind') == 'source_unit':
+            extra = office_versions.get(str(chunk.get('chunk_id')))
+            if extra and extra.get('index_version'):
+                chunk['index_version'] = extra['index_version']
+
+
+def _material_rows(conn, project_id, document_ids):
+    rows = conn.execute('''SELECT d.id, d.category, d.subject_id, sub.name AS subject_name,
+            sub.role AS subject_role, d.date_kind, d.point_date, d.period_start, d.period_end
+        FROM dd_agent.documents d
+        LEFT JOIN dd_agent.project_subjects sub
+          ON sub.id = d.subject_id AND sub.project_id = d.project_id
+        WHERE d.project_id = %s AND d.id = ANY(%s::uuid[])''', (project_id, list(document_ids))).fetchall()
+    return {str(row['id']): material_view(row) for row in rows}
+
+
+def _page_versions(conn, project_id, chunk_ids):
+    rows = conn.execute('''SELECT c.id::text AS chunk_id, c.index_version AS chunk_index_version, p.source_revision
+        FROM dd_agent.evidence_chunks c
+        JOIN dd_agent.documents d ON d.id = c.document_id
+        JOIN dd_agent.indexed_pages i
+          ON i.document_id = c.document_id AND i.page_number = c.page_number AND i.index_version = c.index_version
+        JOIN dd_agent.effective_document_pages p
+          ON p.document_id = i.document_id AND p.page_number = i.page_number
+         AND p.pipeline_version = i.pipeline_version AND p.updated_at = i.source_updated_at
+         AND p.source_revision = i.source_revision AND p.status = 'succeeded'
+        WHERE d.project_id = %s AND c.id = ANY(%s::uuid[])''', (project_id, list(chunk_ids))).fetchall()
+    return {row['chunk_id']: {'index_version': row['chunk_index_version'], 'source_revision': row['source_revision']}
+            for row in rows}
+
+
+def _office_versions(conn, project_id, chunk_ids):
+    rows = conn.execute('''SELECT c.id::text AS chunk_id, c.index_version AS office_index_version
+        FROM dd_agent.source_unit_chunks c
+        JOIN dd_agent.documents d ON d.id = c.document_id
+        WHERE d.project_id = %s AND c.id = ANY(%s::uuid[])''', (project_id, list(chunk_ids))).fetchall()
+    return {row['chunk_id']: {'index_version': row['office_index_version']} for row in rows}
 
 
 def _tool_ok(payload):
