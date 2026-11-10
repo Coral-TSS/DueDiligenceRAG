@@ -1,13 +1,16 @@
-"""只读 MCP HTTP/SSE 适配。工具调用现有项目列表、材料列表和混合检索，不重写排序。
+"""只读 MCP 适配。工具调用现有项目列表、材料列表和混合检索，不重写排序。
 
-传输是 MCP 2024-11-05 的 HTTP + SSE：GET /sse 接收服务端消息，POST /messages 发送 JSON-RPC。
+同一进程提供两种传输。`/mcp` 是 Streamable HTTP：POST 返回单个 JSON，不开启 SSE 流。
+`/sse` 与 `/messages` 仍是 MCP 2024-11-05 的 HTTP + SSE，给还在用旧协议的客户端。
 每个请求都要带本机 API 密钥。这里不提供写入、入库、OCR，也不返回 PDF 或页面图。
 """
 from contextlib import asynccontextmanager
 import asyncio
 import hmac
 import json
+import secrets
 import sys
+import time
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -31,7 +34,18 @@ from .retrieval import EvidenceService, RetrievalError
 
 PROTOCOL_VERSIONS = frozenset({'2024-11-05', '2025-03-26', '2025-06-18'})
 DEFAULT_PROTOCOL = '2024-11-05'
+# Streamable HTTP 只协商 2025-03-26 与 2025-06-18。客户端若请求更新的版本（例如官方 SDK 的
+# 2025-11-25），按规范回一个本端支持的版本，这里固定回 2025-06-18。2025-11-25 的传输规则与
+# 2025-06-18 相同，但多了任务、图标等本服务不实现的能力，因此不把它算作已支持版本。
+STREAMABLE_PROTOCOL_VERSIONS = frozenset({'2025-03-26', '2025-06-18'})
+STREAMABLE_DEFAULT_PROTOCOL = '2025-06-18'
+# 2025-06-18 起，initialize 之后若缺少 MCP-Protocol-Version，按 2025-03-26 接受。
+STREAMABLE_MISSING_HEADER_PROTOCOL = '2025-03-26'
+# 会话只在本进程内存中。空闲超时或超过数量上限后失效，重启即全部失效。
+HTTP_SESSION_IDLE_SECONDS = 30 * 60
+HTTP_SESSION_LIMIT = 128
 SERVER_INFO = {'name': 'dd-agent-evidence', 'version': '0.1.0'}
+_STREAMABLE_ACCEPT = frozenset({'application/json', 'text/event-stream'})
 
 TOOLS = (
     {
@@ -156,11 +170,13 @@ def create_mcp_app(settings=None):
             for session in list(app.state.sessions.values()):
                 session['queue'].put_nowait(None)
             app.state.sessions.clear()
+            app.state.http_sessions.clear()
             from .model_runtime import close_runtime
             close_runtime(settings)
             provider.close()
 
     app = Starlette(routes=[
+        Route('/mcp', mcp_endpoint, methods=['GET', 'POST', 'DELETE']),
         Route('/sse', sse_endpoint, methods=['GET']),
         Route('/messages', messages_endpoint, methods=['POST']),
     ], lifespan=lifespan)
@@ -168,6 +184,8 @@ def create_mcp_app(settings=None):
     app.state.database = database
     app.state.evidence = EvidenceService(settings, database=database)
     app.state.sessions = {}
+    app.state.http_sessions = {}
+    app.state.http_session_lock = asyncio.Lock()
     return app
 
 
@@ -260,6 +278,173 @@ async def messages_endpoint(request):
     return Response(status_code=202)
 
 
+def _media_types(header):
+    found = set()
+    for part in (header or '').split(','):
+        media = part.split(';', 1)[0].strip().lower()
+        if media:
+            found.add(media)
+    return found
+
+
+def _streamable_version_error(request):
+    """initialize 之后才检查 MCP-Protocol-Version。缺头按 2025-03-26 接受。"""
+    if 'mcp-protocol-version' not in request.headers:
+        version = STREAMABLE_MISSING_HEADER_PROTOCOL
+    else:
+        version = request.headers.get('mcp-protocol-version', '').strip()
+    if version in STREAMABLE_PROTOCOL_VERSIONS:
+        return None
+    return JSONResponse({'detail': '不支持的 MCP-Protocol-Version。'}, status_code=400)
+
+
+def _session_header(request):
+    if 'mcp-session-id' not in request.headers:
+        return None
+    value = request.headers.get('mcp-session-id', '').strip()
+    return value or None
+
+
+def _expire_http_sessions(app):
+    now = time.monotonic()
+    stale = [sid for sid, session in app.state.http_sessions.items()
+             if now - session['touched'] > HTTP_SESSION_IDLE_SECONDS]
+    for sid in stale:
+        app.state.http_sessions.pop(sid, None)
+
+
+async def _open_http_session(app):
+    async with app.state.http_session_lock:
+        _expire_http_sessions(app)
+        if len(app.state.http_sessions) >= HTTP_SESSION_LIMIT:
+            return None, JSONResponse({'detail': 'MCP 会话数量已达上限。'}, status_code=503)
+        session = {
+            'id': secrets.token_hex(16),
+            'lock': asyncio.Lock(),
+            'initialized': False,
+            'touched': time.monotonic(),
+            'protocol_versions': STREAMABLE_PROTOCOL_VERSIONS,
+            'protocol_default': STREAMABLE_DEFAULT_PROTOCOL,
+        }
+        app.state.http_sessions[session['id']] = session
+        return session, None
+
+
+async def _drop_http_session(app, session_id):
+    async with app.state.http_session_lock:
+        app.state.http_sessions.pop(session_id, None)
+
+
+async def _lookup_http_session(app, session_id):
+    if not session_id:
+        return None, JSONResponse({'detail': '缺少 MCP 会话标识。'}, status_code=400)
+    async with app.state.http_session_lock:
+        _expire_http_sessions(app)
+        session = app.state.http_sessions.get(session_id)
+        if session is None:
+            return None, JSONResponse({'detail': 'MCP 会话不存在或已结束。'}, status_code=404)
+        session['touched'] = time.monotonic()
+        return session, None
+
+
+def _message_kind(payload):
+    if not isinstance(payload, dict) or payload.get('jsonrpc') != '2.0':
+        return 'invalid'
+    method = payload.get('method')
+    has_method = isinstance(method, str) and bool(method)
+    has_id = 'id' in payload
+    if has_method and has_id:
+        return 'request'
+    if has_method and not has_id:
+        return 'notification'
+    has_result = 'result' in payload
+    has_error = 'error' in payload
+    if not has_method and has_id and has_result != has_error:
+        return 'response'
+    return 'invalid'
+
+
+def _is_initialize(payload):
+    return _message_kind(payload) == 'request' and payload.get('method') == 'initialize'
+
+
+async def _dispatch_locked(app, session, payload):
+    async with session['lock']:
+        return await anyio.to_thread.run_sync(lambda: dispatch(app, session, payload))
+
+
+async def mcp_endpoint(request):
+    denied = _reject(request)
+    if denied is not None:
+        return denied
+    if request.method == 'GET':
+        rejected = _streamable_version_error(request)
+        if rejected is not None:
+            return rejected
+        return Response(status_code=405, headers={'Allow': 'POST, DELETE'})
+    if request.method == 'DELETE':
+        return await _mcp_delete(request)
+    return await _mcp_post(request)
+
+
+async def _mcp_delete(request):
+    rejected = _streamable_version_error(request)
+    if rejected is not None:
+        return rejected
+    session_id = _session_header(request)
+    if not session_id:
+        return JSONResponse({'detail': '缺少 MCP 会话标识。'}, status_code=400)
+    async with request.app.state.http_session_lock:
+        _expire_http_sessions(request.app)
+        session = request.app.state.http_sessions.pop(session_id, None)
+    if session is None:
+        return JSONResponse({'detail': 'MCP 会话不存在或已结束。'}, status_code=404)
+    return Response(status_code=204)
+
+
+async def _mcp_post(request):
+    if not _STREAMABLE_ACCEPT <= _media_types(request.headers.get('accept')):
+        return JSONResponse(
+            {'detail': 'Accept 须同时包含 application/json 和 text/event-stream。'}, status_code=406)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({'detail': '请求不是有效的 JSON。'}, status_code=400)
+    if isinstance(payload, list):
+        return JSONResponse({'detail': '不支持批量请求。'}, status_code=400)
+    if _message_kind(payload) == 'invalid':
+        return JSONResponse({'detail': '请求不是有效的 JSON-RPC。'}, status_code=400)
+    if _is_initialize(payload) and _session_header(request) is None:
+        return await _mcp_initialize(request, payload)
+    if not _is_initialize(payload):
+        rejected = _streamable_version_error(request)
+        if rejected is not None:
+            return rejected
+    session, missing = await _lookup_http_session(request.app, _session_header(request))
+    if missing is not None:
+        return missing
+    if _message_kind(payload) == 'response':
+        return Response(status_code=202)
+    response = await _dispatch_locked(request.app, session, payload)
+    if response is None:
+        return Response(status_code=202)
+    headers = {'Mcp-Session-Id': session['id']} if _is_initialize(payload) and 'result' in response else None
+    return JSONResponse(response, headers=headers)
+
+
+async def _mcp_initialize(request, payload):
+    session, rejected = await _open_http_session(request.app)
+    if rejected is not None:
+        return rejected
+    response = await _dispatch_locked(request.app, session, payload)
+    if not isinstance(response, dict) or 'result' not in response:
+        await _drop_http_session(request.app, session['id'])
+        if response is None:
+            return Response(status_code=202)
+        return JSONResponse(response)
+    return JSONResponse(response, headers={'Mcp-Session-Id': session['id']})
+
+
 def dispatch(app, session, payload):
     has_id = isinstance(payload, dict) and 'id' in payload
     message_id = payload.get('id') if has_id else None
@@ -299,8 +484,14 @@ def dispatch(app, session, payload):
 
 def _initialize(session, params):
     requested = params.get('protocolVersion')
+    allowed = session.get('protocol_versions')
+    if allowed is None:
+        allowed = PROTOCOL_VERSIONS
+    fallback = session.get('protocol_default')
+    if fallback is None:
+        fallback = DEFAULT_PROTOCOL
     session['initialized'] = True
-    session['protocol'] = requested if requested in PROTOCOL_VERSIONS else DEFAULT_PROTOCOL
+    session['protocol'] = requested if requested in allowed else fallback
     return {
         'protocolVersion': session['protocol'],
         'capabilities': {'tools': {'listChanged': False}},

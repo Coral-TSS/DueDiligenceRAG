@@ -1,5 +1,5 @@
 # 命令行入口：python -m dd_agent 默认启动本机 FastAPI 服务。
-# mcp 另起只读 HTTP/SSE 服务，供另一台机器上的 MCP 客户端检索证据。
+# mcp 另起只读服务：/mcp 是 Streamable HTTP，/sse 与 /messages 是旧的 HTTP+SSE。
 # import-file 只登记；read-pages 只做基础阅读；index-pages 只建索引；search 只检索。
 # process-pages 按“基础阅读 -> 先索引 -> 视觉增强 -> 再索引”处理指定小批页。
 # 这些 CLI 诊断命令与网页后台队列不同，不能用网页暂停按钮停止它们。

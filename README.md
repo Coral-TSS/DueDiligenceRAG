@@ -16,14 +16,30 @@
 
 Linux / macOS 把解释器换成 `.venv-dev/bin/python`。网页只监听 `http://127.0.0.1:8765`。`init-db` 按文件名顺序执行 `src/dd_agent/migrations/`（当前到 `019_material_metadata.sql`，健康检查要求 schema 19），可以重复执行，不删除已有材料。
 
-只读 MCP 给另一台机器上的客户端列项目、列材料和检索。它不上传、不做 OCR，也不提供原件下载。
+只读 MCP 给另一台机器上的客户端列项目、列材料和检索。它不上传、不做 OCR，也不提供原件下载。启动命令不变。
 
 ```powershell
 $env:DDA_MCP_API_KEY = '只保存在本机的长随机密钥'
 .\.venv-dev\Scripts\python.exe -m dd_agent mcp
 ```
 
-Linux / macOS 用 `export DDA_MCP_API_KEY='...'`。未设置密钥时进程直接退出。默认监听 `127.0.0.1:8766`；只有局域网访问才把 `DDA_MCP_HOST` 设为 `0.0.0.0`。不要把该端口暴露到公网。客户端连接 `http://<主机>:8766/sse`，每个请求带 `Authorization: Bearer <密钥>`。原有工具 `list_projects`、`list_documents`、`search_evidence` 保持不变；另外有 `coverage_gaps` 和 `read_evidence`，除了列项目以外都要带 `project_id`。调用顺序见 [MCP 客户端说明](docs/mcp-client.md)。默认检索同时走向量和关键词，再按 RRF 融合（`DDA_RETRIEVAL_MODE=hybrid`）。
+Linux / macOS 用 `export DDA_MCP_API_KEY='...'`。未设置密钥时进程直接退出。默认监听 `127.0.0.1:8766`；只有局域网访问才把 `DDA_MCP_HOST` 设为 `0.0.0.0`。不要把该端口暴露到公网。
+
+新的客户端连接 `http://127.0.0.1:8766/mcp`（Streamable HTTP）。每个请求带 `Authorization: Bearer <密钥>`，也可以用 `X-API-Key`；两个头都有时以 `Authorization` 为准。DeepSeek Harness 使用 `@deepseek-ai/dsh-mcp-client`，配置示例：
+
+```yaml
+- id: mcp-dda
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: dda
+    transport: streamable-http
+    url: http://127.0.0.1:8766/mcp
+    expandTemplates: true
+    headers:
+      Authorization: Bearer ${credential:DDA_MCP_API_KEY}
+```
+
+`expandTemplates` 为 true 时，`${credential:...}` 才会换成本机凭据。不要把密钥写进仓库或命令行参数。`http://127.0.0.1:8766/sse` 仍由同一个进程提供，那是旧的 HTTP + SSE（协议 2024-11-05）。新的 Harness 只使用 `/mcp`，不会回落到 `/sse`。工具和调用顺序见 [MCP 客户端说明](docs/mcp-client.md)。原有工具 `list_projects`、`list_documents`、`search_evidence` 保持不变；另外有 `coverage_gaps` 和 `read_evidence`，除了列项目以外都要带 `project_id`。默认检索同时走向量和关键词，再按 RRF 融合（`DDA_RETRIEVAL_MODE=hybrid`）。
 
 ## 本机环境
 
