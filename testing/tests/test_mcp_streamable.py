@@ -85,7 +85,8 @@ def test_session_header_version_accept_and_notification(tmp_path, monkeypatch):
         omitted = http.post('/mcp', headers=_headers(session=sid), json=_rpc('tools/list', {}, 8))
         assert omitted.status_code == 200, omitted.text
         names = [tool['name'] for tool in omitted.json()['result']['tools']]
-        assert names == ['list_projects', 'list_documents', 'search_evidence', 'coverage_gaps', 'read_evidence']
+        assert names == [
+            'list_projects', 'list_documents', 'search_evidence', 'coverage_gaps', 'read_evidence', 'list_subjects']
         assert 'text/event-stream' not in omitted.headers['content-type']
         assert omitted.headers['content-type'].startswith('application/json')
 

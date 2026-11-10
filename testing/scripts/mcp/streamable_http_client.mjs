@@ -10,7 +10,7 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 
 const url = process.env.MCP_URL;
 const key = process.env.DDA_MCP_API_KEY;
-const EXPECTED = ['coverage_gaps', 'list_documents', 'list_projects', 'read_evidence', 'search_evidence'];
+const EXPECTED = ['coverage_gaps', 'list_documents', 'list_projects', 'list_subjects', 'read_evidence', 'search_evidence'];
 
 if (!url || !key) {
   console.error('需要环境变量 MCP_URL 和 DDA_MCP_API_KEY');

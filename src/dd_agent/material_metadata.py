@@ -240,6 +240,28 @@ def page_sql(scope, column):
     return f' AND {column} BETWEEN %s AND %s', (scope.page_from, scope.page_to)
 
 
+MATERIAL_FIELDS = (
+    'category', 'subject_id', 'subject_name', 'subject_role',
+    'date_kind', 'point_date', 'period_start', 'period_end',
+)
+
+
+def material_view(row):
+    """材料对外的类别、主体和日期。没有值的键保留为 None，不省略。"""
+    row = row or {}
+    subject_id = row.get('subject_id')
+    return {
+        'category': row.get('category'),
+        'subject_id': None if subject_id is None else str(subject_id),
+        'subject_name': row.get('subject_name'),
+        'subject_role': row.get('subject_role'),
+        'date_kind': row.get('date_kind'),
+        'point_date': row.get('point_date'),
+        'period_start': row.get('period_start'),
+        'period_end': row.get('period_end'),
+    }
+
+
 def span_page_sql(scope, column='c.source_spans'):
     """父块只认 source_spans 里的物理页码。没有页码的片段在设置页范围时不命中。"""
     if scope is None or scope.page_from is None:

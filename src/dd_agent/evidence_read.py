@@ -1,9 +1,16 @@
 """按证据标识或来源范围补读。过期引用不返回新正文，跨项目与不存在使用同一句提示。"""
 from uuid import UUID
 
+from .material_metadata import material_view
 from .office import locator_label
 from .page_queries import PageQueryError
 from .storage import Storage
+
+# 与材料列表同一组列。主体角色在 project_subjects.role，对外叫 subject_role，避免和主体自身的 role 混用。
+_MATERIAL_COLUMNS = '''d.category, d.subject_id, sub.name AS subject_name, sub.role AS subject_role,
+        d.date_kind, d.point_date, d.period_start, d.period_end'''
+_SUBJECT_JOIN = '''LEFT JOIN dd_agent.project_subjects sub
+          ON sub.id = d.subject_id AND sub.project_id = d.project_id'''
 
 
 MISSING = '证据不存在或不属于当前项目。'
@@ -93,6 +100,7 @@ class EvidenceReader:
                 'limit': limit,
                 'next_offset': next_offset,
                 'truncated': next_offset is not None,
+                **material_view(row),
             }
         if row['status'] != 'succeeded' or row['formula_state'] == 'unknown':
             raise PageQueryError('not_processed', NOT_READY)
@@ -120,6 +128,7 @@ class EvidenceReader:
             'limit': limit,
             'next_offset': next_offset,
             'truncated': next_offset is not None,
+            **material_view(row),
         }
 
     def by_range(self, project_id, document_id, *, page_from=None, page_to=None, resume_page=None,
@@ -132,18 +141,20 @@ class EvidenceReader:
         with self.database.connect() as conn:
             conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
             document = conn.execute(
-                '''SELECT d.id, d.storage_key FROM dd_agent.documents d
+                '''SELECT d.id, d.storage_key, ''' + _MATERIAL_COLUMNS + '''
+                   FROM dd_agent.documents d ''' + _SUBJECT_JOIN + '''
                    WHERE d.project_id = %s AND d.id = %s''', (project_id, document_id)).fetchone()
             if document is None:
                 raise PageQueryError('not_found', MISSING_DOCUMENT)
             filenames = _filenames(conn, project_id, document_id)
+            material = material_view(document)
             self._file(document['storage_key'])
             if page_from is not None:
                 return self._pages(conn, project_id, document_id, filenames, page_from, page_to,
-                                   resume_page, offset, limit, source_revision)
-            return self._units(conn, project_id, document_id, filenames, offset, limit, resume_unit)
+                                   resume_page, offset, limit, source_revision, material=material)
+            return self._units(conn, project_id, document_id, filenames, offset, limit, resume_unit, material=material)
 
-    def _pages(self, conn, project_id, document_id, filenames, page_from, page_to, resume_page, offset, limit, source_revision):
+    def _pages(self, conn, project_id, document_id, filenames, page_from, page_to, resume_page, offset, limit, source_revision, *, material):
         if type(page_from) is not int or type(page_to) is not int or page_from < 1 or page_to < page_from:
             raise ValueError('页范围须为正整数，且止页不小于起页。')
         if page_to - page_from + 1 > MAX_PAGES:
@@ -185,9 +196,9 @@ class EvidenceReader:
             if remaining == 0 and number < page_to:
                 next_pos = {'page_number': number + 1, 'offset': 0}
                 break
-        return _range_payload(project_id, document_id, filenames, page_from, page_to, limit, items, next_pos)
+        return _range_payload(project_id, document_id, filenames, page_from, page_to, limit, items, next_pos, material=material)
 
-    def _units(self, conn, project_id, document_id, filenames, offset, limit, resume_unit):
+    def _units(self, conn, project_id, document_id, filenames, offset, limit, resume_unit, *, material):
         reading = conn.execute(
             'SELECT 1 FROM dd_agent.document_readings WHERE document_id = %s', (document_id,)).fetchone()
         if reading is not None:
@@ -238,7 +249,7 @@ class EvidenceReader:
         else:
             if len(rows) > MAX_UNITS:
                 next_pos = {'unit_id': str(rows[MAX_UNITS]['id']), 'offset': 0}
-        return _range_payload(project_id, document_id, filenames, None, None, limit, items, next_pos)
+        return _range_payload(project_id, document_id, filenames, None, None, limit, items, next_pos, material=material)
 
     def _file(self, storage_key):
         try:
@@ -252,13 +263,14 @@ class EvidenceReader:
 def _page_chunk(conn, project_id, evidence_id):
     return conn.execute('''SELECT c.id, c.document_id, c.page_number, c.text, c.start_offset, c.end_offset,
         c.index_version, d.storage_key, p.status AS page_status, p.verification, p.method, p.error_code,
-        p.source_revision,
+        p.source_revision, ''' + _MATERIAL_COLUMNS + ''',
         (p.status = 'succeeded' AND p.pipeline_version = i.pipeline_version
          AND p.updated_at = i.source_updated_at AND p.source_revision = i.source_revision) AS current
         FROM dd_agent.evidence_chunks c
         JOIN dd_agent.indexed_pages i
           ON i.document_id = c.document_id AND i.page_number = c.page_number AND i.index_version = c.index_version
         JOIN dd_agent.documents d ON d.id = c.document_id
+        ''' + _SUBJECT_JOIN + '''
         LEFT JOIN dd_agent.effective_document_pages p
           ON p.document_id = c.document_id AND p.page_number = c.page_number
         WHERE c.id = %s AND d.project_id = %s''', (evidence_id, project_id)).fetchone()
@@ -266,11 +278,12 @@ def _page_chunk(conn, project_id, evidence_id):
 
 def _unit_chunk(conn, project_id, evidence_id):
     return conn.execute('''SELECT c.id, c.document_id, c.text, c.index_version, c.locator,
-        u.status, u.formula_state, u.error_code, d.storage_key,
+        u.status, u.formula_state, u.error_code, d.storage_key, ''' + _MATERIAL_COLUMNS + ''',
         (u.status = 'succeeded' AND u.formula_state <> 'unknown' AND u.text = c.text) AS current
         FROM dd_agent.source_unit_chunks c
         JOIN dd_agent.source_units u ON u.id = c.unit_id
         JOIN dd_agent.documents d ON d.id = c.document_id
+        ''' + _SUBJECT_JOIN + '''
         WHERE c.id = %s AND d.project_id = %s''', (evidence_id, project_id)).fetchone()
 
 
@@ -331,8 +344,9 @@ def _unit_item(row, text, offset, total):
     }
 
 
-def _range_payload(project_id, document_id, filenames, page_from, page_to, limit, items, next_pos):
+def _range_payload(project_id, document_id, filenames, page_from, page_to, limit, items, next_pos, *, material):
     returned = sum(len(item['text']) for item in items)
+    # 一份材料一份元数据，放在响应顶层。页或来源单元条目仍只带各自的定位和来源修订。
     return {
         'project_id': str(project_id),
         'document_id': str(document_id),
@@ -344,4 +358,5 @@ def _range_payload(project_id, document_id, filenames, page_from, page_to, limit
         'items': items,
         'next': next_pos,
         'truncated': next_pos is not None,
+        **material,
     }
