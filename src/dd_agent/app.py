@@ -472,10 +472,27 @@ def create_app(settings=None):
         require_document(project_id, document_id)
         # 单页定位：不再先取回整卷页记录再筛某一页。
         key = database.page_image_key(document_id, page_number)
-        if not key:
-            raise HTTPException(404, '该页尚无预览图，请先完成该页阅读。')
-        path = storage.path(key)
-        if not path.is_file():
+        path = storage.path(key) if key else None
+        from .reading import Reader, ReadingError
+        # 识别图键还在、文件丢了：按原参数补图，不重新 OCR。
+        # 文字页没有图键：第一次浏览再生成预览。没有阅读结果仍是 404。
+        if key and (path is None or not path.is_file()):
+            try:
+                key = Reader(settings, database).ensure_preview(project_id, document_id, page_number)
+            except ReadingError as exc:
+                raise HTTPException(404, str(exc)) from None
+            path = storage.path(key)
+        elif not key:
+            row = database.page_row(document_id, page_number)
+            if row and row['status'] == 'succeeded' and row['method'] == 'text':
+                try:
+                    key = Reader(settings, database).ensure_preview(project_id, document_id, page_number)
+                    path = storage.path(key)
+                except ReadingError:
+                    raise HTTPException(404, '该页尚无预览图，请先完成该页阅读。') from None
+            else:
+                raise HTTPException(404, '该页尚无预览图，请先完成该页阅读。')
+        if not path or not path.is_file():
             raise HTTPException(404, '页面预览缺失，请重新读取该页。')
         return FileResponse(path, media_type='image/png')
 

@@ -379,6 +379,14 @@ class Database:
                 WHERE p.document_id=%s AND p.page_number=%s''', (document_id, number)).fetchone()
             return row['image_key'] if row else ''
 
+    def set_page_image(self, document_id, version, number, image_key):
+        """只补预览键。不改 updated_at，避免把补图当成正文修订。"""
+        with self.connect() as conn:
+            row = conn.execute('''UPDATE dd_agent.document_pages SET image_key=%s
+                WHERE document_id=%s AND pipeline_version=%s AND page_number=%s
+                RETURNING image_key''', (image_key, document_id, version, number)).fetchone()
+            return row['image_key'] if row else None
+
     def page_machine_summary(self, document_id, number, machine_id):
         """只投影实际生效记录的元信息与历史数量，不取正文、历史数组或候选输出。"""
         with self.connect() as conn:

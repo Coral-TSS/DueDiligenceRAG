@@ -21,7 +21,7 @@ from uuid import uuid4
 from .performance import accept_worker, count, worker_process
 from .process_owner import ProcessOwner
 from .model_admission import FairAdmission, AdmissionError, current_control
-from .maintenance import rotate_log
+from .maintenance import LogPump, append_error, rotate_log
 
 LIGHT_KINDS = {'embedding', 'reranker'}
 
@@ -131,6 +131,11 @@ class ModelRuntime:
                 except OSError:pass
         r['reader'].join(timeout=1)
         r['log'].close()
+        code=process.poll()
+        if code not in (None, 0) and r.get('log_path'):
+            # 只记失败类别。普通 stderr 已在 model-runtime.log，不把页面正文抄进错误日志。
+            append_error(Path(r['log_path']).with_suffix('.error.log'),
+                category='worker_failed', location='model-runtime', request_id=str(code))
 
     def _release_lease_if_idle(self):
         if self.resident is None and self.partner is None and self.lease is not None:
@@ -220,20 +225,21 @@ class ModelRuntime:
             except RetrievalError:raise ModelRuntimeError('model_busy') from None
             self.lease=lease
             acquired_now=True
-        log=None;process=None
+        log=None;process=None;pump=None
         try:
             self.directory.mkdir(parents=True,exist_ok=True)
             log_path=self.directory/'model-runtime.log'
             if self.resident is None and self.partner is None:
                 rotate_log(log_path)
-            log=log_path.open('ab')
             env={k:v for k,v in os.environ.items() if k.upper() in {'SYSTEMROOT','WINDIR','PATH','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC'}}
             env.update(PYTHONUTF8='1',PYTHONIOENCODING='utf-8',HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',
                 PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True',PADDLE_PDX_CACHE_HOME=str(self.directory/'cache'),DDA_WORKER_METRICS='0',
                 PYTORCH_CUDA_ALLOC_CONF=os.environ.get('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True'))
             nonce=uuid4().hex
-            process=subprocess.Popen([str(spec.python),str(spec.script),'--serve',nonce],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=log,env=env)
-            r=dict(process=process,owner=None,queue=Queue(8),stop=Event(),log=log,
+            process=subprocess.Popen([str(spec.python),str(spec.script),'--serve',nonce],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+            pump=LogPump(process.stderr, log_path)
+            log=pump
+            r=dict(process=process,owner=None,queue=Queue(8),stop=Event(),log=pump,log_path=str(log_path),
                 spec=spec,generation=uuid4().hex,pid=None)
             r['reader']=Thread(target=self._receive,args=(r,),daemon=True,name='model-protocol-read')
             setattr(self, slot, r);r['reader'].start()

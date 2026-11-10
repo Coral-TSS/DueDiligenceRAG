@@ -22,7 +22,12 @@ from .storage import Storage, _resolved_path
 from .performance import active, accept_worker, worker_process, span, timed, observed, count
 from .model_admission import current_control
 from .control import ProcessingDeferred
-from .maintenance import rotate_log
+from .maintenance import LogPump, append_error, rotate_log, split_log_paths
+from .image_artifacts import (
+    DISK_BYTES, INFLIGHT_PIXELS, SINGLE_IMAGE_PIXELS, ArtifactError, ArtifactLimitError,
+    TRANSFORM_VERSION, GenerationLease, admit_image, assert_recognition_input, artifact_key,
+    dpi_for_scale, inspect_artifact, plan_pages, png_bytes, seal_rendered_png,
+)
 
 
 # 字符串里的 cpu 是历史算法编号，不是运行设备。GPU 与 CPU 的 OCR 文本已核对为一致，
@@ -85,30 +90,34 @@ def worker_records(python,worker,manifest,directory,timeout_seconds=1200):
         PYTORCH_CUDA_ALLOC_CONF=os.environ.get('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True'))
     if active(): env['DDA_WORKER_METRICS'] = '1'
     script=Path(__file__).parent/'workers'/(worker+'.py')
-    log_path=directory/(worker+'.log')
-    rotate_log(log_path)
-    with log_path.open('a',encoding='utf-8') as log:
-        process=subprocess.Popen([str(python),str(script),str(manifest_path)],stdout=subprocess.PIPE,stderr=log,text=True,encoding='utf-8',env=env)
-        count('worker.'+worker+'.starts')
-        timer=Timer(timeout_seconds,process.kill);timer.daemon=True;timer.start()
-        try:
-            with worker_process(process.pid) as register, span('worker.'+worker):
-                for line in process.stdout:
-                    try: record = json.loads(line)
-                    except json.JSONDecodeError:raise ReadingError('工作进程输出无效，请检查本地处理日志。') from None
-                    if isinstance(record, dict) and '_dda_metric' in record:
-                        metric = record['_dda_metric']
-                        if isinstance(metric, dict) and 'runtime_pid' in metric:
-                            register(metric['runtime_pid'])
-                        else: accept_worker(metric)
-                    else: yield record
-                if process.wait()!=0:raise ReadingError('PDF／OCR 工作进程失败，请检查本地处理日志。')
-        finally:
-            # 即使上层因暂停而提前关闭生成器，也要结束／回收子进程。
-            # 否则文件锁已释放，旧模型却仍占着内存，下一次调用可能与它叠加。
-            timer.cancel();process.stdout.close()
-            if process.poll() is None:process.kill()
-            process.wait()
+    logs=split_log_paths(directory, worker)
+    rotate_log(logs['output'])
+    process=subprocess.Popen([str(python),str(script),str(manifest_path)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',env=env)
+    # 普通诊断进 worker.log；失败摘要另写 worker.error.log，不抄页面正文。
+    pump=LogPump(process.stderr, logs['output'])
+    count('worker.'+worker+'.starts')
+    timer=Timer(timeout_seconds,process.kill);timer.daemon=True;timer.start()
+    try:
+        with worker_process(process.pid) as register, span('worker.'+worker):
+            for line in process.stdout:
+                try: record = json.loads(line)
+                except json.JSONDecodeError:raise ReadingError('工作进程输出无效，请检查本地处理日志。') from None
+                if isinstance(record, dict) and '_dda_metric' in record:
+                    metric = record['_dda_metric']
+                    if isinstance(metric, dict) and 'runtime_pid' in metric:
+                        register(metric['runtime_pid'])
+                    else: accept_worker(metric)
+                else: yield record
+            if process.wait()!=0:
+                append_error(logs['error'], category='worker_failed', location=worker, request_id='')
+                raise ReadingError('PDF／OCR 工作进程失败，请检查本地处理日志。')
+    finally:
+        # 即使上层因暂停而提前关闭生成器，也要结束／回收子进程。
+        # 否则文件锁已释放，旧模型却仍占着内存，下一次调用可能与它叠加。
+        timer.cancel();process.stdout.close()
+        if process.poll() is None:process.kill()
+        process.wait()
+        pump.close()
 
 
 def ocr_records(settings,manifest,directory):
@@ -183,15 +192,9 @@ def ocr_fingerprint(settings,verify=False):
         entries, compute, verify=verify, directory=cache_directory(settings))['value']
 
 
-def render_plan(numbers, routes, exists, force_ocr):
-    """OCR 页已有稳定渲染图时不再重画。文字层页仍要渲染，除非强制 OCR 且图已在。"""
-    reuse, render = [], []
-    for number in numbers:
-        if exists(number) and (force_ocr or routes.get(number) == 'ocr'):
-            reuse.append(number)
-        else:
-            render.append(number)
-    return reuse, render
+def render_plan(numbers, routes, exists, force_ocr, **kwargs):
+    """识别页有完整图则复用。文字页默认不画，调用方传入 preview=True 才生成预览。"""
+    return plan_pages(numbers, routes, exists, force_ocr, **kwargs)
 
 
 def stable_render_path(root, document_id, number, scale, sha256):
@@ -259,7 +262,16 @@ class Reader:
         stamp=document.get('sha256')
         def image_for(number):
             return stable_render_path(self.storage.root, document_id, number, scale, stamp)
-        reuse, render = render_plan(pending, routes, lambda number: image_for(number).is_file() and image_for(number).stat().st_size>0, force_ocr)
+        def image_exists(number):
+            path=image_for(number)
+            return path.is_file() and not path.is_symlink() and path.stat().st_size>0
+        def image_intact(number):
+            # 损坏文件不能复用。缩略图即使落在同路径也不能当成识别输入。
+            report=inspect_artifact(image_for(number))
+            if report['state']=='ok' and report['descriptor'].get('kind')=='thumbnail':
+                return False
+            return report['state'] in {'ok','unsealed'}
+        reuse, render = render_plan(pending, routes, image_exists, force_ocr, intact=image_intact)
         finished=object()
         batch_limit=max(1, self.settings.ocr_page_batch)
         incoming=Queue(); done=Queue()
@@ -320,21 +332,68 @@ class Reader:
                 persist(item,'ocr')
         worker=Thread(target=copy_context().run, args=(consume,), name='ocr-pipeline', daemon=True)
         worker.start()
+        leases=[]
         try:
+            owner=f'{os.getpid()}:{uuid4().hex}'
+            still=[]
+            for number in render:
+                # 同一描述键同时只允许一个生成者。后来者拿到租约后复查，避免重复渲染。
+                key=artifact_key(source_sha256=stamp or 'nosha', page=number, kind='recognition',
+                    engine='pdfium', dpi=dpi_for_scale(scale), color='rgb', orientation=0, crop=None,
+                    transform_version=TRANSFORM_VERSION)
+                lease=GenerationLease(self.storage.root, key, owner)
+                lease.acquire()
+                leases.append(lease)
+                if image_exists(number) and image_intact(number):
+                    reuse.append(number)
+                else:
+                    still.append(number)
+            render=still
+            extract=[number for number in pending if number not in set(reuse)]
+            used=png_bytes(self.storage.root/'readings')
+            if render and used>=DISK_BYTES:
+                for number in render:
+                    persist({'page_number':number,'error_code':'disk_budget_exceeded'},'text')
+                render=[]
+                extract=[number for number in extract if routes.get(number)!='ocr' and not force_ocr]
+            if extract:
+                pattern='page-{number}-x'+f'{scale:g}-'+(stamp or 'nosha')[:12]+'.png'
+                rendered=image_for(extract[0]).parent
+                manifest={'mode':'read','source':str(source),'pages':extract,'output_dir':str(rendered),
+                    'render_scale':scale,'image_pattern':pattern,'render_pages':render,
+                    'max_pixels':SINGLE_IMAGE_PIXELS,'max_inflight_pixels':INFLIGHT_PIXELS,
+                    'max_file_bytes':max(1, DISK_BYTES-used)}
+                with closing(worker_records(self.settings.pdf_python,'pdf_worker',manifest,directory)) as records:
+                    render_set=set(render)
+                    for page in records:
+                        number=page.get('page_number')
+                        if page.get('error_code') in {'image_budget_exceeded','disk_budget_exceeded'}:
+                            persist(page,'text')
+                        elif page.get('error_code'):
+                            persist(page,'text')
+                        elif number in render_set and page.get('image_path'):
+                            try:
+                                self._seal_recognition(page['image_path'], stamp, number, scale)
+                            except ArtifactLimitError:
+                                persist({'page_number':number,'error_code':'image_budget_exceeded'},'text')
+                                continue
+                            except ArtifactError:
+                                persist({'page_number':number,'error_code':'image_corrupt'},'text')
+                                continue
+                            if force_ocr or page.get('route')=='ocr':
+                                enqueued.add(number); incoming.put(page)
+                            else:
+                                persist(page,'text')
+                        else:
+                            persist(page,'text')
             for number in reuse:
+                try:
+                    self._seal_recognition(image_for(number), stamp, number, scale)
+                except (ArtifactError, OSError):
+                    persist({'page_number':number,'error_code':'image_corrupt'},'ocr')
+                    continue
                 count('pdf.render.reused')
                 incoming.put({'page_number':number,'route':'ocr','text':'','image_path':str(image_for(number))})
-            if render:
-                pattern='page-{number}-x'+f'{scale:g}-'+(stamp or 'nosha')[:12]+'.png'
-                rendered=image_for(render[0]).parent
-                with closing(worker_records(self.settings.pdf_python,'pdf_worker',{
-                        'mode':'read','source':str(source),'pages':render,'output_dir':str(rendered),
-                        'render_scale':scale,'image_pattern':pattern},directory)) as records:
-                    for page in records:
-                        if page.get('error_code'):persist(page,'text')
-                        elif force_ocr or page.get('route')=='ocr':
-                            enqueued.add(page['page_number']); incoming.put(page)
-                        else:persist(page,'text')
             incoming.put(None)
             finish_ocr()
         except ReadingError:
@@ -349,7 +408,114 @@ class Reader:
             for number in set(pending)-saved:
                 persist({'page_number':number,'error_code':'worker_failed'},'ocr' if number in enqueued else 'text')
         finally:
+            for lease in leases:
+                lease.release()
             if worker.is_alive():
                 incoming.put(None)
                 worker.join()
         return {**self.database.reading(document_id),'skipped_pages':skipped}
+
+    def _seal_recognition(self, image_path, stamp, number, scale):
+        path=Path(image_path)
+        report=inspect_artifact(path)
+        if report['state'] in {'missing','corrupt'}:
+            raise ArtifactError('图像缺失或损坏，不能登记。')
+        width,height=report['artifact_size']
+        file_bytes=path.stat().st_size
+        used=png_bytes(self.storage.root/'readings')
+        admit_image(width, height, single_limit=SINGLE_IMAGE_PIXELS, inflight=0,
+            inflight_limit=INFLIGHT_PIXELS, disk_used=max(0, used-file_bytes),
+            incoming_bytes=file_bytes, disk_limit=DISK_BYTES)
+        relative=image_key_for(self.storage.root, path)
+        descriptor=seal_rendered_png(path, root=self.storage.root, relative_path=relative,
+            source_sha256=stamp or 'nosha', page=number, kind='recognition', scale=scale)
+        return assert_recognition_input(descriptor)
+
+    def _usable_image(self, path, kind):
+        report=inspect_artifact(path)
+        if report['state'] not in {'ok','unsealed'}:
+            return False
+        if report['state']=='unsealed':
+            return True
+        found=report['descriptor'].get('kind')
+        if found=='thumbnail':
+            return False
+        if kind=='recognition':
+            return found=='recognition'
+        return found in {'preview','recognition'}
+
+    def _render_single(self, document, document_id, page_number, kind):
+        """按同一渲染参数补一张图。不调用 OCR。"""
+        source=self.storage.path(document['storage_key'])
+        scale=self.settings.pdf_render_scale
+        stamp=document.get('sha256')
+        target=stable_render_path(self.storage.root, document_id, page_number, scale, stamp)
+        used=png_bytes(self.storage.root/'readings')
+        if used>=DISK_BYTES:
+            raise ReadingError('磁盘字节上限已超过，未降低画质。')
+        key=artifact_key(source_sha256=stamp or 'nosha', page=page_number, kind=kind,
+            engine='pdfium', dpi=dpi_for_scale(scale), color='rgb', orientation=0, crop=None,
+            transform_version=TRANSFORM_VERSION)
+        directory=self.storage.root/'readings'/str(document_id)/uuid4().hex
+        directory.mkdir(parents=True)
+        pattern='page-{number}-x'+f'{scale:g}-'+(stamp or 'nosha')[:12]+'.png'
+        owner=f'{os.getpid()}:{uuid4().hex}'
+        with GenerationLease(self.storage.root, key, owner):
+            if self._usable_image(target, kind):
+                if inspect_artifact(target)['state']=='unsealed':
+                    if kind=='recognition':
+                        self._seal_recognition(target, stamp, page_number, scale)
+                    else:
+                        seal_rendered_png(target, root=self.storage.root,
+                            relative_path=image_key_for(self.storage.root, target),
+                            source_sha256=stamp or 'nosha', page=page_number, kind=kind, scale=scale)
+                return image_key_for(self.storage.root, target)
+            records=list(worker_records(self.settings.pdf_python,'pdf_worker',{
+                'mode':'read','source':str(source),'pages':[page_number],'output_dir':str(target.parent),
+                'render_scale':scale,'image_pattern':pattern,'render_pages':[page_number],
+                'max_pixels':SINGLE_IMAGE_PIXELS,'max_inflight_pixels':INFLIGHT_PIXELS,
+                'max_file_bytes':max(1, DISK_BYTES-used)}, directory))
+            if not records or records[0].get('error_code') in {'image_budget_exceeded','disk_budget_exceeded'}:
+                raise ReadingError('单图或磁盘上限已超过，未降低画质。')
+            if records[0].get('error_code') or not records[0].get('image_path'):
+                raise ReadingError('页面预览无法生成。')
+            path=records[0]['image_path']
+            if kind=='recognition':
+                self._seal_recognition(path, stamp, page_number, scale)
+            else:
+                seal_rendered_png(path, root=self.storage.root, relative_path=image_key_for(self.storage.root, path),
+                    source_sha256=stamp or 'nosha', page=page_number, kind=kind, scale=scale)
+            return image_key_for(self.storage.root, path)
+
+    def ensure_preview(self, project_id, document_id, page_number):
+        """浏览时补预览或按原参数补识别图。已有 OCR 文本时不重新识别。"""
+        project_id,document_id=UUID(str(project_id)),UUID(str(document_id))
+        page_number=int(page_number)
+        document=self.database.document(project_id, document_id)
+        if document is None:
+            raise ReadingError('材料不存在或不属于当前项目。')
+        version=self.database.reading_version(document_id)
+        if version is None:
+            raise ReadingError('该页尚无阅读结果。')
+        row=self.database.page_row(document_id, page_number)
+        if row is None or row['status']!='succeeded':
+            raise ReadingError('该页尚无阅读结果。')
+        kind='recognition' if row['method']=='ocr' else 'preview'
+        scale=self.settings.pdf_render_scale
+        stamp=document.get('sha256')
+        current=self.storage.path(row['image_key']) if row.get('image_key') else stable_render_path(
+            self.storage.root, document_id, page_number, scale, stamp)
+        if row.get('image_key') and self._usable_image(current, kind):
+            if inspect_artifact(current)['state']=='unsealed':
+                if kind=='recognition':
+                    self._seal_recognition(current, stamp, page_number, scale)
+                else:
+                    seal_rendered_png(current, root=self.storage.root,
+                        relative_path=image_key_for(self.storage.root, current),
+                        source_sha256=stamp or 'nosha', page=page_number, kind=kind, scale=scale)
+            return row['image_key']
+        key=self._render_single(document, document_id, page_number, kind)
+        saved=self.database.set_page_image(document_id, version['pipeline_version'], page_number, key)
+        if not saved:
+            raise ReadingError('页面预览无法登记。')
+        return saved

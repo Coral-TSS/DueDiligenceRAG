@@ -67,6 +67,12 @@ def main():
             # 预检遍历所有物理页，只返回页数／文字数量／路由，不输出所有正文。
             emit(inspect_pages(pdf))
         else:
+            render_pages=config.get('render_pages')
+            render_set=None if render_pages is None else set(render_pages)
+            max_pixels=int(config.get('max_pixels') or 0)
+            max_inflight=int(config.get('max_inflight_pixels') or 0)
+            max_file=int(config.get('max_file_bytes') or 0)
+            inflight=0
             for number in config['pages']:
                 # 外部物理页码从 1 开始，PDFium 数组下标从 0 开始。
                 page=None
@@ -76,16 +82,30 @@ def main():
                         tp=page.get_textpage()
                         try:text=tp.get_text_range()
                         finally:tp.close()
+                    # 未列入 render_pages 的文字页只取文字。预览改由浏览时再生成。
+                    if render_set is not None and number not in render_set:
+                        emit({'page_number':number,'route':text_route(text),'text':text})
+                        continue
                     pattern=config.get('image_pattern') or 'page-{number}.png'
                     target, partial = preview_paths(config['output_dir'], pattern, number)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     # 临时名必须仍以 .png 结尾。Pillow 靠扩展名选格式，.png.part 会让保存失败，
                     # 整页被记成 pdf_page_failed，后面的 OCR 和 image_key 都不会发生。
-                    # 可读文字页也保留预览图，供回看；渲染图片本身不表示调用视觉识别。
                     # 先写临时文件再替换，避免 OCR 重试读到半张图。
+                    # 像素或单文件超限时不保存、不缩小。
                     with span('pdf.render', page=number):
-                        page.render(scale=config.get('render_scale',2)).to_pil().save(partial, format='PNG')
+                        image=page.render(scale=config.get('render_scale',2)).to_pil()
+                        pixels=image.width*image.height
+                        if (max_pixels and pixels>max_pixels) or (max_inflight and inflight+pixels>max_inflight):
+                            emit({'page_number':number,'error_code':'image_budget_exceeded'})
+                            continue
+                        image.save(partial, format='PNG')
+                        if max_file and partial.stat().st_size>max_file:
+                            partial.unlink(missing_ok=True)
+                            emit({'page_number':number,'error_code':'disk_budget_exceeded'})
+                            continue
                         os.replace(partial, target)
+                        inflight+=pixels
                     count('pdf.render.pages')
                     emit({'page_number':number,'route':text_route(text),'text':text,'image_path':str(target)})
                 except Exception:

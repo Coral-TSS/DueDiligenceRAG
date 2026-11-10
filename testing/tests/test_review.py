@@ -104,11 +104,13 @@ def test_higher_resolution_produces_larger_preview_and_a_new_reading_version(tmp
     with client(app) as c:
         p = project(c); d = upload(c, p, body=body).json()['document']['id']
     default = Reader(Settings(database_url=database_url, data_dir=tmp_path/'data')).read(p, d, [1])
-    detail = Reader(Settings(database_url=database_url, data_dir=tmp_path/'data', pdf_render_scale=3)).read(p, d, [1])
+    detail_reader = Reader(Settings(database_url=database_url, data_dir=tmp_path/'data', pdf_render_scale=3))
+    detail = detail_reader.read(p, d, [1])
     assert default['pipeline_version'] != detail['pipeline_version']
     assert detail['skipped_pages'] == []
-    page = app.state.database.pages(d)[0]
-    image = (tmp_path/'data'/page['image_key']).read_bytes()
+    # 文字页阅读时不渲染，浏览时才按该版本的比例生成预览。
+    key = detail_reader.ensure_preview(p, d, 1)
+    image = (tmp_path/'data'/key).read_bytes()
     assert struct.unpack('>II', image[16:24]) == (1785,2526)
 
 
