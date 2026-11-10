@@ -21,6 +21,7 @@ from .lexical import build_keyword_query, document_tsvector, fuse_for, page_key,
 from .model_results import ModelResults
 from .model_admission import request_scope, current_control, AdmissionError
 from .control import ProcessingDeferred
+from .material_metadata import MetadataError
 from .search_queries import CURRENT, SearchQueries
 from .config import Settings
 from .db import Database
@@ -419,7 +420,7 @@ class EvidenceService:
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector,%s::tsvector,%s)''',
                     (uuid4(), document_id, number, version, ordinal, chunk['start_offset'], chunk['end_offset'], chunk['text'], vector, document_tsvector(chunk['text']), Jsonb(spans)))
 
-    def _recall(self,queries,project_id,version,query,*,excluded_documents=(),included_documents=None,include_office=False):
+    def _recall(self,queries,project_id,version,query,*,excluded_documents=(),included_documents=None,include_office=False,scope=None):
         """向量与关键词各自取有界候选，合并后再交给重排。单路开关不再查询另一路。"""
         control=current_control();control.check()
         settings=self.settings
@@ -432,17 +433,17 @@ class EvidenceService:
             vector=self._model_result('embedding',project_id,query,[],embed,valid_vector)
             control.check()
             vector_rows=queries.candidates(project_id,version,valid_vector(vector),
-                excluded_documents=excluded_documents,included_documents=included_documents,limit=settings.retrieval_vector_limit)
+                excluded_documents=excluded_documents,included_documents=included_documents,limit=settings.retrieval_vector_limit,scope=scope)
         keyword_rows=[]
         if settings.retrieval_mode!='vector':
             plan=build_keyword_query(query)
             if plan.tsquery:
                 found=queries.keyword_candidates(project_id,version,plan.tsquery,plan.needles,
-                    excluded_documents=excluded_documents,included_documents=included_documents,limit=settings.retrieval_keyword_limit)
+                    excluded_documents=excluded_documents,included_documents=included_documents,limit=settings.retrieval_keyword_limit,scope=scope)
                 keyword_rows=prepare_keyword_rows(found,plan)[:settings.retrieval_keyword_limit]
         control.check()
         if include_office:
-            office_rows=self._office_rows(project_id, query, included_documents)
+            office_rows=self._office_rows(project_id, query, included_documents, scope)
             vector_rows=list(vector_rows)+office_rows['vector']
             keyword_rows=list(keyword_rows)+office_rows['keyword']
         return fuse_for(settings, vector_rows, keyword_rows, key=page_key)
@@ -460,10 +461,10 @@ class EvidenceService:
         return value
 
     @observed('search')
-    def search(self,project_id,query,*,cancel=None,document_id=None):
+    def search(self,project_id,query,*,cancel=None,document_id=None,scope=None):
         project_id=UUID(str(project_id));query=query.strip()
         if not 1<=len(query)<=500:raise ValueError('查询须为 1–500 个字符。')
-        # document_id 只收窄召回范围，融合与重排仍走原路径。
+        # document_id 只收窄召回范围，融合与重排仍走原路径。过滤在各路 SQL 内完成。
         if document_id is not None:document_id=UUID(str(document_id))
         try:
             with request_scope('interactive',cancel=cancel,deadline=monotonic()+self.settings.search_timeout_seconds):
@@ -474,24 +475,27 @@ class EvidenceService:
                     from .parent_index import ParentIndex
                     from .mixed_search import MixedSearch
                     index=ParentIndex(self.settings,database=self.database,models=self.models)
-                    return MixedSearch(self,index,self.settings.search_parent_documents)._search(project_id,query,document_id=document_id)
-                return self._search(project_id,query,document_id=document_id)
+                    found=MixedSearch(self,index,self.settings.search_parent_documents)._search(
+                        project_id,query,document_id=document_id,scope=scope)
+                else:
+                    found=self._search(project_id,query,document_id=document_id,scope=scope)
+                return self._annotate(found,project_id,scope)
         except AdmissionError as exc:
             if exc.code=='cancelled':raise SearchCancelled('查询已取消。') from None
             if exc.code=='deadline':raise SearchTimeout('本次查询超时，请稍后重试。') from None
             raise RetrievalBusy('本地模型繁忙，请稍后重试。') from None
 
-    def _search(self,project_id,query,*,project_checked=False,document_id=None):
+    def _search(self,project_id,query,*,project_checked=False,document_id=None,scope=None):
         control=current_control();control.check()
         if not project_checked and not self.database.project_exists(project_id):raise RetrievalError('项目不存在。')
-        included=self._included_document(project_id,document_id)
+        included=self._bound_documents(project_id,document_id,scope)
         version=self.version();control.check()
         queries=SearchQueries(self.database)
         coverage=queries.coverage(project_id,version)
         response=dict(index_version=version,coverage=coverage,results=[],status='not_indexed')
         if not coverage['indexed_pages'] and not coverage['office_chunks']:
             return response
-        rows=self._recall(queries,project_id,version,query,included_documents=included,include_office=bool(coverage['office_chunks']))
+        rows=self._recall(queries,project_id,version,query,included_documents=included,include_office=bool(coverage['office_chunks']),scope=scope)
         if rows:
             texts=[r['text'] for r in rows]
             def validate_scores(scores):
@@ -524,7 +528,7 @@ class EvidenceService:
         from .office import OfficeIndex
         return OfficeIndex(self.settings, self.database, self.models)
 
-    def _office_rows(self, project_id, query, included):
+    def _office_rows(self, project_id, query, included, scope=None):
         from .lexical import build_keyword_query
         office=self._office()
         version=office.version()
@@ -536,13 +540,13 @@ class EvidenceService:
                 return values[0]
             vector=self._model_result('embedding',project_id,query,[],embed,valid_vector)
             vector_rows=office.candidates(project_id, version, vector=valid_vector(vector), included=included,
-                                          limit=self.settings.retrieval_vector_limit)
+                                          limit=self.settings.retrieval_vector_limit, scope=scope)
         keyword_rows=[]
         if self.settings.retrieval_mode!='vector':
             plan=build_keyword_query(query)
             if plan.tsquery:
                 keyword_rows=office.candidates(project_id, version, tsquery=plan.tsquery, needles=plan.needles,
-                                               included=included, limit=self.settings.retrieval_keyword_limit)
+                                               included=included, limit=self.settings.retrieval_keyword_limit, scope=scope)
         names=self._office_names(project_id, [row['document_id'] for row in vector_rows+keyword_rows])
         for row in vector_rows+keyword_rows:
             row.update(names.get(row['document_id'], {'filenames': []}))
@@ -558,9 +562,47 @@ class EvidenceService:
                 WHERE d.project_id=%s AND d.id=ANY(%s::uuid[]) GROUP BY d.id''', (project_id, list(set(documents)))).fetchall()
         return {row['document_id']: row for row in rows}
 
-    def _included_document(self,project_id,document_id):
-        if document_id is None:return None
-        document_id=UUID(str(document_id))
-        if self.database.document(project_id,document_id) is None:
+    def _bound_documents(self,project_id,document_id,scope):
+        if document_id is not None and scope is not None and scope.document_ids is not None:
+            raise MetadataError('不能同时传入 document_id 与 document_ids。')
+        self._require_subjects(project_id,scope)
+        if scope is not None and scope.document_ids is not None:
+            ids=tuple(scope.document_ids)
+        elif document_id is not None:
+            ids=(UUID(str(document_id)),)
+        else:
+            return None
+        found={str(item) for item in self.database.document_ids_in_project(project_id,ids)}
+        if found!={str(item) for item in ids}:
             raise RetrievalError('材料不存在或不属于当前项目。')
-        return (document_id,)
+        return ids
+
+    def _require_subjects(self,project_id,scope):
+        if scope is None or scope.subject_ids is None:
+            return
+        found={str(item) for item in self.database.subject_ids_in_project(project_id,scope.subject_ids)}
+        if found!={str(item) for item in scope.subject_ids}:
+            raise RetrievalError('主体不存在或不属于当前项目。')
+
+    def _annotate(self,response,project_id,scope):
+        if scope is None or not scope.active:
+            return response
+        counts=self.database.exclusion_counts(project_id)
+        response=dict(response)
+        response['excluded_uncategorized']=0 if scope.categories is None or 'uncategorized' in scope.categories else counts['uncategorized']
+        response['excluded_unsubjected']=counts['unsubjected'] if scope.subject_ids is not None else 0
+        response['excluded_undated']=counts['undated'] if scope.dates_enabled else 0
+        if response.get('status')=='no_matches':
+            parts=['过滤后没有命中。项目已有索引，本次条件过窄。']
+            if response['excluded_uncategorized']:
+                parts.append(f"未分类被排除 {response['excluded_uncategorized']} 份。")
+            if response['excluded_unsubjected']:
+                parts.append(f"未填主体被排除 {response['excluded_unsubjected']} 份。")
+            if response['excluded_undated']:
+                parts.append(f"未填日期被排除 {response['excluded_undated']} 份。")
+            if scope.page_from is not None and (response.get('coverage') or {}).get('office_chunks'):
+                parts.append('页范围不适用于无页码材料。')
+            response['message']=''.join(parts)
+        elif response.get('status')=='not_indexed':
+            response['message']='项目尚无当前版本索引。'
+        return response

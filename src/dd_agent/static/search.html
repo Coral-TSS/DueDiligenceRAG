@@ -2,6 +2,16 @@
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>证据检索</title><link rel="stylesheet" href="/static/styles.css"><script defer src="/static/search.js"></script></head>
 <body><header><div><span class="eyebrow">尽调报告 AGENT · 本地检索</span><h1>查找证据片段</h1><a href="/">返回材料工作区</a></div><span class="local">● 本地模型</span></header>
-<main><section class="card"><form id="search-form"><label for="search-project">尽调项目</label><select id="search-project" required><option value="">请选择项目</option></select><label for="query">想查找什么内容</label><div class="create-row"><input id="query" maxlength="500" required placeholder="例如：公司的注册资本及历次变更"><button id="submit-search" disabled>查找</button><button id="cancel-search" type="button" hidden>取消查询</button></div></form>
+<main><section class="card"><form id="search-form"><label for="search-project">尽调项目</label><select id="search-project" required><option value="">请选择项目</option></select><label for="query">想查找什么内容</label><div class="create-row"><input id="query" maxlength="500" required placeholder="例如：公司的注册资本及历次变更"><button id="submit-search" disabled>查找</button><button id="cancel-search" type="button" hidden>取消查询</button></div>
+<details id="search-filters"><summary>缩小范围</summary><p class="muted">材料、页、类别、主体和日期要同时满足。某一维没填的材料，在启用该维过滤时会被排除。</p>
+<fieldset id="filter-documents"><legend>材料</legend><p id="filter-documents-status" class="muted">展开后加载当前项目的材料。</p></fieldset>
+<label for="page-from">PDF 起页</label><input id="page-from" inputmode="numeric" placeholder="1">
+<label for="page-to">PDF 止页</label><input id="page-to" inputmode="numeric" placeholder="与起页一起填写">
+<fieldset id="filter-categories"><legend>类别</legend></fieldset>
+<fieldset id="filter-subjects"><legend>主体</legend><p id="filter-subjects-status" class="muted">展开后加载当前项目的主体。</p></fieldset>
+<label for="filter-date-kind">日期过滤</label><select id="filter-date-kind"><option value="">不限</option><option value="point">时点</option><option value="period">期间</option></select>
+<label for="filter-date-point">时点</label><input id="filter-date-point" type="date">
+<label for="filter-period-start">期间起</label><input id="filter-period-start" type="date">
+<label for="filter-period-end">期间止</label><input id="filter-period-end" type="date"></details></form>
 <p class="notice">仅检索已经建立索引的页面。结果是待核实的候选材料，相关分数不表示事实正确率；未命中也不能证明原卷没有该内容。</p>
 <p id="search-state" role="status" aria-live="polite">正在读取项目…</p><p id="search-error" class="error" role="alert"></p><div id="search-results"></div></section></main></body></html>

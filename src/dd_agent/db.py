@@ -10,8 +10,10 @@ from contextlib import contextmanager, nullcontext
 from uuid import uuid4
 
 import psycopg
+from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 from .db_connections import MeasuredCursor, open_connection
+from .material_metadata import MetadataError, metadata_sql, validate_name, validate_role
 
 
 class Database:
@@ -56,7 +58,7 @@ class Database:
         try:
             with self.connect() as conn:
                 row = conn.execute("SELECT max(version) AS version FROM dd_agent.schema_version").fetchone()
-                if row["version"] != 18:
+                if row["version"] != 19:
                     return {"status": "needs_migration", "message": "数据库版本与应用不符，请检查迁移版本。"}
         except (psycopg.errors.UndefinedTable, psycopg.errors.InvalidSchemaName):
             return {"status": "needs_migration", "message": "数据库已连接，请先运行 python -m dd_agent init-db 初始化表。"}
@@ -97,17 +99,47 @@ class Database:
             document["filenames"] = [n["filename"] for n in names]
         return document
 
-    def documents(self, project_id):
+    _DOCUMENT = '''SELECT d.*, sub.name AS subject_name
+        FROM dd_agent.documents d
+        LEFT JOIN dd_agent.project_subjects sub ON sub.id = d.subject_id AND sub.project_id = d.project_id'''
+
+    def _project_document(self, conn, project_id, document_id):
+        return conn.execute(self._DOCUMENT + ' WHERE d.project_id = %s AND d.id = %s', (project_id, document_id)).fetchone()
+
+    def documents(self, project_id, scope=None):
+        clause, args = metadata_sql(scope, 'd') if scope is not None else ('', ())
         with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM dd_agent.documents WHERE project_id = %s ORDER BY created_at DESC, id", (project_id,)).fetchall()
+            rows = conn.execute(self._DOCUMENT + ' WHERE d.project_id = %s' + clause + ' ORDER BY d.created_at DESC, d.id',
+                                (project_id, *args)).fetchall()
             return [self._with_sources(conn, row) for row in rows]
 
     def document(self, project_id, document_id):
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM dd_agent.documents WHERE project_id = %s AND id = %s", (project_id, document_id)).fetchone()
-            return self._with_sources(conn, row)
+            return self._with_sources(conn, self._project_document(conn, project_id, document_id))
 
-    def material_catalog(self, project_id, limit, after=None):
+    def document_ids_in_project(self, project_id, ids):
+        with self.connect() as conn:
+            rows = conn.execute(
+                'SELECT id FROM dd_agent.documents WHERE project_id = %s AND id = ANY(%s::uuid[])',
+                (project_id, list(ids))).fetchall()
+        return {row['id'] for row in rows}
+
+    def subject_ids_in_project(self, project_id, ids):
+        with self.connect() as conn:
+            rows = conn.execute(
+                'SELECT id FROM dd_agent.project_subjects WHERE project_id = %s AND id = ANY(%s::uuid[])',
+                (project_id, list(ids))).fetchall()
+        return {row['id'] for row in rows}
+
+    def exclusion_counts(self, project_id):
+        with self.connect() as conn:
+            return conn.execute('''SELECT
+                count(*) FILTER (WHERE category = 'uncategorized')::int AS uncategorized,
+                count(*) FILTER (WHERE subject_id IS NULL)::int AS unsubjected,
+                count(*) FILTER (WHERE date_kind = 'none')::int AS undated
+                FROM dd_agent.documents WHERE project_id = %s''', (project_id,)).fetchone()
+
+    def material_catalog(self, project_id, limit, after=None, scope=None):
         """Metadata only, bounded at SQL level; UUID ordering supports keyset paging."""
         # UUID 升序续读，不把 after 当偏移量；游标本身也必须属于当前项目。
         # 多取一条判断是否还有下一批，实际只返回 limit 条，不加载页面正文。
@@ -117,15 +149,18 @@ class Database:
             if after is not None and not conn.execute(
                 'SELECT 1 FROM dd_agent.documents WHERE project_id=%s AND id=%s',(project_id,after)).fetchone():
                 raise LookupError('材料游标不存在或不属于当前项目。')
-            total=conn.execute('SELECT count(*) AS n FROM dd_agent.documents WHERE project_id=%s',
-                               (project_id,)).fetchone()['n']
+            clause, meta_args = metadata_sql(scope, 'd') if scope is not None else ('', ())
+            total=conn.execute('SELECT count(*) AS n FROM dd_agent.documents d WHERE d.project_id=%s'+clause,
+                               (project_id, *meta_args)).fetchone()['n']
             rows=conn.execute('''SELECT d.id AS document_id,d.status,d.reason,d.byte_size,
+                d.category,d.subject_id,sub.name AS subject_name,d.date_kind,d.point_date,d.period_start,d.period_end,
                 r.page_count,r.pipeline_version AS reading_version,
                 ARRAY(SELECT s.filename FROM dd_agent.document_sources s
                       WHERE s.document_id=d.id ORDER BY s.first_seen_at,s.filename) AS filenames
                 FROM dd_agent.documents d LEFT JOIN dd_agent.document_readings r ON r.document_id=d.id
-                WHERE d.project_id=%s AND (%s::uuid IS NULL OR d.id>%s::uuid)
-                ORDER BY d.id LIMIT %s''',(project_id,after,after,limit+1)).fetchall()
+                LEFT JOIN dd_agent.project_subjects sub ON sub.id=d.subject_id AND sub.project_id=d.project_id
+                WHERE d.project_id=%s AND (%s::uuid IS NULL OR d.id>%s::uuid)'''+clause+'''
+                ORDER BY d.id LIMIT %s''',(project_id,after,after,*meta_args,limit+1)).fetchall()
             items=rows[:limit]
             return dict(items=items,total_documents=total,
                         next_cursor=str(items[-1]['document_id']) if len(rows)>limit else None)
@@ -143,7 +178,72 @@ class Database:
             if duplicate:
                 row = conn.execute("SELECT * FROM dd_agent.documents WHERE project_id = %s AND sha256 = %s", (project_id, stored["sha256"])).fetchone()
             conn.execute("INSERT INTO dd_agent.document_sources (document_id, filename) VALUES (%s, %s) ON CONFLICT DO NOTHING", (row["id"], stored["filename"]))
-            return self._with_sources(conn, row), duplicate
+            return self._with_sources(conn, self._project_document(conn, project_id, row["id"])), duplicate
+
+    def subjects(self, project_id):
+        with self.connect() as conn:
+            if not conn.execute('SELECT 1 FROM dd_agent.projects WHERE id=%s', (project_id,)).fetchone():
+                raise LookupError('项目不存在。')
+            return conn.execute('''SELECT id, project_id, name, role, created_at
+                FROM dd_agent.project_subjects WHERE project_id=%s ORDER BY created_at, id''', (project_id,)).fetchall()
+
+    def create_subject(self, project_id, name, role=None):
+        name, role = validate_name(name), validate_role(role)
+        with self.connect() as conn:
+            if not conn.execute('SELECT 1 FROM dd_agent.projects WHERE id=%s', (project_id,)).fetchone():
+                raise LookupError('项目不存在。')
+            try:
+                return conn.execute('''INSERT INTO dd_agent.project_subjects (id, project_id, name, role)
+                    VALUES (%s, %s, %s, %s) RETURNING id, project_id, name, role, created_at''',
+                    (uuid4(), project_id, name, role)).fetchone()
+            except UniqueViolation:
+                raise MetadataError('同项目已有同名主体。', {'name': '同项目已有同名主体。'}, status=409) from None
+
+    def rename_subject(self, project_id, subject_id, name):
+        name = validate_name(name)
+        with self.connect() as conn:
+            try:
+                row = conn.execute('''UPDATE dd_agent.project_subjects SET name=%s
+                    WHERE project_id=%s AND id=%s RETURNING id, project_id, name, role, created_at''',
+                    (name, project_id, subject_id)).fetchone()
+            except UniqueViolation:
+                raise MetadataError('同项目已有同名主体。', {'name': '同项目已有同名主体。'}, status=409) from None
+            if row is None:
+                raise LookupError('主体不存在或不属于当前项目。')
+            return row
+
+    def apply_metadata(self, project_id, document_ids, changes):
+        # 整批一个事务：任一材料或主体不属于当前项目就全部不写。不碰向量表。
+        ids = list(dict.fromkeys(document_ids))
+        if not ids:
+            raise MetadataError('材料标识不能为空列表。')
+        if not changes:
+            raise MetadataError('没有勾选要修改的字段。')
+        with self.connect() as conn:
+            if not conn.execute('SELECT 1 FROM dd_agent.projects WHERE id=%s', (project_id,)).fetchone():
+                raise LookupError('项目不存在。')
+            locked = conn.execute('''SELECT id FROM dd_agent.documents
+                WHERE project_id=%s AND id=ANY(%s::uuid[]) FOR UPDATE''', (project_id, ids)).fetchall()
+            if len(locked) != len(ids):
+                raise LookupError('材料不存在或不属于当前项目。')
+            if changes.get('subject_id') is not None:
+                found = conn.execute('SELECT 1 FROM dd_agent.project_subjects WHERE project_id=%s AND id=%s',
+                                     (project_id, changes['subject_id'])).fetchone()
+                if found is None:
+                    raise LookupError('主体不存在或不属于当前项目。')
+            sets, args = [], []
+            if 'category' in changes:
+                sets.append('category=%s')
+                args.append(changes['category'])
+            if 'subject_id' in changes:
+                sets.append('subject_id=%s')
+                args.append(changes['subject_id'])
+            if 'date_kind' in changes:
+                sets.extend(('date_kind=%s', 'point_date=%s', 'period_start=%s', 'period_end=%s'))
+                args.extend((changes['date_kind'], changes['point_date'], changes['period_start'], changes['period_end']))
+            conn.execute(f'''UPDATE dd_agent.documents SET {", ".join(sets)}
+                WHERE project_id=%s AND id=ANY(%s::uuid[])''', (*args, project_id, ids))
+            return [self._with_sources(conn, self._project_document(conn, project_id, item)) for item in ids]
 
     def set_reading(self, document_id, page_count, version, conn=None):
         # 这里切换材料的当前阅读版本；历史 document_pages 仍保留，不是删除后重建。

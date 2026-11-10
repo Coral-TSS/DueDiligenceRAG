@@ -10,9 +10,9 @@ class MaterialCatalog:
         self.database=database
         self.project_id=UUID(str(project_id))
 
-    def list_materials(self,limit=50,after=None):
+    def list_materials(self,limit=50,after=None,scope=None):
         # 在服务层也限制批量，保证绕过 HTTP 直接调用（例如 MCP）时仍受约束。
         if type(limit) is not int or not 1<=limit<=100:
             raise ValueError('每批材料数量须为 1–100。')
         cursor=UUID(str(after)) if after is not None else None
-        return self.database.material_catalog(self.project_id,limit,cursor)
+        return self.database.material_catalog(self.project_id,limit,cursor,scope)
