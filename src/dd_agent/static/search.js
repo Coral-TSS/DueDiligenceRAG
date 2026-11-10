@@ -7,7 +7,7 @@ const CATEGORIES = [
   ["shareholder_resolution", "股东会决议"], ["board_resolution", "董事会决议"], ["equity_structure", "股权结构／名册"],
   ["audit_report", "审计报告"], ["financial_statement", "财务报表"], ["major_contract", "重大合同"],
   ["litigation", "诉讼／仲裁文书"], ["ip_certificate", "知识产权证书"], ["regulatory_filing", "监管报送／批复"],
-  ["hr_labor", "劳动／人事材料"], ["other", "其他"],
+  ["hr_labor", "劳动／人事材料"], ["interview_record", "访谈记录"], ["other", "其他"],
 ];
 function selectedBoxes(containerId) {
   const found = [];

@@ -29,6 +29,7 @@ CATEGORIES = {
     'ip_certificate': '知识产权证书',
     'regulatory_filing': '监管报送／批复',
     'hr_labor': '劳动／人事材料',
+    'interview_record': '访谈记录',
     'other': '其他',
 }
 
