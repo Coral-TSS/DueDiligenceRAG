@@ -103,6 +103,10 @@ class Settings:
     retrieval_rrf_k: int = 60
     retrieval_vector_weight: float = 1.
     retrieval_keyword_weight: float = 1.
+    # 空值表示不指定程序：Windows 上再找 LibreOffice 的默认安装路径。
+    soffice_path: Path | None = None
+    soffice_timeout_seconds: int = 120
+    soffice_concurrency: int = 1
 
     def __post_init__(self):
         if self.parent_index_mode not in ('on','off','shadow'):
@@ -180,6 +184,12 @@ class Settings:
             raise ValueError('视觉低置信阈值须在 0–1 之间。')
         if type(self.ocr_cpu_threads) is not int or not 0 <= self.ocr_cpu_threads <= 16 or type(self.ocr_enable_mkldnn) is not bool:
             raise ValueError('OCR 线程或 oneDNN 开关无效。')
+        if self.soffice_path is not None and not isinstance(self.soffice_path, Path):
+            object.__setattr__(self, 'soffice_path', Path(self.soffice_path))
+        if type(self.soffice_timeout_seconds) is not int or not 1 <= self.soffice_timeout_seconds <= 1200:
+            raise ValueError('LibreOffice 转换超时须为 1–1200 秒。')
+        if type(self.soffice_concurrency) is not int or not 1 <= self.soffice_concurrency <= 4:
+            raise ValueError('LibreOffice 同时转换的上限须为 1–4。')
 
     @classmethod
     def from_env(cls):
@@ -262,4 +272,7 @@ class Settings:
             retrieval_rrf_k=int(os.getenv('DDA_RETRIEVAL_RRF_K') or '60'),
             retrieval_vector_weight=float(os.getenv('DDA_RETRIEVAL_VECTOR_WEIGHT') or '1'),
             retrieval_keyword_weight=float(os.getenv('DDA_RETRIEVAL_KEYWORD_WEIGHT') or '1'),
+            soffice_path=Path(os.getenv('DDA_SOFFICE_PATH', '').strip()).expanduser() if os.getenv('DDA_SOFFICE_PATH', '').strip() else None,
+            soffice_timeout_seconds=int(os.getenv('DDA_SOFFICE_TIMEOUT_SECONDS') or '120'),
+            soffice_concurrency=int(os.getenv('DDA_SOFFICE_CONCURRENCY') or '1'),
         )

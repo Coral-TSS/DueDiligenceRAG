@@ -299,13 +299,17 @@ class JobManager:
             self._save(job,'failed',progress,'local_processing_failed')
 
     def _run_staged(self, job, pipeline):
-        from .office import _extension, _PACKAGE
+        from .office import _extension, _PACKAGE, _LEGACY
         doc = self._document(job['project_id'], job['document_id'])
-        if any(_extension(name) in _PACKAGE for name in doc.get('filenames') or []):
+        if any(_extension(name) in _PACKAGE or _extension(name) in _LEGACY for name in doc.get('filenames') or []):
             try:
                 self._save(job, 'running', {})
                 outcome = pipeline.evidence.index_office(job['project_id'], doc['id'])
-                self._save(job, 'partial' if outcome['failed_units'] else 'completed', outcome)
+                if outcome.get('unsupported'):
+                    # 这一份失败就结束，不重试，也不要让队列里的其他材料一起失败。
+                    self._save(job, 'failed', outcome, outcome.get('error_code') or 'legacy_unsupported')
+                else:
+                    self._save(job, 'partial' if outcome['failed_units'] else 'completed', outcome)
             except Exception:
                 self._save(job, 'failed', {}, 'local_processing_failed')
             return

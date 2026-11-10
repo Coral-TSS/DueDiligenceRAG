@@ -1,4 +1,4 @@
-"""现代 DOCX／XLSX／PPTX 的登记、来源单元和向量。不把它们写成 PDF 页。"""
+"""现代 DOCX／XLSX／PPTX 的登记、来源单元和向量。旧版 DOC／XLS／PPT 先转换再走同一条解析。不把它们写成 PDF 页。"""
 import json
 import zipfile
 from io import BytesIO
@@ -20,17 +20,23 @@ _LEGACY = {'.doc': '旧版 Word', '.xls': '旧版 Excel', '.ppt': '旧版 PowerP
 
 def _extension(filename):
     lower = (filename or '').lower()
-    for ext in (*_PACKAGE, *_LEGACY):
-        if lower.endswith(ext):
-            return ext
+    dot = lower.rfind('.')
+    if dot < 0:
+        return ''
+    suffix = lower[dot:]
+    if suffix in _PACKAGE or suffix in _LEGACY:
+        return suffix
     return ''
 
 
-def classify_saved_file(filename, path):
-    """登记阶段只看扩展名和压缩包结构，不抽取正文，也不启动转换器。"""
+def classify_saved_file(filename, path, soffice_resolver=None):
+    """登记阶段只看扩展名和压缩包或复合文档结构，不抽取正文，也不启动转换器。"""
     ext = _extension(filename)
     if ext in _LEGACY:
-        return 'unsupported', f'{_LEGACY[ext]} 暂不解析。请另存为 docx、xlsx 或 pptx，本系统不调用外部转换。'
+        from .legacy_office import registration_decision
+        decision = registration_decision(path, ext, soffice_resolver)
+        if decision is not None:
+            return decision
     if ext not in _PACKAGE:
         return None
     try:
@@ -177,12 +183,53 @@ class OfficeIndex:
         document = self.database.document(project_id, document_id)
         if document is None:
             raise RetrievalError('材料不存在或不属于当前项目。')
-        filename = next((name for name in document['filenames'] if _extension(name) in _PACKAGE), '')
-        if not filename:
-            raise RetrievalError('这份材料不是可解析的现代 Office 文件。')
+        legacy = next((name for name in document['filenames'] if _extension(name) in _LEGACY), '')
+        modern = next((name for name in document['filenames'] if _extension(name) in _PACKAGE), '')
         from .storage import Storage
-        blob = Storage(self.settings.data_dir, self.settings.max_upload_bytes).path(document['storage_key']).read_bytes()
-        units = parse_office(filename, blob)
+        stored = Storage(self.settings.data_dir, self.settings.max_upload_bytes).path(document['storage_key'])
+        # 同一内容若同时有现代扩展名和旧扩展名，以文件头决定走哪条解析，避免把 docx 误判成旧版后拒绝。
+        if legacy and modern:
+            with stored.open('rb') as handle:
+                head = handle.read(8)
+            if head != bytes.fromhex('D0CF11E0A1B11AE1'):
+                legacy = ''
+        conversion = None
+        if legacy:
+            from .legacy_office import convert_for_parse
+            prepared = convert_for_parse(self.settings, stored, _extension(legacy))
+            if not prepared['ok']:
+                self._reject(project_id, document_id, prepared)
+                return {
+                    'indexed_units': [], 'failed_units': [], 'index_version': self.version(),
+                    'unsupported': True, 'error_code': prepared['error_code'], 'reason': prepared['reason'],
+                    'conversion': prepared['conversion'],
+                }
+            filename = 'converted' + prepared['target_extension']
+            blob = prepared['blob']
+            conversion = prepared['conversion']
+            self._set_disposition(project_id, document_id, 'registered', prepared['reason'])
+        elif modern:
+            filename = modern
+            blob = stored.read_bytes()
+        else:
+            raise RetrievalError('这份材料不是可解析的 Office 文件。')
+        try:
+            units = parse_office(filename, blob)
+        except Exception:
+            if not legacy:
+                raise
+            rejection = {
+                'status': 'invalid',
+                'reason': f'{_LEGACY[_extension(legacy)]} 的转换结果无法解析，未入库。',
+                'error_code': 'legacy_output_rejected',
+                'conversion': dict(conversion, outcome='legacy_output_rejected'),
+            }
+            self._reject(project_id, document_id, rejection)
+            return {
+                'indexed_units': [], 'failed_units': [], 'index_version': self.version(),
+                'unsupported': True, 'error_code': rejection['error_code'], 'reason': rejection['reason'],
+                'conversion': rejection['conversion'],
+            }
         version = self.version()
         failed = []
         indexed = []
@@ -205,7 +252,30 @@ class OfficeIndex:
                 continue
             self._publish_chunk(document_id, unit_id, version, unit, vector)
             indexed.append(unit['locator'])
-        return {'indexed_units': indexed, 'failed_units': failed, 'index_version': version}
+        result = {'indexed_units': indexed, 'failed_units': failed, 'index_version': version}
+        if conversion is not None:
+            result['conversion'] = conversion
+        return result
+
+    def _set_disposition(self, project_id, document_id, status, reason):
+        with self.database.connect() as conn:
+            row = conn.execute('''UPDATE dd_agent.documents SET status=%s, reason=%s
+                WHERE project_id=%s AND id=%s RETURNING id''', (status, reason, project_id, document_id)).fetchone()
+        if row is None:
+            from .retrieval import RetrievalError
+            raise RetrievalError('材料不存在或不属于当前项目。')
+
+    def _reject(self, project_id, document_id, rejection):
+        # 转换失败时撤下已发布的来源单元，避免旧向量继续被当前项目检索到。只动这一份材料。
+        with self.database.connect() as conn:
+            conn.execute('''DELETE FROM dd_agent.source_units u USING dd_agent.documents d
+                WHERE u.document_id=d.id AND d.project_id=%s AND d.id=%s''', (project_id, document_id))
+            row = conn.execute('''UPDATE dd_agent.documents SET status=%s, reason=%s
+                WHERE project_id=%s AND id=%s RETURNING id''',
+                (rejection['status'], rejection['reason'], project_id, document_id)).fetchone()
+        if row is None:
+            from .retrieval import RetrievalError
+            raise RetrievalError('材料不存在或不属于当前项目。')
 
     def _store_unit(self, document_id, unit):
         with self.database.connect() as conn:

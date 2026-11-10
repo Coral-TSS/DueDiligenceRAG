@@ -177,6 +177,12 @@ class Database:
             duplicate = row is None
             if duplicate:
                 row = conn.execute("SELECT * FROM dd_agent.documents WHERE project_id = %s AND sha256 = %s", (project_id, stored["sha256"])).fetchone()
+                # 先前只因当时找不到 soffice 而未支持。同一原件再次上传且现在可以转换时，改为待处理。
+                # 宏、密码和损坏的结论不含这句，不会被改回可解析。
+                if stored['status'] == 'registered' and row['status'] == 'unsupported' and '未找到 LibreOffice 的 soffice' in (row['reason'] or ''):
+                    row = conn.execute('''UPDATE dd_agent.documents SET status=%s, reason=%s
+                        WHERE project_id=%s AND id=%s RETURNING *''',
+                        (stored['status'], stored['reason'], project_id, row['id'])).fetchone()
             conn.execute("INSERT INTO dd_agent.document_sources (document_id, filename) VALUES (%s, %s) ON CONFLICT DO NOTHING", (row["id"], stored["filename"]))
             return self._with_sources(conn, self._project_document(conn, project_id, row["id"])), duplicate
 
