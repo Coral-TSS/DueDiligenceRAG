@@ -172,7 +172,7 @@ def test_mcp_command_requires_key_and_binds_configured_host(monkeypatch, tmp_pat
 
     monkeypatch.setattr('dd_agent.__main__.uvicorn.run', run)
     assert main() == 0
-    assert captured == {'host': '0.0.0.0', 'port': 8899, 'paths': ['/messages', '/sse']}
+    assert captured == {'host': '0.0.0.0', 'port': 8899, 'paths': ['/mcp', '/messages', '/sse']}
     assert Settings.from_env().mcp_api_key == 'local-test-key'
 
 

@@ -1,0 +1,12 @@
+{
+  "name": "dd-agent-streamable-http-client",
+  "private": true,
+  "type": "module",
+  "description": "用官方 MCP TypeScript SDK 验收本机 Streamable HTTP。",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.2.0"
+  }
+}
