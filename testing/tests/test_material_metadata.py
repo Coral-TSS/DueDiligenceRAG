@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 from docx import Document
+from psycopg.errors import CheckViolation
+import pytest
 
 from dd_agent.material_metadata import CATEGORIES, dates_overlap, parse_filters, validate_date_fields
 from dd_agent.mcp_server import TOOLS, ToolFailure, _call_tool
@@ -20,11 +22,32 @@ from test_retrieval import TinyModels
 from test_workspace import PDF, application, client, project, upload
 
 
+def _category_codes(sql):
+    constraint = re.search(r'documents_category_known CHECK \(category IN \((.*?)\)\)', sql, re.S)
+    assert constraint, sql
+    return re.findall(r"'([a-z_]+)'", constraint.group(1))
+
+
+def _ui_categories(path):
+    text = Path(path).read_text(encoding='utf-8')
+    block = text.split('const CATEGORIES = [', 1)[1].split('];', 1)[0]
+    return re.findall(r'\["([a-z_]+)", "([^"]+)"\]', block)
+
+
 def test_confirmed_category_table_and_overlap_rules():
-    text = Path('src/dd_agent/migrations/019_material_metadata.sql').read_text(encoding='utf-8')
+    original = Path('src/dd_agent/migrations/019_material_metadata.sql').read_text(encoding='utf-8')
+    added = Path('src/dd_agent/migrations/020_interview_record.sql').read_text(encoding='utf-8')
+    health = Path('src/dd_agent/db.py').read_text(encoding='utf-8')
     assert list(CATEGORIES)[0] == 'uncategorized'
-    for code in CATEGORIES:
-        assert f"'{code}'" in text
+    assert list(CATEGORIES)[-1] == 'other'
+    assert CATEGORIES['interview_record'] == '访谈记录'
+    assert _category_codes(original) == [code for code in CATEGORIES if code != 'interview_record']
+    assert _category_codes(added) == list(CATEGORIES)
+    assert 'VALUES (20)' in added
+    assert 'row["version"] != 20' in health
+    assert _ui_categories('src/dd_agent/static/app.js') == list(CATEGORIES.items())
+    assert _ui_categories('src/dd_agent/static/search.js') == list(CATEGORIES.items())
+    assert parse_filters(categories=['interview_record', 'articles']).categories == ('interview_record', 'articles')
     assert dates_overlap('period', None, date(2023, 1, 1), date(2023, 6, 30), period_start=date(2023, 1, 1), period_end=date(2023, 12, 31))
     assert dates_overlap('point', date(2023, 6, 1), None, None, period_start=date(2023, 1, 1), period_end=date(2023, 12, 31))
     assert not dates_overlap('period', None, date(2022, 1, 1), date(2022, 12, 31), period_start=date(2023, 1, 1), period_end=date(2023, 12, 31))
@@ -142,7 +165,7 @@ def test_metadata_filters_isolation_and_mcp(tmp_path, database_url):
     app = application(tmp_path, database_url, migrate=True, limit=2_000_000)
     assert app.state.database.health()['status'] == 'ready'
     with app.state.database.connect() as conn:
-        assert conn.execute('SELECT max(version) AS version FROM dd_agent.schema_version').fetchone()['version'] == 19
+        assert conn.execute('SELECT max(version) AS version FROM dd_agent.schema_version').fetchone()['version'] == 20
     service = _service(app, tmp_path, database_url)
     with client(app) as http:
         project_a = project(http, '项目甲')
@@ -383,6 +406,80 @@ def test_metadata_filters_isolation_and_mcp(tmp_path, database_url):
     assert articles not in json.dumps(filtered)
     empty_project = tool('list_documents', {'project_id': str(uuid4())})
     assert empty_project['isError'] is True
+
+
+def test_interview_record_saves_filters_and_returns_from_mcp(tmp_path, database_url):
+    app = application(tmp_path, database_url, migrate=True, limit=2_000_000)
+    assert app.state.database.health()['status'] == 'ready'
+    service = _service(app, tmp_path, database_url)
+    with client(app) as http:
+        project_id = project(http, '访谈项目')
+        interview_id = upload(http, project_id, '访谈.pdf', PDF + b'interview').json()['document']['id']
+        other_id = upload(http, project_id, '章程.pdf', PDF + b'articles').json()['document']['id']
+        saved = http.patch(
+            f'/api/projects/{project_id}/documents/{interview_id}/metadata',
+            json=_body('interview_record'))
+        assert saved.status_code == 200, saved.text
+        assert saved.json()['document']['category'] == 'interview_record'
+        assert http.patch(
+            f'/api/projects/{project_id}/documents/{other_id}/metadata',
+            json=_body('articles')).status_code == 200
+        catalog = http.get(
+            f'/api/projects/{project_id}/material-catalog',
+            params={'categories': ['interview_record']}).json()
+        assert {row['document_id'] for row in catalog['items']} == {interview_id}
+        assert catalog['items'][0]['category'] == 'interview_record'
+        excluded = http.get(
+            f'/api/projects/{project_id}/material-catalog',
+            params={'categories': ['articles']}).json()
+        assert {row['document_id'] for row in excluded['items']} == {other_id}
+    with app.state.database.connect() as conn:
+        definition = conn.execute(
+            "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conname = 'documents_category_known'"
+        ).fetchone()['definition']
+        assert 'interview_record' in definition and 'business_license' in definition and 'hr_labor' in definition
+    with pytest.raises(CheckViolation):
+        with app.state.database.connect() as conn:
+            conn.execute(
+                'UPDATE dd_agent.documents SET category = %s WHERE id = %s',
+                ('not_a_category', interview_id))
+    assert app.state.database.document(project_id, interview_id)['category'] == 'interview_record'
+
+    _index(app, service, project_id, interview_id, ['访谈记录里的注册资本。'])
+    _index(app, service, project_id, other_id, ['章程里的注册资本。'])
+    with client(app) as http:
+        found = http.post(
+            f'/api/projects/{project_id}/search',
+            json={'query': '注册资本', 'categories': ['interview_record']}).json()
+        assert _ids(found) == {interview_id}
+        missed = http.post(
+            f'/api/projects/{project_id}/search',
+            json={'query': '注册资本', 'categories': ['articles']}).json()
+        assert interview_id not in _ids(missed) and other_id in _ids(missed)
+
+    tool_app = SimpleNamespace(state=SimpleNamespace(database=app.state.database, evidence=service))
+
+    def tool(name, arguments):
+        try:
+            result = _call_tool(tool_app, {'name': name, 'arguments': arguments})
+        except ToolFailure as exc:
+            return {'isError': True, 'content': [{'text': str(exc)}]}
+        if result.get('isError'):
+            return result
+        return json.loads(result['content'][0]['text'])
+
+    listed = tool('list_documents', {'project_id': project_id, 'categories': ['interview_record']})
+    assert {item['id'] for item in listed['documents']} == {interview_id}
+    assert listed['documents'][0]['category'] == 'interview_record'
+    hidden = tool('list_documents', {'project_id': project_id, 'categories': ['articles']})
+    assert interview_id not in {item['id'] for item in hidden['documents']}
+    searched = tool('search_evidence', {
+        'project_id': project_id, 'query': '注册资本', 'categories': ['interview_record']})
+    assert searched['status'] == 'candidates'
+    assert {row['document_id'] for row in searched['results']} == {interview_id}
+    not_interview = tool('search_evidence', {
+        'project_id': project_id, 'query': '注册资本', 'categories': ['articles']})
+    assert interview_id not in {row['document_id'] for row in not_interview['results']}
 
 
 def _chunk_signature(database, document_id):
