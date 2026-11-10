@@ -58,7 +58,8 @@ def test_list_projects_and_documents_include_identifiers_and_empty_lists(tmp_pat
             assert early['error']['message'] == '请先完成 initialize。'
             _initialize(session)
             names = [tool['name'] for tool in _result(session.call('tools/list', {}, 20))['tools']]
-            assert names == ['list_projects', 'list_documents', 'search_evidence']
+            assert names[:3] == ['list_projects', 'list_documents', 'search_evidence']
+            assert 'coverage_gaps' in names and 'read_evidence' in names
             assert _payload(session.call('tools/call', {'name': 'list_projects', 'arguments': {}}, 3)) == {'projects': []}
             with client(app) as http:
                 project_id = project(http)

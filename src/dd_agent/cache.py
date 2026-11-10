@@ -117,11 +117,13 @@ def _key_lock(key):
         return lock
 
 
-def _resolve(directory, subdir, kind, identity, compute, verify, runtime_descriptor=None):
+def _resolve(directory, subdir, kind, identity, compute, verify, runtime_descriptor=None, *, allow_compute=True):
     if directory is None:
         raise ValueError('缓存目录未指定，无法复用指纹／预检结果。')
     if runtime_descriptor is None:
-        # 无法绑定解释器／依赖版本时不作可信复用，直接完整校验。
+        # 无法绑定解释器／依赖版本时不作可信复用。只读查看不能因此去启动模型。
+        if not allow_compute:
+            return None
         verify = True
     key = _key({'kind': kind, **identity})
     manifest_revision = _key({'entries': identity.get('entries')})
@@ -138,6 +140,8 @@ def _resolve(directory, subdir, kind, identity, compute, verify, runtime_descrip
             entry = _read(path, key)
         if entry is not None:
             return hit(entry)
+    if not allow_compute:
+        return None
     count('cache.miss.' + kind)
     with _key_lock(key):
         if not verify:
@@ -155,11 +159,15 @@ def _resolve(directory, subdir, kind, identity, compute, verify, runtime_descrip
 
 
 def resolve_fingerprint(kind, runtime_descriptor, algorithm_tag, parameters, entries, compute,
-                        verify=False, directory=None):
-    """按种类／算法／参数／文件清单复用指纹；verify=True 强制完整复验。"""
+                        verify=False, directory=None, *, allow_compute=True):
+    """按种类／算法／参数／文件清单复用指纹；verify=True 强制完整复验。
+
+    allow_compute=False 时只接受已经完整校验过的缓存。未命中返回 None，不调用 compute。
+    """
     identity = dict(runtime=str(runtime_descriptor), algorithm=str(algorithm_tag),
                     parameters=parameters, entries=entries)
-    return _resolve(directory, 'fingerprints', kind, identity, compute, verify, runtime_descriptor)
+    return _resolve(directory, 'fingerprints', kind, identity, compute, verify, runtime_descriptor,
+                    allow_compute=allow_compute)
 
 
 def inspect_document(identity, sha256, parser_version, source, compute, verify=False, directory=None):

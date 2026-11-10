@@ -1,0 +1,17 @@
+{
+  "format": "rg04-manifest-v1",
+  "set": "development",
+  "synthetic": true,
+  "customer_data": false,
+  "note": "合成样例，只核对清单格式。不是冻结的客户开发集，也不能当作质量结果。",
+  "items": [
+    {
+      "item_id": "dev-synthetic-1",
+      "content_family": "synthetic-license-a",
+      "page": 1,
+      "kind": "printed",
+      "cases": ["exact", "cross_page"],
+      "field_ids": ["f001", "f012"]
+    }
+  ]
+}

@@ -1,19 +1,19 @@
 # 项目任务清单
 
-更新：2026-11-09。基线是默认分支 `b06c693`。MM-01 与 RG-06 已按确认规格实现到工程测试；本机与真实模型未验收。
+更新：2026-11-10。基线是默认分支 `938e662`。PC-ISO、PC-UI、PC-FMT 已在 PR #12 落地。RG-02、RG-03、RG-07 的仓库内部分和 RG-04 脚手架已有工程测试；本机与真实模型未验收。评测集和真实模型由用户在本机运行。RG-07 的教练 Bot Harness 冻结调用仍待对方确认。
 
 本文件只有下面这一张表。状态、顺序和依赖只改这张表，不再另开章节、阶段表或“下一步”列表。细节见 [spec.md](./spec.md)、[plan.md](./plan.md)、[project-center-spec.md](./project-center-spec.md)、[project-center-plan.md](./project-center-plan.md)、[project-center-test-design.md](./project-center-test-design.md)、[material-metadata-spec.md](./material-metadata-spec.md)、[material-metadata-test-design.md](./material-metadata-test-design.md)。回归数字和过程在 [tasks-history.md](./tasks-history.md)；那份说明**不是**任务清单，也不维护当前状态。
 
-读表顺序：待做、工程完成、本机验收待定、待核实、待确认、暂缓、放弃、移交、已完成。同一状态内看“顺序”。工程完成不等于客户整卷或真实模型质量验收。迁移文件到 `019_material_metadata.sql`，健康检查要求 schema 19。
+读表顺序：待做、工程完成、本机验收待定、待核实、待确认、暂缓、放弃、移交、已完成。同一状态内看“顺序”。工程完成不等于客户整卷或真实模型质量验收。迁移文件仍到 `019_material_metadata.sql`，健康检查要求 schema 19。本轮没有新迁移。
 
 | 顺序 | ID | 目标 | 状态 | 依赖 | 验收／证据 |
 | --- | --- | --- | --- | --- | --- |
-| 1 | PC-ISO | 共享库上补项目隔离回归：A／B 同名、相同内容，向量、关键词、混合、父块、缓存、补读、MCP 越界和异步任务 | 待做 | 无。2026-11-08 仍无实现授权 | [规格 C](./project-center-spec.md)、[TD-C](./project-center-test-design.md)。已正确行为直接作回归，不伪称先红 |
-| 2 | PC-UI | 项目列表到工作台、进度、检索、补读共用显式当前项目；无项目不搜索、不默认最新项目；切换、刷新和迟到响应不串项目 | 待做 | 无。与 PC-ISO 可并行。别名：显式当前项目、切换与旧响应 | [规格 A](./project-center-spec.md)、[TD-A](./project-center-test-design.md) |
-| 3 | RG-02 | 当前项目的覆盖缺口清单：未处理、失败、未知、空文本、待重建。别名 C-T02-b 覆盖部分 | 待做 | PC-UI | [RS-02](./spec.md)、[TD-D01](./project-center-test-design.md)。搜索摘要已有，不等于本项完成 |
-| 4 | RG-03 | 按证据标识或来源范围补读，并提供必填项目的 MCP 工具。别名 C-T02-b 补读部分 | 待做 | PC-UI。可与 RG-02 并行 | [RS-03](./spec.md)、[TD-D02](./project-center-test-design.md)、[TD-D03](./project-center-test-design.md)。单页和父块 HTTP 已有，不计入本项完成 |
-| 7 | RG-04 | 冻结开发／保留集并分开记录 OCR、召回、重排、来源和未知。至少 60 个可判读字段 | 待做 | 无。不阻塞 1–6。质量数字只来自真实模型运行 | [RS-04](./spec.md)、[B-Q](./spec.md#b-q-的首轮验收门槛)、[TD-D05](./project-center-test-design.md) |
-| 20 | RG-07 | 本仓库只做 MCP 对接验收：遍历、覆盖、检索、补读、拒绝跨项目。编排和报告不在此行 | 待做 | RG-02、RG-03；对方教学 Bot 冻结调用（仓库外） | [RS-07](./spec.md)。检索 MCP 已交付，见 MCP-SSE |
+| 1 | PC-ISO | 共享库上补项目隔离回归：A／B 同名、相同内容，向量、关键词、混合、父块、缓存、补读、MCP 越界和异步任务 | 工程完成、本机验收待定 | 无 | PR #12 提交 `aa974cd`。断言在 `testing/tests/test_project_isolation.py`。云端 `testing/run.py` 运行 `20261110-024545-0e8a9d`：573 项里 528 通过、29 失败、16 跳过。29 项失败都是缺少 Windows 视觉／OCR 工作进程，与本项无关。未做本机验收 |
+| 2 | PC-UI | 项目列表到工作台、进度、检索、补读共用显式当前项目；无项目不搜索、不默认最新项目；切换、刷新和迟到响应不串项目 | 工程完成、本机验收待定 | 无。与 PC-ISO 可并行。别名：显式当前项目、切换与旧响应 | PR #12 提交 `0d35914`。断言在 `testing/tests/test_project_ui.py`。同上运行 `20261110-024545-0e8a9d`（528 通过、29 失败、16 跳过）。未做本机浏览器验收 |
+| 3 | RG-02 | 当前项目的覆盖缺口清单：未处理、失败、未知、空文本、待重建。别名 C-T02-b 覆盖部分 | 工程完成、本机验收待定 | PC-UI | `GET /api/projects/{id}/coverage` 与工作台面板。断言在 `testing/tests/test_coverage_gaps.py`、`testing/scripts/frontend/coverage-gaps-regression.cjs`。同上运行 `20261110-024545-0e8a9d`（528 通过、29 失败、16 跳过）。未做本机验收。搜索摘要不算本项 |
+| 4 | RG-03 | 按证据标识或来源范围补读，并提供必填项目的 MCP 工具。别名 C-T02-b 补读部分 | 工程完成、本机验收待定 | PC-UI。可与 RG-02 并行 | 证据标识与来源范围 HTTP，以及 MCP `read_evidence`。断言在 `testing/tests/test_evidence_read.py`。同上运行 `20261110-024545-0e8a9d`（528 通过、29 失败、16 跳过）。单页和父块旧接口不计入本项。未做本机验收 |
+| 7 | RG-04 | 冻结开发／保留集并分开记录 OCR、召回、重排、来源和未知。至少 60 个可判读字段 | 工程完成、本机验收待定 | 无。不阻塞 1–6。质量数字只来自真实模型运行 | 只冻结清单、62 个空字段槽和报告脚本：`testing/quality/fixed_set/`、`testing/scripts/quality/run_fixed_set.py`。断言在 `testing/tests/test_fixed_set.py`。同上运行 `20261110-024545-0e8a9d`（528 通过、29 失败、16 跳过）。评测集和真实模型运行由用户在本机完成。仓库内没有质量数字，也没有客户数据 |
+| 20 | RG-07 | 本仓库只做 MCP 对接验收：遍历、覆盖、检索、补读、拒绝跨项目。编排和报告不在此行 | 工程完成、本机验收待定 | RG-02、RG-03；对方教学 Bot 冻结调用（仓库外） | 仓库内合成客户端：`testing/tests/test_mcp_acceptance.py`，说明见 [mcp-client.md](../../docs/mcp-client.md)。同上运行 `20261110-024545-0e8a9d`（528 通过、29 失败、16 跳过）。教练 Bot Harness 的冻结调用仍待对方确认，不在本仓库 |
 | 5 | MM-01 | 材料元数据：类别（默认表）、项目主体、日期／期间；单份与批量人工录入；列表与 MCP 投影。迁移 019。不含自动分类、可信度／管理字段；主体首批只改名不删除 | 工程完成、本机验收待定 | PC-UI | 云端 `testing/run.py` 运行 `20261109-142741-095200`：560 项里 515 通过、29 失败、16 跳过。29 项失败都是缺少 Windows 视觉／OCR 工作进程，与本项无关。未做本机或真实模型验收。规格见 [material-metadata-spec](./material-metadata-spec.md) |
 | 6 | RG-06 | 当前项目内材料多选、PDF 页范围、类别／主体／日期过滤（HTTP、页面、MCP）。字段间 AND、字段内 OR；未填维默认排除并给计数。别名：RG-06 其余。不含 RG-06a／b／c、不含固定集、不含 Office 定位过滤（设页范围时排除无页码单元） | 工程完成、本机验收待定 | PC-UI、MM-01 | 同上运行 `20261109-142741-095200`（515 通过、29 失败、16 跳过）。断言在 `testing/tests/test_material_metadata.py`。未做本机或真实模型验收。hybrid 已完成，见 RG-06c |
 | 7 | RG-05k | 核对渲染与 OCR 重叠是否已达到原定验收。2026-11-04 仍列为后续；代码有渲染计划与 OCR 等待，本轮未重跑 | 工程完成、本机验收待定 | RG-05b、RG-05e | 云端 `testing/run.py` 运行 `20261110-024435-d567af`：574 项里 538 通过、20 失败、16 跳过。20 项失败里 2 项是缺少 Windows 视觉／OCR 工作进程，18 项是 Linux 上 `test_model_runtime.py` 无法创建 Windows 作业对象（改动前同样失败）。未在本机核对 Windows 视觉与 OCR 工作进程。k1–k3 见 [plan 的 RG-05k](./plan.md#rg-05k统一图像产物与坐标)、`image_artifacts.py` |
@@ -23,7 +23,7 @@
 | 31 | OBS-02 | 保留历史 Harness 启动超时观察。本仓库不恢复 Harness 进程 | 待核实 | 无 | 若做 RG-07，只记客户端能否连上现有 MCP |
 | 32 | OBS-03 | GPU 上复测或排除调度等待。不靠加长测试等待关闭 | 待核实 | 无 | [历史说明](./tasks-history.md#obs) |
 | 33 | OBS-04 | 继续观察测试库初始化、连接和关闭等待 | 待核实 | 无 | 运行目录里的 database-lifecycle.jsonl，不入库长文 |
-| 10 | PC-FMT | 决定首批是否按 DOCX、再 XLSX、再 PPTX 解析。未确认不得实施，也不得改成已支持 | 待确认 | 无 | [规格 B](./project-center-spec.md)、[TD-B](./project-center-test-design.md)。建议顺序不是批准 |
+| 10 | PC-FMT | 首批按 DOCX、再 XLSX、再 PPTX 解析。用户已确认并实施 | 工程完成、本机验收待定 | 无 | PR #12 提交 `2e6c00b`、`8435bb8`。实现在 `src/dd_agent/office.py`，断言在 `testing/tests/test_office_formats.py`。同上运行 `20261110-024545-0e8a9d`（528 通过、29 失败、16 跳过）。未做本机验收 |
 | — | RG-05l3 | 清理预览。别名 l3 | 暂缓 | 无 | [plan 的 RG-05l](./plan.md#rg-05l可证明安全的回收)。不删除原件 |
 | — | RG-05l4 | 回收无引用缓存。别名 l4 | 暂缓 | 无 | 同上 |
 | — | JV-01 | 可选 Jev 重排：核实外发边界并冻结本地基线。不是入库加速 | 暂缓 | RG-04 | [Jev 实验](./plan.md#jev四组实验与融合算法) |
@@ -52,4 +52,4 @@
 | — | RG-06b | 父子索引发布、恢复和受控 shadow。默认 off | 已完成 | RG-06a | 限定工程与两页真实模型。不是客户整卷 |
 | — | RG-06c | 父块检索、补读和默认 mixed／hybrid。别名 c1、c2、c3、c4a、c4b、c4c | 已完成 | RG-06b | [历史说明](./tasks-history.md#rg-06c)、[README](../../README.md)。限定工程，不是整项 RG-06 |
 | — | MCP-SSE | 只读 MCP：列项目、列材料、检索。不上传、不 OCR | 已完成 | 无 | [README](../../README.md)。不是 RG-07 对接验收 |
-| — | PC-DOC | 项目中心规格、测试设计和方案 | 已完成 | 无 | PR #10。确认格式前不表示 PC-FMT 已批准 |
+| — | PC-DOC | 项目中心规格、测试设计和方案 | 已完成 | 无 | PR #10。格式实施见 PC-FMT |

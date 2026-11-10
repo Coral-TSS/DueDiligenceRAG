@@ -20,9 +20,12 @@ from starlette.routing import Route
 
 from .app import public_document
 from .config import Settings
+from .coverage_gaps import CoverageGaps
 from .db import Database
 from .db_connections import ConnectionProvider, DatabaseBusy
+from .evidence_read import EvidenceReader
 from .material_metadata import MetadataError, parse_filters
+from .page_queries import PageQueryError
 from .retrieval import EvidenceService, RetrievalError
 
 
@@ -82,6 +85,51 @@ TOOLS = (
                 'period_end': {'type': 'string', 'description': '可选。期间止日'},
             },
             'required': ['project_id', 'query'],
+            'additionalProperties': False,
+        },
+    },
+    {
+        'name': 'coverage_gaps',
+        'description': (
+            '列出指定项目的覆盖缺口：未处理、失败、未知、空文本、待重建。'
+            '必须提供 project_id，只返回该项目的计数和清单，不检索，也不启动 OCR。'
+            '各项计数口径不同，不能相加。空项目的 complete 为 false。'
+        ),
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'project_id': {'type': 'string', 'description': '项目 UUID'},
+                'kind': {'type': 'string', 'description': '可选。unprocessed、failed、unknown、empty_text、pending_rebuild'},
+                'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100, 'description': '可选。每批条数，默认 50'},
+                'cursor': {'type': 'string', 'description': '可选。上一批的 next_cursor'},
+            },
+            'required': ['project_id'],
+            'additionalProperties': False,
+        },
+    },
+    {
+        'name': 'read_evidence',
+        'description': (
+            '按证据标识，或按材料加来源范围，补读指定项目里的原文。必须提供 project_id。'
+            '有长度上限和续读位置。过期引用不会换成新正文。'
+            '其他项目的证据标识会拒绝，且不说明该标识是否存在。'
+        ),
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'project_id': {'type': 'string', 'description': '项目 UUID'},
+                'evidence_id': {'type': 'string', 'description': '证据 UUID。不要和 document_id 同时传'},
+                'document_id': {'type': 'string', 'description': '材料 UUID。与页范围或来源单元续读一起使用'},
+                'page_from': {'type': 'integer', 'minimum': 1, 'description': 'PDF 起页，须与 page_to 同时给出'},
+                'page_to': {'type': 'integer', 'minimum': 1, 'description': 'PDF 止页，含端点'},
+                'resume_page': {'type': 'integer', 'minimum': 1, 'description': '可选。从该页继续'},
+                'offset': {'type': 'integer', 'minimum': 0, 'description': '可选。当前页或当前单元内的字符偏移'},
+                'limit': {'type': 'integer', 'minimum': 1, 'maximum': 8000, 'description': '可选。本次最多返回的字符数，默认 4000'},
+                'source_revision': {'type': 'string', 'description': '可选。绑定起始页的来源版本，不一致则拒绝且不返回新正文'},
+                'resume_unit': {'type': 'string', 'description': '可选。没有物理页码时，从该来源单元继续（含本单元）'},
+                'index_version': {'type': 'string', 'description': '可选。证据上的索引版本，不一致则拒绝'},
+            },
+            'required': ['project_id'],
             'additionalProperties': False,
         },
     },
@@ -257,7 +305,11 @@ def _initialize(session, params):
         'protocolVersion': session['protocol'],
         'capabilities': {'tools': {'listChanged': False}},
         'serverInfo': dict(SERVER_INFO),
-        'instructions': '只读尽调证据服务。先 list_projects，再 list_documents，然后用 search_evidence 取片段。结果是候选证据，不是已核实事实。过滤后无命中不等于材料不存在。',
+        'instructions': (
+            '只读尽调证据服务。先 list_projects，再 list_documents。'
+            'coverage_gaps 查看当前项目的缺口，search_evidence 取候选片段，read_evidence 按证据标识或来源范围补读。'
+            '每次调用都要带 project_id。结果是候选证据，不是已核实事实。过滤后无命中不等于材料不存在。'
+        ),
     }
 
 
@@ -273,6 +325,14 @@ def _call_tool(app, params):
             arguments = _arguments(params, (
                 'project_id', 'categories', 'subject_ids', 'date_point', 'period_start', 'period_end'), ('project_id',))
             payload = _list_documents(app.state.database, _uuid(arguments['project_id'], '项目标识'), arguments)
+        elif name == 'coverage_gaps':
+            arguments = _arguments(params, ('project_id', 'kind', 'limit', 'cursor'), ('project_id',))
+            payload = _coverage(app, _uuid(arguments['project_id'], '项目标识'), arguments)
+        elif name == 'read_evidence':
+            arguments = _arguments(params, (
+                'project_id', 'evidence_id', 'document_id', 'page_from', 'page_to', 'resume_page',
+                'offset', 'limit', 'source_revision', 'resume_unit', 'index_version'), ('project_id',))
+            payload = _read(app, _uuid(arguments['project_id'], '项目标识'), arguments)
         else:
             arguments = _arguments(params, (
                 'project_id', 'query', 'document_id', 'document_ids', 'page_from', 'page_to',
@@ -280,7 +340,7 @@ def _call_tool(app, params):
             payload = _search(app.state.evidence, _uuid(arguments['project_id'], '项目标识'), arguments['query'], arguments)
     except ToolFailure:
         raise
-    except (RetrievalError, LookupError, ValueError) as exc:
+    except (RetrievalError, LookupError, ValueError, PageQueryError) as exc:
         raise ToolFailure(str(exc)) from None
     except DatabaseBusy:
         raise ToolFailure('数据库连接繁忙或暂不可用，请稍后重试。') from None
@@ -331,6 +391,44 @@ def _list_documents(database, project_id, arguments):
         # 与网页材料列表同一投影：去掉存储键，附上阅读进度和业务元数据，不读原件。
         documents.append({**public_document(row), 'reading': database.reading(row['id'])})
     return {'documents': documents}
+
+
+def _optional_int(arguments, name):
+    value = arguments.get(name)
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise ToolFailure(f'{name}须为整数。')
+    return value
+
+
+def _coverage(app, project_id, arguments):
+    if not app.state.database.project_exists(project_id):
+        raise ToolFailure('项目不存在。')
+    return CoverageGaps(app.state.database, app.state.evidence).page(
+        project_id, kind=arguments.get('kind'), limit=_optional_int(arguments, 'limit'),
+        cursor=arguments.get('cursor'))
+
+
+def _read(app, project_id, arguments):
+    evidence_id = arguments.get('evidence_id')
+    document_id = arguments.get('document_id')
+    if evidence_id and document_id:
+        raise ToolFailure('不能同时给出证据标识和材料范围。')
+    if not evidence_id and not document_id:
+        raise ToolFailure('需要证据标识，或材料标识与来源范围。')
+    reader = EvidenceReader(app.state.database, app.state.settings)
+    if evidence_id:
+        return reader.by_id(
+            project_id, _uuid(evidence_id, '证据标识'), offset=_optional_int(arguments, 'offset') or 0,
+            limit=_optional_int(arguments, 'limit'), index_version=arguments.get('index_version'))
+    resume_unit = arguments.get('resume_unit')
+    return reader.by_range(
+        project_id, _uuid(document_id, '材料标识'),
+        page_from=_optional_int(arguments, 'page_from'), page_to=_optional_int(arguments, 'page_to'),
+        resume_page=_optional_int(arguments, 'resume_page'), offset=_optional_int(arguments, 'offset') or 0,
+        limit=_optional_int(arguments, 'limit'), source_revision=arguments.get('source_revision'),
+        resume_unit=_uuid(resume_unit, '来源单元') if resume_unit else None)
 
 
 def _search(evidence, project_id, query, arguments):
