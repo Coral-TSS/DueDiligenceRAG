@@ -159,14 +159,18 @@ def test_preview_partial_stays_a_png_and_image_key_stays_under_the_data_dir(tmp_
     assert image_key_for(tmp_path, image) == 'readings/doc/rendered/page-1-x2-abc.png'
 
 
-def test_render_plan_reuses_ocr_images_and_still_renders_text_pages(tmp_path):
+def test_render_plan_reuses_ocr_images_and_defers_text_previews(tmp_path):
     ready = tmp_path / 'page-1.png'
     ready.write_bytes(b'png')
     exists = lambda number: number == 1 and ready.is_file()
     reuse, render = render_plan([1, 2, 3], {1: 'ocr', 2: 'text', 3: 'ocr'}, exists, False)
-    assert reuse == [1] and render == [2, 3]
+    assert reuse == [1] and render == [3]
+    reuse, render = render_plan([2], {2: 'text'}, lambda number: False, False, preview=True)
+    assert reuse == [] and render == [2]
     reuse, render = render_plan([2], {2: 'text'}, lambda number: True, True)
     assert reuse == [2] and render == []
+    reuse, render = render_plan([1], {1: 'ocr'}, lambda number: True, False, kinds={1: 'thumbnail'})
+    assert reuse == [] and render == [1]
 
 
 def test_inventory_lists_sizes_without_deleting(tmp_path):
