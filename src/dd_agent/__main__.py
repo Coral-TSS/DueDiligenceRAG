@@ -135,7 +135,8 @@ def dispatch(args, parser, settings, database):
             elif args.command=='import-file':
                 if not args.file or not args.project_id:parser.error('import-file 需要 --file 和 --project-id')
                 if not database.project_exists(args.project_id):raise ReadingError('项目不存在，请先在页面创建项目。')
-                storage=Storage(settings.data_dir,settings.max_upload_bytes)
+                from .legacy_office import soffice_status
+                storage=Storage(settings.data_dir,settings.max_upload_bytes,soffice_resolver=lambda: soffice_status(settings))
                 with args.file.open('rb') as stream:stored=storage.save(args.project_id,args.file.name,stream)
                 doc,duplicate=database.register(args.project_id,stored)
                 print(json.dumps({'document_id':str(doc['id']),'duplicate':duplicate,'status':doc['status']},ensure_ascii=False))

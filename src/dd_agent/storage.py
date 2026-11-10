@@ -33,9 +33,11 @@ def clean_filename(name):
 
 
 class Storage:
-    def __init__(self, root, limit):
+    def __init__(self, root, limit, soffice_resolver=None):
         self.root = _resolved_path(Path(root))
         self.limit = limit
+        # 只在登记旧版 Office 时询问 soffice 是否存在，不在这里启动转换。
+        self.soffice_resolver = soffice_resolver
 
     def save(self, project_id, filename, stream):
         # 流式写临时文件并计算摘要，避免一次把数百 MiB 文件读进 Python 内存。
@@ -58,7 +60,7 @@ class Storage:
                 os.fsync(output.fileno())
             filename = clean_filename(filename)
             from .office import classify_saved_file
-            office = classify_saved_file(filename, temporary)
+            office = classify_saved_file(filename, temporary, self.soffice_resolver)
             if office is not None:
                 status, reason = office
             elif size == 0:

@@ -184,7 +184,8 @@ def create_app(settings=None):
     app.state.automatic = AutomaticProcessor(settings, database=database)
     app.state.pipeline = ProcessingPipeline(settings, database=database)
     app.state.jobs = JobManager(settings, pipeline_factory=lambda: app.state.pipeline, database=database)
-    storage = Storage(settings.data_dir, settings.max_upload_bytes)
+    from .legacy_office import soffice_status
+    storage = Storage(settings.data_dir, settings.max_upload_bytes, soffice_resolver=lambda: soffice_status(settings))
     static = Path(__file__).parent / "static"
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]"])
     app.add_middleware(UploadRequestLimit, limit=settings.max_upload_bytes)
