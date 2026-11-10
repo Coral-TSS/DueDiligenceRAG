@@ -33,7 +33,12 @@ def test_inventory_and_dry_run_explain_every_item_and_delete_nothing(tmp_path):
     outside = tmp_path.parent / f'dda-outside-{tmp_path.name}.txt'
     outside.write_text('keep-me', encoding='utf-8')
     link = tmp_path / 'cache' / 'escape'
-    link.symlink_to(outside)
+    # 普通用户没有 SeCreateSymbolicLinkPrivilege 时，Windows 在这里抛出 WinError 1314。
+    # 建不成链接就只跳过 cache/escape；目录外的 '../outside.bin' 仍要判为逃逸。
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        link = None
     before = _snapshot(tmp_path)
     registry = [
         {'relative_path': 'cache/free.bin', 'bytes': 4, 'version': 'image-transform-v1',
@@ -53,7 +58,8 @@ def test_inventory_and_dry_run_explain_every_item_and_delete_nothing(tmp_path):
     assert reasons['cache/used.bin'].startswith('仍被引用')
     assert reasons['cache/leased.bin'] == REASON_LEASE
     assert reasons['notes.txt'] == REASON_UNREGISTERED
-    assert reasons['cache/escape'] == REASON_ESCAPE
+    if link is not None:
+        assert reasons['cache/escape'] == REASON_ESCAPE
     assert any(item['reason'] == REASON_ESCAPE and item['relative_path'] == '../outside.bin' for item in report['items'])
     assert report['deleted'] == [] and report['mode'] == 'dry-run'
     assert _snapshot(tmp_path) == before
