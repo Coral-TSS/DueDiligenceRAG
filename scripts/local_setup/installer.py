@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import locale
 import os
 import secrets
 import shutil
@@ -168,7 +169,7 @@ def execute(args, reporter: Reporter) -> int:
     _install_components(root, components, profile, commands, reporter)
     soffice = _libreoffice(args, root, reporter)
     source = _model_source(args, jobs, reporter)
-    _download_models(jobs, source, reporter)
+    _download_models(root, jobs, source, reporter)
     database, database_url = _database(args, root, database, reporter)
     fills = dict(conventional_fills(root, windows))
     if soffice:
@@ -203,9 +204,9 @@ def _probe_nvidia() -> tuple[str, tuple[int, int] | None, str]:
     if shutil.which("nvidia-smi") is None:
         return "", None, ""
     try:
-        completed = subprocess.run(
+        completed = _capture(
             ["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=30, check=False,
+            timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired):
         return "", None, "nvidia-smi 没有返回。按 CPU 安装；若实际有 NVIDIA 显卡，请加上 --device。"
@@ -310,9 +311,10 @@ def _bootstrap(python: Path, reporter: Reporter) -> None:
 
 def _pip_works(python: Path) -> bool:
     try:
-        completed = subprocess.run(
+        completed = _capture(
             [str(python), "-m", "pip", "--version"],
-            capture_output=True, text=True, timeout=60, check=False,
+            timeout=60,
+            env=_python_child_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -321,10 +323,10 @@ def _pip_works(python: Path) -> bool:
 
 def _probe_ok(python: Path, component: str, profile, reporter: Reporter) -> bool:
     try:
-        completed = subprocess.run(
+        completed = _capture(
             [str(python), "-c", probe_source(component)],
-            capture_output=True, text=True, timeout=180, check=False,
-            env={**os.environ, "PYTHONUTF8": "1"},
+            timeout=180,
+            env=_python_child_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -375,9 +377,7 @@ def _find_soffice() -> Path | None:
 
 def _soffice_version(path: Path) -> tuple[int, int] | None:
     try:
-        completed = subprocess.run(
-            [str(path), "--version"], capture_output=True, text=True, timeout=60, check=False,
-        )
+        completed = _capture([str(path), "--version"], timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return parse_soffice_version((completed.stdout or "") + "\n" + (completed.stderr or ""))
@@ -401,7 +401,7 @@ def _model_source(args, jobs: tuple[ModelJob, ...], reporter: Reporter) -> str:
     ))
 
 
-def _download_models(jobs: tuple[ModelJob, ...], source: str, reporter: Reporter) -> None:
+def _download_models(root: Path, jobs: tuple[ModelJob, ...], source: str, reporter: Reporter) -> None:
     if not jobs:
         return
     grouped = {"ocr": [], "vision": [], "retrieval": []}
@@ -574,9 +574,9 @@ def _compose_up(root: Path, env_path: Path, reporter: Reporter) -> None:
         root, reporter, timeout=300,
     )
     for _ in range(60):
-        completed = subprocess.run(
+        completed = _capture(
             ["docker", "inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}", POSTGRES_CONTAINER],
-            capture_output=True, text=True, timeout=30, check=False,
+            timeout=30,
         )
         status = (completed.stdout or "").strip()
         if status == "healthy":
@@ -589,10 +589,7 @@ def _compose_up(root: Path, env_path: Path, reporter: Reporter) -> None:
 
 
 def _assert_container_owner(reporter: Reporter) -> None:
-    completed = subprocess.run(
-        ["docker", "inspect", POSTGRES_CONTAINER],
-        capture_output=True, text=True, timeout=30, check=False,
-    )
+    completed = _capture(["docker", "inspect", POSTGRES_CONTAINER], timeout=30)
     if completed.returncode != 0:
         return
     try:
@@ -666,10 +663,9 @@ def _finish_database(root: Path, database: DatabasePlan, windows: bool, reporter
 
 
 def _app_command(python: Path, root: Path, command: str) -> tuple[int, str]:
-    completed = subprocess.run(
+    completed = _capture(
         [str(python), "-m", "dd_agent", command],
-        cwd=root, capture_output=True, text=True, timeout=300, check=False,
-        env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+        cwd=root, timeout=300, env=_python_child_env(),
     )
     output = "\n".join(part.strip() for part in (completed.stdout, completed.stderr) if part and part.strip())
     return completed.returncode, output
@@ -699,13 +695,61 @@ def _ask(choices: tuple[tuple[str, str], ...]) -> str:
     raise SetupError("没有得到有效选择。", "请用对应的命令行参数重新运行。")
 
 
+def _python_child_env() -> dict[str, str]:
+    # 让 Python 子进程尽量自己输出 UTF-8。venv、winget 等仍可能写出系统 ANSI，由 _decode_output 兜底。
+    return {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+
+
+def _output_encodings() -> tuple[str, ...]:
+    try:
+        preferred = locale.getpreferredencoding(False) or ""
+    except LookupError:
+        preferred = ""
+    names = ["utf-8", preferred, "gbk", "cp936"]
+    if os.name == "nt":
+        names.append("mbcs")
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        key = name.lower().replace("-", "").replace("_", "")
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(name)
+    return tuple(ordered)
+
+
+def _decode_output(payload: bytes | str | None) -> str:
+    # PYTHONUTF8=1 时 text=True 会按 UTF-8 解码。中文 Windows 上 venv、winget 的输出可能是 GBK，
+    # 首字节 0xD0 很常见。先取字节，UTF-8 失败再试系统编码和 GBK，并且不再抛 UnicodeDecodeError。
+    if not payload:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    for encoding in _output_encodings():
+        try:
+            return payload.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return payload.decode("utf-8", errors="replace")
+
+
+def _capture(argv, *, cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        list(argv), cwd=cwd, capture_output=True, timeout=timeout, check=False, env=env,
+    )
+    return subprocess.CompletedProcess(
+        completed.args,
+        completed.returncode,
+        _decode_output(completed.stdout),
+        _decode_output(completed.stderr),
+    )
+
+
 def _run(argv: tuple[str, ...], cwd: Path, reporter: Reporter, *, optional: bool = False, timeout: int | None = None) -> int:
     reporter.say("      " + " ".join(argv))
     try:
-        completed = subprocess.run(
-            list(argv), cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False,
-            env={**os.environ, "PYTHONUTF8": "1"},
-        )
+        completed = _capture(argv, cwd=cwd, timeout=timeout, env=_python_child_env())
     except subprocess.TimeoutExpired as exc:
         raise SetupError("命令超时：" + argv[0], "可以重新运行。已完成的步骤会跳过。") from exc
     except OSError as exc:
