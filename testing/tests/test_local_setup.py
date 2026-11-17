@@ -1,6 +1,7 @@
 """本地安装脚本的纯逻辑测试。不下载模型，不连接数据库，也不写仓库里的 .env。"""
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import local_setup.installer as installer
 from local_setup.fetch import download
 from local_setup.installer import main
 from local_setup.plan import (
@@ -484,3 +486,246 @@ def test_windows_entrypoint_mentions_python_312_and_installer():
     shell = (ROOT / "scripts" / "setup.sh").read_text(encoding="utf-8")
     assert "3.12" in shell and "apt" in shell and "-m local_setup" in shell
     assert json.dumps(parse_hf_tree([])) == "[]"
+
+
+def _gbk(text: str) -> bytes:
+    encoded = text.encode("gbk")
+    with pytest.raises(UnicodeDecodeError):
+        encoded.decode("utf-8")
+    return encoded
+
+
+def _reject_text_mode(**kwargs):
+    if kwargs.get("text") or kwargs.get("universal_newlines") or kwargs.get("encoding"):
+        raise UnicodeDecodeError("utf-8", b"\xd0", 0, 1, "invalid continuation byte")
+
+
+def _bytes_completed(argv, stdout: bytes, stderr: bytes = b"", code: int = 0, **kwargs):
+    _reject_text_mode(**kwargs)
+    return subprocess.CompletedProcess(list(argv), code, stdout, stderr)
+
+
+def test_execute_passes_root_into_model_download(tmp_path, monkeypatch, capsys):
+    # 当前 main 在 execute() 里调用 _download_models 时没有把 root 传进去，
+    # 第一个模型（PP-OCRv5_mobile_det）一进入下载就会 NameError。
+    (tmp_path / ".env.example").write_text(EXAMPLE, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    calls = {"fetch": [], "download": []}
+
+    def block_network(*_args, **_kwargs):
+        raise AssertionError("测试不应访问网络或下载模型")
+
+    def fake_fetch(url, opener=None):
+        calls["fetch"].append(url)
+        assert url.startswith("https://hf-mirror.com/api/models/PaddlePaddle/")
+        return [
+            {
+                "type": "file",
+                "path": "inference.pdiparams",
+                "size": MIN_WEIGHT_BYTES,
+                "lfs": {"oid": "sha256:aa", "size": MIN_WEIGHT_BYTES},
+            },
+            {"type": "file", "path": "inference.json", "size": 2},
+            {"type": "file", "path": "inference.yml", "size": 4},
+            {"type": "file", "path": "README.md", "size": 10},
+        ]
+
+    def fake_download(url, dest, size, sha256, opener=None):
+        calls["download"].append((url, Path(dest)))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"w" * (size or 1))
+        return "downloaded"
+
+    monkeypatch.setattr("local_setup.fetch.urlopen", block_network)
+    monkeypatch.setattr(installer, "fetch_json", fake_fetch)
+    monkeypatch.setattr(installer, "download", fake_download)
+    monkeypatch.setattr(installer, "_install_components", lambda *_args, **_kwargs: None)
+    argv = [
+        "--root", str(tmp_path), "--device", "cpu", "--non-interactive",
+        "--model-source", "hf-mirror", "--postgres", "skip", "--skip-database",
+        "--skip-libreoffice", "--skip-vision", "--skip-retrieval", "--skip-pdf",
+        "--no-mcp-key",
+    ]
+    assert installer.main(argv) == 0
+    first_out = capsys.readouterr().out
+    assert "PaddlePaddle/PP-OCRv5_mobile_det" in first_out
+    assert "keep-secret" not in first_out and "postgresql://" not in first_out
+    assert len(calls["fetch"]) == 4
+    assert len(calls["download"]) == 12
+    assert all(url.startswith("https://hf-mirror.com/") for url, _dest in calls["download"])
+    first_dest = calls["download"][0][1]
+    assert first_dest.parts[-2:] == ("PP-OCRv5_mobile_det", "inference.pdiparams")
+    model_dir = tmp_path / "models" / "ocr" / "official_models" / "PP-OCRv5_mobile_det"
+    assert assess_model(model_dir, "ocr").ok
+    checksum = tmp_path / ".local" / "setup" / "checksums" / "PaddlePaddle__PP-OCRv5_mobile_det.json"
+    assert checksum.is_file()
+    assert checksum.is_relative_to(tmp_path / ".local" / "setup" / "checksums")
+    saved = json.loads(checksum.read_text(encoding="utf-8"))
+    assert saved["inference.pdiparams"]["size"] >= MIN_WEIGHT_BYTES
+    assert not list((tmp_path / "models").rglob("*checksum*"))
+    assert not (model_dir / ".dda-checksums.json").exists()
+
+    assert installer.main(argv) == 0
+    second_out = capsys.readouterr().out
+    assert len(calls["fetch"]) == 4
+    assert len(calls["download"]) == 12
+    assert "已存在且通过校验，跳过" in second_out
+    assert "需要下载" not in second_out
+
+
+def test_decode_output_uses_utf8_then_gbk():
+    text = "虚拟环境"
+    raw = _gbk(text)
+    assert raw[0] == 0xD0
+    assert installer._decode_output(text.encode("utf-8")) == text
+    assert installer._decode_output(raw) == text
+    assert installer._decode_output(b"") == ""
+    assert installer._decode_output("已经是文本") == "已经是文本"
+    garbage = installer._decode_output(b"\xff\xfe")
+    assert isinstance(garbage, str)
+
+
+def test_run_prints_gbk_failure_tail(tmp_path, monkeypatch, capsys):
+    message = "虚拟环境创建失败"
+    stdout = "标准输出有说明".encode("gbk")
+    stderr = message.encode("gbk")
+    assert stderr[0] == 0xD0
+    # 标记写在子进程里，确认 PYTHONUTF8 / PYTHONIOENCODING 仍传给 Python 子进程。
+    child = (
+        "import os, sys\n"
+        f"sys.stdout.buffer.write({stdout!r})\n"
+        f"sys.stderr.buffer.write({stderr!r})\n"
+        "marker = os.environ.get('PYTHONUTF8', '') + '|' + os.environ.get('PYTHONIOENCODING', '')\n"
+        "sys.stderr.buffer.write(b'\\n' + marker.encode('ascii'))\n"
+        "raise SystemExit(4)\n"
+    )
+    monkeypatch.setenv("DDA_DATABASE_URL", "postgresql://dda:keep-secret-value@127.0.0.1:5432/dda")
+    reporter = installer.Reporter()
+    with pytest.raises(SetupError) as caught:
+        installer._run((sys.executable, "-c", child), tmp_path, reporter)
+    assert "退出码 4" in str(caught.value)
+    output = capsys.readouterr().out
+    assert message in output
+    assert "标准输出有说明" in output
+    assert "1|utf-8" in output
+    assert "keep-secret-value" not in output
+    assert "postgresql://" not in output
+
+    success = "已创建虚拟环境".encode("gbk")
+    code = installer._run(
+        (sys.executable, "-c", f"import sys; sys.stdout.buffer.write({success!r})"),
+        tmp_path, installer.Reporter(),
+    )
+    assert code == 0
+
+    garbage = "import sys; sys.stderr.buffer.write(b'\\xff\\xfe'); raise SystemExit(2)"
+    code = installer._run((sys.executable, "-c", garbage), tmp_path, installer.Reporter(), optional=True)
+    assert code == 2
+    trailed = capsys.readouterr().out
+    assert "UnicodeDecodeError" not in trailed
+
+
+def test_installer_helpers_decode_gbk_streams(tmp_path, monkeypatch, capsys):
+    seen = []
+    real_decode = installer._decode_output
+
+    def spy(payload):
+        text = real_decode(payload)
+        seen.append(text)
+        return text
+
+    monkeypatch.setattr(installer, "_decode_output", spy)
+    monkeypatch.setattr(installer.shutil, "which", lambda name: name if name == "nvidia-smi" else None)
+    gpu = _gbk("NVIDIA GeForce RTX 4070 笔记本, 8.9\n")
+    monkeypatch.setattr(
+        installer.subprocess, "run",
+        lambda argv, **kwargs: _bytes_completed(argv, gpu, **kwargs),
+    )
+    name, capability, note = installer._probe_nvidia()
+    assert name == "NVIDIA GeForce RTX 4070 笔记本"
+    assert capability == (8, 9) and note == ""
+    assert any("笔记本" in item for item in seen)
+
+    pip_out = _gbk("pip 25.0 来自虚拟环境\n")
+    pip_calls = []
+
+    def fake_pip(argv, **kwargs):
+        _reject_text_mode(**kwargs)
+        pip_calls.append(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(list(argv), 0, pip_out, b"")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_pip)
+    assert installer._pip_works(Path("python")) is True
+    assert pip_calls[0]["PYTHONUTF8"] == "1" and pip_calls[0]["PYTHONIOENCODING"] == "utf-8"
+    assert any("来自虚拟环境" in item for item in seen)
+
+    probe = _gbk("虚拟环境检查\n") + b'DDA_SETUP_PROBE {"dd_agent": true, "fastapi": true, "pytest": true, "psycopg": true}\n'
+    probe_calls = []
+
+    def fake_probe(argv, **kwargs):
+        _reject_text_mode(**kwargs)
+        probe_calls.append(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(list(argv), 0, probe, _gbk("探测标准错误"))
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_probe)
+    assert installer._probe_ok(Path("python"), "dev", select_profile("cpu"), installer.Reporter()) is True
+    assert probe_calls[0]["PYTHONUTF8"] == "1" and probe_calls[0]["PYTHONIOENCODING"] == "utf-8"
+    assert any("虚拟环境检查" in item for item in seen)
+    assert any("探测标准错误" in item for item in seen)
+
+    version = _gbk("LibreOffice 24.2.5.2 40(Build:2) 中文版\n")
+    monkeypatch.setattr(
+        installer.subprocess, "run",
+        lambda argv, **kwargs: _bytes_completed(argv, version, **kwargs),
+    )
+    assert installer._soffice_version(Path("soffice")) == (24, 2)
+    assert any("中文版" in item for item in seen)
+
+    failure = _gbk("数据库检查失败：扩展未安装")
+    app_calls = []
+
+    def fake_app(argv, **kwargs):
+        _reject_text_mode(**kwargs)
+        app_calls.append(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(list(argv), 1, b"", failure)
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_app)
+    code, output = installer._app_command(Path("python"), tmp_path, "check")
+    assert code == 1
+    assert "扩展未安装" in output
+    assert "postgresql://" not in output
+    assert app_calls[0]["PYTHONUTF8"] == "1" and app_calls[0]["PYTHONIOENCODING"] == "utf-8"
+
+    note = "项目数据库"
+    body = json.dumps(
+        [{"Config": {"Labels": {"com.dd-agent.setup": "1", "note": note}}}],
+        ensure_ascii=False,
+    ).encode("gbk")
+    monkeypatch.setattr(
+        installer.subprocess, "run",
+        lambda argv, **kwargs: _bytes_completed(argv, body, _gbk("检查容器"), **kwargs),
+    )
+    installer._assert_container_owner(installer.Reporter())
+    assert "复用已有的" in capsys.readouterr().out
+    assert any(note in item for item in seen)
+
+    def fake_compose(argv, **kwargs):
+        _reject_text_mode(**kwargs)
+        command = list(argv)
+        if command[:2] == ["docker", "compose"]:
+            return subprocess.CompletedProcess(command, 0, _gbk("已启动"), b"")
+        if command[:3] == ["docker", "inspect", "-f"]:
+            return subprocess.CompletedProcess(command, 0, b"healthy\n", _gbk("容器日志：正常"))
+        if command[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, b"", _gbk("没有这个容器"))
+        raise AssertionError(command)
+
+    def fail_sleep(*_args, **_kwargs):
+        raise AssertionError("容器应立即健康")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_compose)
+    monkeypatch.setattr(installer.time, "sleep", fail_sleep)
+    installer._compose_up(tmp_path, tmp_path / "postgres.env", installer.Reporter())
+    assert any("已启动" in item for item in seen)
+    assert any("容器日志：正常" in item for item in seen)
+    assert any("没有这个容器" in item for item in seen)
