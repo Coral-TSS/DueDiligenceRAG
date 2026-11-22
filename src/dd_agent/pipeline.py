@@ -345,9 +345,18 @@ class JobManager:
                     # 这一份失败就结束，不重试，也不要让队列里的其他材料一起失败。
                     self._save(job, 'failed', outcome, outcome.get('error_code') or 'legacy_unsupported')
                 else:
-                    self._save(job, 'partial' if outcome['failed_units'] else 'completed', outcome)
+                    state = outcome.get('outcome') or 'indexing_incomplete'
+                    if state == 'complete':
+                        job_status, error = 'completed', ''
+                    elif state == 'failed':
+                        job_status, error = 'failed', outcome.get('error_code') or 'embed_failed'
+                    else:
+                        # 空结果、图片未识别、向量未齐都不算完成。完成只留给向量已经齐的材料。
+                        job_status, error = 'partial', outcome.get('error_code') or ''
+                    self._save(job, job_status, outcome, error)
             except Exception:
-                self._save(job, 'failed', {}, 'local_processing_failed')
+                self._save(job, 'failed', {'outcome': 'failed'}, 'local_processing_failed')
+                self._clear_office_progress_reason(job)
             return
         from .stage_scheduler import StageScheduler
         scheduler=StageScheduler(self,job,pipeline)
@@ -365,6 +374,16 @@ class JobManager:
         finally:
             with self.database.connect() as conn:
                 conn.execute("UPDATE dd_agent.processing_jobs SET status='paused' WHERE id=%s AND run_epoch=%s AND status='pause_requested'",(job['id'],job['run_epoch']))
+
+    def _clear_office_progress_reason(self, job):
+        # 解析中途失败时，不要把「正在解析／正在识别」留成最终说明。
+        try:
+            with self.database.connect() as conn:
+                conn.execute('''UPDATE dd_agent.documents SET reason=%s
+                    WHERE project_id=%s AND id=%s AND status='registered' AND reason LIKE %s''',
+                    ('处理失败，不能视为已处理。', job['project_id'], job['document_id'], '正在%'))
+        except (psycopg.Error, OSError):
+            return
 
     def wake(self):
         with self._mutex:

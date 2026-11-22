@@ -14,6 +14,20 @@ const processingLabels = {
   queued: "排队中", running: "处理中", pause_requested: "正在暂停",
   paused: "已暂停", completed: "已处理", partial: "部分完成", failed: "处理失败",
 };
+// Office 的「已处理」只在正文、需要的图片识别和当前版本向量都完成时使用。PDF 仍走下面的页状态。
+const officeLabels = {
+  registered: "已登记 · 待解析", queued: "排队中", converting: "正在转换", parsing: "正在解析",
+  recognizing: "正在识别图片", indexing: "正在建立向量", paused: "已暂停",
+  image_failed: "图片未能识别", partial: "部分完成", empty: "未提取到内容",
+  indexing_incomplete: "向量尚未完成", complete: "已处理", failed: "处理失败",
+  unsupported: "暂不支持", invalid: "文件无效",
+};
+const officeTone = {
+  registered: "registered", queued: "queued", converting: "running", parsing: "running",
+  recognizing: "running", indexing: "running", paused: "paused", image_failed: "image_failed",
+  partial: "partial", empty: "empty", indexing_incomplete: "indexing_incomplete", complete: "complete",
+  failed: "failed", unsupported: "unsupported", invalid: "invalid",
+};
 const CATEGORIES = [
   ["incorporation", "公司的设立、变更"], ["organizational_docs", "公司的组织性文件"],
   ["shareholders", "股东及实际控制人"], ["outbound_investment", "对外股权投资"], ["business", "公司的业务"],
@@ -187,7 +201,11 @@ function renderMaterials() {
     const state = cell(""); const badge = document.createElement("span");
     const reason = document.createElement("small");
     const job = d.processing_status;
-    if (job && ["queued","running","pause_requested","paused","failed","partial"].includes(job)) {
+    if (d.office_outcome) {
+      badge.className = `badge ${officeTone[d.office_outcome] || d.office_outcome}`;
+      badge.textContent = officeLabels[d.office_outcome] || "状态待确认";
+      reason.textContent = d.reason || "";
+    } else if (job && ["queued","running","pause_requested","paused","failed","partial"].includes(job)) {
       badge.className = `badge ${job}`;
       badge.textContent = processingLabels[job] || job;
       reason.textContent = d.reading_version ? `已读取 ${d.page_count} 页。` : (d.reason || "");
