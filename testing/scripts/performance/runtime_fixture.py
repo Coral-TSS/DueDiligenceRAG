@@ -24,6 +24,9 @@ for line in sys.stdin:
     if action == 'bad_operation':head['operation']='wrong-operation'
     if action == 'bad_json':
         print('broken', flush=True); continue
-    emit(dict(head, event='record', value=dict(pid=os.getpid(), value=frame['payload'].get('value'))))
+    record=dict(pid=os.getpid(), value=frame['payload'].get('value'))
+    if action == 'env':
+        record['env']=dict(os.environ)
+    emit(dict(head, event='record', value=record))
     if action == 'incomplete': os._exit(0)
     emit(dict(head, event='done'))

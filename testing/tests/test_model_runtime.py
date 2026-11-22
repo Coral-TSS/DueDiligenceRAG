@@ -247,6 +247,165 @@ os._exit(0)
         process.stdout.close()
 
 
+_SECRET_KEYS = (
+    'DDA_DATABASE_URL', 'DATABASE_URL', 'HF_TOKEN', 'HUGGING_FACE_HUB_TOKEN',
+    'OPENAI_API_KEY', 'AWS_SECRET_ACCESS_KEY', 'AWS_ACCESS_KEY_ID',
+)
+_IDENTITY_KEYS = ('LOGNAME', 'USER', 'LNAME', 'USERNAME')
+# torch 2.11 cache_dir() 仅在 TORCHINDUCTOR_CACHE_DIR 未设置时调用 getpass.getuser()。
+_PWDLESS = r'''
+import builtins, os, sys
+real = builtins.__import__
+def blocked(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "pwd" or name.startswith("pwd."):
+        raise ModuleNotFoundError("No module named 'pwd'")
+    return real(name, globals, locals, fromlist, level)
+builtins.__import__ = blocked
+sys.modules.pop("pwd", None)
+
+def cache_dir():
+    path = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if path is None:
+        import getpass, re, tempfile
+        sanitized = re.sub(r'[\\/:*?"<>|]', "_", getpass.getuser())
+        path = os.path.join(tempfile.gettempdir(), "torchinductor_" + sanitized)
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = path
+    os.makedirs(path, exist_ok=True)
+    return path
+
+mode = sys.argv[1]
+if mode == "cache":
+    for key in ("LOGNAME", "USER", "LNAME", "USERNAME"):
+        os.environ.pop(key, None)
+    print(cache_dir())
+elif mode == "user":
+    import getpass
+    print(getpass.getuser())
+else:
+    raise SystemExit(2)
+'''
+
+
+def _hide_identity(monkeypatch):
+    for key in _IDENTITY_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv('TORCHINDUCTOR_CACHE_DIR', raising=False)
+
+
+def _plant_secrets(monkeypatch):
+    for key in _SECRET_KEYS:
+        monkeypatch.setenv(key, 'secret-value')
+
+
+def _pwdless(env, mode):
+    import subprocess
+    completed = subprocess.run([sys.executable, '-c', _PWDLESS, mode], env=env, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout.strip()
+
+
+class _StoppedWorker:
+    def __init__(self):
+        import io
+        self.stdout = io.StringIO('{"ok":true}\n')
+        self.stderr = io.StringIO('')
+        self.pid = 1
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        self.returncode = 0
+        return 0
+
+    def poll(self):
+        return 0
+
+    def kill(self):
+        self.returncode = -9
+
+
+def _oneshot_env(directory):
+    import dd_agent.reading as reading
+    captured = {}
+
+    def spy(args, **kwargs):
+        captured['env'] = kwargs['env']
+        return _StoppedWorker()
+
+    original = reading.subprocess.Popen
+    reading.subprocess.Popen = spy
+    try:
+        list(reading.worker_records(sys.executable, 'tokenizer_worker', {'texts': ['a']}, directory, timeout_seconds=5))
+    finally:
+        reading.subprocess.Popen = original
+    return captured['env']
+
+
+def _assert_no_secrets(env):
+    leaked = [key for key in _SECRET_KEYS if key in env]
+    assert leaked == []
+
+
+class _Owner:
+    """ProcessOwner 只在 Windows 上创建作业对象。环境回归不依赖那条监督路径。"""
+
+    def __init__(self, process):
+        self.process = process
+
+    def attach_actual(self, pid, ppid):
+        return None
+
+    def close(self):
+        return None
+
+
+def _resident_env(tmp_path, monkeypatch):
+    monkeypatch.setattr('dd_agent.model_runtime.ProcessOwner', _Owner)
+    broker, spec = runtime(tmp_path)
+    try:
+        return list(broker.infer(spec, 'echo', {'action': 'env'}, timeout=3))[0]['env']
+    finally:
+        broker.close()
+
+
+def test_worker_env_survives_windows_without_username_or_pwd(tmp_path, monkeypatch):
+    from dd_agent.model_runtime import worker_process_env
+    _hide_identity(monkeypatch)
+    _plant_secrets(monkeypatch)
+    oneshot = _oneshot_env(tmp_path / 'tokenizer')
+    assert oneshot == worker_process_env(tmp_path / 'tokenizer')
+    _assert_no_secrets(oneshot)
+    assert not any(key.upper() in _IDENTITY_KEYS for key in oneshot)
+    assert oneshot['HF_HUB_OFFLINE'] == '1' and oneshot['PYTHONUTF8'] == '1'
+    assert 'TRANSFORMERS_OFFLINE' not in oneshot
+    assert _pwdless(oneshot, 'cache') == oneshot['TORCHINDUCTOR_CACHE_DIR']
+    resident = _resident_env(tmp_path / 'runtime', monkeypatch)
+    # CPython 在缺少区域设置时会自己写入 LC_CTYPE，这不是父进程放进来的。
+    assert {key: value for key, value in resident.items() if key != 'LC_CTYPE'} == worker_process_env(
+        tmp_path / 'runtime', TRANSFORMERS_OFFLINE='1', DDA_WORKER_METRICS='0')
+    _assert_no_secrets(resident)
+    assert resident['TRANSFORMERS_OFFLINE'] == '1' and resident['HF_HUB_OFFLINE'] == '1'
+    assert _pwdless(resident, 'cache') == resident['TORCHINDUCTOR_CACHE_DIR']
+
+
+def test_worker_spawn_forwards_windows_username_without_secrets(tmp_path, monkeypatch):
+    from dd_agent.model_runtime import worker_process_env
+    _hide_identity(monkeypatch)
+    _plant_secrets(monkeypatch)
+    monkeypatch.setenv('USERNAME', 'alice')
+    oneshot = _oneshot_env(tmp_path / 'tokenizer')
+    assert oneshot['USERNAME'] == 'alice'
+    assert 'USER' not in oneshot and 'LOGNAME' not in oneshot and 'LNAME' not in oneshot
+    _assert_no_secrets(oneshot)
+    assert _pwdless(oneshot, 'user') == 'alice'
+    assert _pwdless(oneshot, 'cache') == oneshot['TORCHINDUCTOR_CACHE_DIR']
+    resident = _resident_env(tmp_path / 'runtime', monkeypatch)
+    assert {key: value for key, value in resident.items() if key != 'LC_CTYPE'} == worker_process_env(
+        tmp_path / 'runtime', TRANSFORMERS_OFFLINE='1', DDA_WORKER_METRICS='0')
+    assert resident['USERNAME'] == 'alice'
+    _assert_no_secrets(resident)
+    assert _pwdless(resident, 'user') == 'alice'
+
+
 def test_process_owner_rejects_forged_parent_claim(tmp_path):
     import os
     import subprocess

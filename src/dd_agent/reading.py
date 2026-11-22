@@ -89,9 +89,9 @@ def worker_records(python,worker,manifest,directory,timeout_seconds=1200):
     manifest_path=directory/(worker+'-'+uuid4().hex+'.json')
     manifest_path.write_text(json.dumps(manifest,ensure_ascii=False),encoding='utf-8')
     # 只传必要系统变量，不把主应用的数据库连接或模型服务凭据放进 worker 环境。
-    env={key:value for key,value in os.environ.items() if key.upper() in {'SYSTEMROOT','WINDIR','PATH','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC'}}
-    env.update(PYTHONUTF8='1',PYTHONIOENCODING='utf-8',HF_HUB_OFFLINE='1',PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True',PADDLE_PDX_CACHE_HOME=str(directory/'cache'),
-        PYTORCH_CUDA_ALLOC_CONF=os.environ.get('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True'))
+    # 分词 worker 与一次性检索 worker 走这里；常驻向量 worker 使用同一份环境构造。
+    from .model_runtime import worker_process_env
+    env=worker_process_env(directory)
     if active(): env['DDA_WORKER_METRICS'] = '1'
     script=Path(__file__).parent/'workers'/(worker+'.py')
     logs=split_log_paths(directory, worker)
