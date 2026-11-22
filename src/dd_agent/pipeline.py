@@ -127,6 +127,42 @@ class JobManager:
         if wake:self.wake()
         return row
 
+    def enqueue_many(self, project_id, category=None, wake=True):
+        """按项目或当前目录把尚未成功处理的已登记材料加入现有队列，只唤醒一次。"""
+        from .batch_processing import batch_enqueue_decision, batch_enqueue_report
+        from .material_metadata import validate_category
+        if not self.database.project_exists(project_id):
+            raise LookupError('项目不存在。')
+        if category is not None and category != '':
+            category = validate_category(category)
+        else:
+            category = None
+        counts = {'queued': 0, 'already_done': 0, 'already_active': 0, 'paused': 0, 'unsupported': 0, 'invalid': 0}
+        query = (
+            "SELECT d.id, d.status, "
+            "(SELECT j.status FROM dd_agent.processing_jobs j "
+            "WHERE j.document_id=d.id ORDER BY j.created_at DESC, j.id DESC LIMIT 1) AS job_status "
+            "FROM dd_agent.documents d "
+            "WHERE d.project_id=%s AND (%s::text IS NULL OR d.category=%s) "
+            "ORDER BY d.created_at, d.id"
+        )
+        with self.database.connect() as conn:
+            conn.execute('SELECT pg_advisory_xact_lock(74332104)')
+            rows = conn.execute(query, (project_id, category, category)).fetchall()
+            for row in rows:
+                decision = batch_enqueue_decision(row['status'], row['job_status'])
+                if decision != 'enqueue':
+                    counts[decision[len('skip_'):]] += 1
+                    continue
+                job = conn.execute(
+                    "INSERT INTO dd_agent.processing_jobs(id,project_id,document_id,status) VALUES (%s,%s,%s,'queued') RETURNING *",
+                    (uuid4(), project_id, row['id'])).fetchone()
+                self.stages.seed(job['id'], conn=conn)
+                counts['queued'] += 1
+        if wake and counts['queued']:
+            self.wake()
+        return batch_enqueue_report(counts, category)
+
     def latest(self, project_id, document_id):
         self._document(project_id, document_id)
         with self.database.connect() as conn:

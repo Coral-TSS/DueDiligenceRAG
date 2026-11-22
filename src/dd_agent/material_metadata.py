@@ -1,6 +1,7 @@
 """材料类别、项目主体和日期期间的校验，以及检索过滤的 SQL 片段。
 
-类别用规格里的固定表。第一版不推断类别。过滤片段只描述文档列和物理页码，
+类别是预先固定的尽调目录，不是用户自建文件夹，也不挂在主体下面。
+第一版不从文件名推断目录。过滤片段只描述文档列和物理页码，
 不读取 Office 定位里的幻灯片号或行号。
 """
 from dataclasses import dataclass
@@ -16,20 +17,21 @@ class MetadataError(ValueError):
 
 
 CATEGORIES = {
-    'uncategorized': '未分类',
-    'business_license': '营业执照',
-    'articles': '公司章程',
-    'shareholder_resolution': '股东会决议',
-    'board_resolution': '董事会决议',
-    'equity_structure': '股权结构／名册',
-    'audit_report': '审计报告',
-    'financial_statement': '财务报表',
-    'major_contract': '重大合同',
-    'litigation': '诉讼／仲裁文书',
-    'ip_certificate': '知识产权证书',
-    'regulatory_filing': '监管报送／批复',
-    'hr_labor': '劳动／人事材料',
-    'interview_record': '访谈记录',
+    'incorporation': '公司的设立、变更',
+    'organizational_docs': '公司的组织性文件',
+    'shareholders': '股东及实际控制人',
+    'outbound_investment': '对外股权投资',
+    'business': '公司的业务',
+    'major_contracts': '公司的重大合同',
+    'major_assets': '公司拥有或使用的主要资产',
+    'ip': '公司的知识产权',
+    'litigation_admin': '公司的诉讼、行政处罚',
+    'environmental': '公司的环境保护',
+    'product_quality': '公司的产品服务质量',
+    'labor_hr': '公司的劳动关系及人力资源',
+    'finance': '财务相关',
+    'attachments': '附件',
+    'subsidiary_aic': '子公司工商档案',
     'other': '其他',
 }
 
