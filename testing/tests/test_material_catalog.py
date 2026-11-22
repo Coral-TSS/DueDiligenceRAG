@@ -1,6 +1,8 @@
 """Bounded material enumeration for the future evidence MCP adapter."""
 from uuid import UUID, uuid4
 
+from dd_agent.material_metadata import CATEGORIES
+
 from test_workspace import application, client, project, upload, PDF
 
 
@@ -10,7 +12,7 @@ def test_material_catalog_paginates_with_current_metadata_and_no_cross_project_c
         p=project(c);other=project(c,'其他项目')
         empty=c.get(f'/api/projects/{p}/material-catalog')
         assert empty.status_code==200,empty.text
-        assert empty.json()=={'items':[],'next_cursor':None,'total_documents':0}
+        assert empty.json()=={'items':[],'next_cursor':None,'total_documents':0,'category_counts':{code:0 for code in CATEGORIES}}
         docs=[upload(c,p,f'材料{i}.pdf',PDF+str(i).encode()).json()['document'] for i in range(3)]
         foreign=upload(c,other).json()['document']
         app.state.database.set_reading(UUID(docs[0]['id']),649,'current-reading')

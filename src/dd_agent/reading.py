@@ -26,7 +26,11 @@ from .maintenance import LogPump, append_error, rotate_log, split_log_paths
 from .image_artifacts import (
     DISK_BYTES, INFLIGHT_PIXELS, SINGLE_IMAGE_PIXELS, ArtifactError, ArtifactLimitError,
     TRANSFORM_VERSION, GenerationLease, admit_image, assert_recognition_input, artifact_key,
-    dpi_for_scale, inspect_artifact, plan_pages, png_bytes, seal_rendered_png,
+    dpi_for_scale, inspect_artifact, plan_pages, png_bytes, seal_png, seal_rendered_png,
+)
+from .standalone_images import (
+    StandaloneImageError, image_kind_from_path, inspect_standalone_image, is_image_filename,
+    materialize_standalone_png,
 )
 
 
@@ -219,10 +223,17 @@ class Reader:
         project_id,document_id=UUID(str(project_id)),UUID(str(document_id))
         document=self.database.document(project_id,document_id)
         if document is None:raise ReadingError('材料不存在或不属于当前项目。')
-        if document['status']!='registered':raise ReadingError('材料不是可处理的 PDF，请检查登记状态。')
+        if document['status']!='registered':raise ReadingError('材料不是可处理的格式，请检查登记状态。')
         source=self.storage.path(document['storage_key'])
-        # 预检按材料身份＋原件摘要缓存；同一原件不再逐批遍历全卷。
-        profile=PdfWorker(self.settings).inspect(source,identity=str(document_id),sha256=document.get('sha256'))
+        if self._is_standalone_document(document, source):
+            # 独立图片不走 PDFium。预检失败仍按 1 页进入阅读，由读页阶段记下失败原因。
+            try:
+                profile=inspect_standalone_image(source)
+            except StandaloneImageError:
+                profile={'page_count':1,'pages':[{'page_number':1,'characters':0,'route':'ocr'}],'source_kind':'image'}
+        else:
+            # 预检按材料身份＋原件摘要缓存；同一原件不再逐批遍历全卷。
+            profile=PdfWorker(self.settings).inspect(source,identity=str(document_id),sha256=document.get('sha256'))
         # 阅读版本绑定基础 OCR 权重、渲染比例及是否强制 OCR。
         # 参数变了就选择新版本，不能把旧结果直接算作本次已完成；旧版本仍保留。
         version=PIPELINE_VERSION+'-'+ocr_fingerprint(self.settings)[:16]+f'-render{self.settings.pdf_render_scale:g}'+('-force-ocr' if force_ocr else '')
@@ -258,7 +269,9 @@ class Reader:
                 saved.add(record['page_number'])
                 if checkpoint:checkpoint('ocr' if method=='ocr' else 'reading',record['page_number'])
         routes={item['page_number']:item.get('route') for item in profile.get('pages') or [] if isinstance(item, dict)}
-        scale=self.settings.pdf_render_scale
+        image_doc=profile.get('source_kind')=='image' or self._is_standalone_document(document, source)
+        scale=1 if image_doc else self.settings.pdf_render_scale
+        engine='source' if image_doc else 'pdfium'
         stamp=document.get('sha256')
         def image_for(number):
             return stable_render_path(self.storage.root, document_id, number, scale, stamp)
@@ -339,7 +352,7 @@ class Reader:
             for number in render:
                 # 同一描述键同时只允许一个生成者。后来者拿到租约后复查，避免重复渲染。
                 key=artifact_key(source_sha256=stamp or 'nosha', page=number, kind='recognition',
-                    engine='pdfium', dpi=dpi_for_scale(scale), color='rgb', orientation=0, crop=None,
+                    engine=engine, dpi=dpi_for_scale(scale), color='rgb', orientation=0, crop=None,
                     transform_version=TRANSFORM_VERSION)
                 lease=GenerationLease(self.storage.root, key, owner)
                 lease.acquire()
@@ -357,38 +370,60 @@ class Reader:
                 render=[]
                 extract=[number for number in extract if routes.get(number)!='ocr' and not force_ocr]
             if extract:
-                pattern='page-{number}-x'+f'{scale:g}-'+(stamp or 'nosha')[:12]+'.png'
-                rendered=image_for(extract[0]).parent
-                manifest={'mode':'read','source':str(source),'pages':extract,'output_dir':str(rendered),
-                    'render_scale':scale,'image_pattern':pattern,'render_pages':render,
-                    'max_pixels':SINGLE_IMAGE_PIXELS,'max_inflight_pixels':INFLIGHT_PIXELS,
-                    'max_file_bytes':max(1, DISK_BYTES-used)}
-                with closing(worker_records(self.settings.pdf_python,'pdf_worker',manifest,directory)) as records:
+                if image_doc:
                     render_set=set(render)
-                    for page in records:
-                        number=page.get('page_number')
-                        if page.get('error_code') in {'image_budget_exceeded','disk_budget_exceeded'}:
-                            persist(page,'text')
-                        elif page.get('error_code'):
-                            persist(page,'text')
-                        elif number in render_set and page.get('image_path'):
-                            try:
-                                self._seal_recognition(page['image_path'], stamp, number, scale)
-                            except ArtifactLimitError:
-                                persist({'page_number':number,'error_code':'image_budget_exceeded'},'text')
-                                continue
-                            except ArtifactError:
-                                persist({'page_number':number,'error_code':'image_corrupt'},'text')
-                                continue
-                            if force_ocr or page.get('route')=='ocr':
-                                enqueued.add(number); incoming.put(page)
+                    for number in extract:
+                        if number not in render_set:
+                            persist({'page_number':number,'error_code':'image_corrupt'},'ocr')
+                            continue
+                        try:
+                            path=self._materialize_standalone_page(source, image_for(number), used=used, directory=directory)
+                            used=png_bytes(self.storage.root/'readings')
+                            self._seal_page(path, stamp, number, scale, standalone=True)
+                        except StandaloneImageError as exc:
+                            persist({'page_number':number,'error_code':exc.error_code},'ocr')
+                            continue
+                        except ArtifactLimitError:
+                            persist({'page_number':number,'error_code':'image_budget_exceeded'},'ocr')
+                            continue
+                        except (ArtifactError, OSError):
+                            persist({'page_number':number,'error_code':'image_corrupt'},'ocr')
+                            continue
+                        enqueued.add(number)
+                        incoming.put({'page_number':number,'route':'ocr','text':'','image_path':str(image_for(number))})
+                else:
+                    pattern='page-{number}-x'+f'{scale:g}-'+(stamp or 'nosha')[:12]+'.png'
+                    rendered=image_for(extract[0]).parent
+                    manifest={'mode':'read','source':str(source),'pages':extract,'output_dir':str(rendered),
+                        'render_scale':scale,'image_pattern':pattern,'render_pages':render,
+                        'max_pixels':SINGLE_IMAGE_PIXELS,'max_inflight_pixels':INFLIGHT_PIXELS,
+                        'max_file_bytes':max(1, DISK_BYTES-used)}
+                    with closing(worker_records(self.settings.pdf_python,'pdf_worker',manifest,directory)) as records:
+                        render_set=set(render)
+                        for page in records:
+                            number=page.get('page_number')
+                            if page.get('error_code') in {'image_budget_exceeded','disk_budget_exceeded'}:
+                                persist(page,'text')
+                            elif page.get('error_code'):
+                                persist(page,'text')
+                            elif number in render_set and page.get('image_path'):
+                                try:
+                                    self._seal_page(page['image_path'], stamp, number, scale, standalone=False)
+                                except ArtifactLimitError:
+                                    persist({'page_number':number,'error_code':'image_budget_exceeded'},'text')
+                                    continue
+                                except ArtifactError:
+                                    persist({'page_number':number,'error_code':'image_corrupt'},'text')
+                                    continue
+                                if force_ocr or page.get('route')=='ocr':
+                                    enqueued.add(number); incoming.put(page)
+                                else:
+                                    persist(page,'text')
                             else:
                                 persist(page,'text')
-                        else:
-                            persist(page,'text')
             for number in reuse:
                 try:
-                    self._seal_recognition(image_for(number), stamp, number, scale)
+                    self._seal_page(image_for(number), stamp, number, scale, standalone=image_doc)
                 except (ArtifactError, OSError):
                     persist({'page_number':number,'error_code':'image_corrupt'},'ocr')
                     continue
@@ -414,6 +449,56 @@ class Reader:
                 incoming.put(None)
                 worker.join()
         return {**self.database.reading(document_id),'skipped_pages':skipped}
+
+    def _is_standalone_document(self, document, source=None):
+        names=document.get('filenames') or []
+        if any(is_image_filename(name) for name in names):
+            return True
+        path=Path(source) if source is not None else self.storage.path(document['storage_key'])
+        try:
+            return image_kind_from_path(path) in {'jpeg','png'}
+        except OSError:
+            return False
+
+    def _seal_page(self, image_path, stamp, number, scale, standalone=False):
+        if standalone:
+            return self._seal_standalone(image_path, stamp, number)
+        return self._seal_recognition(image_path, stamp, number, scale)
+
+    def _seal_standalone(self, image_path, stamp, number):
+        path=Path(image_path)
+        report=inspect_artifact(path)
+        if report['state'] in {'missing','corrupt'}:
+            raise ArtifactError('图像缺失或损坏，不能登记。')
+        width,height=report['artifact_size']
+        file_bytes=path.stat().st_size
+        used=png_bytes(self.storage.root/'readings')
+        admit_image(width, height, single_limit=SINGLE_IMAGE_PIXELS, inflight=0,
+            inflight_limit=INFLIGHT_PIXELS, disk_used=max(0, used-file_bytes),
+            incoming_bytes=file_bytes, disk_limit=DISK_BYTES)
+        relative=image_key_for(self.storage.root, path)
+        descriptor=seal_png(path, source_sha256=stamp or 'nosha', page=number, kind='recognition',
+            engine='source', dpi=dpi_for_scale(1), color='rgb', orientation=0, crop=None,
+            source_size=(width, height), scale=1, relative_path=relative, root=self.storage.root)
+        return assert_recognition_input(descriptor)
+
+    def _materialize_standalone_page(self, source, target, *, used, directory):
+        max_file=max(1, DISK_BYTES-used)
+        try:
+            return materialize_standalone_png(source, target, max_pixels=SINGLE_IMAGE_PIXELS, max_file_bytes=max_file)
+        except StandaloneImageError as exc:
+            if exc.error_code!='image_converter_missing':
+                raise
+        pattern=Path(target).name.replace('page-1-', 'page-{number}-', 1)
+        records=list(worker_records(self.settings.pdf_python,'image_worker',{
+            'source':str(source),'output_dir':str(Path(target).parent),'image_pattern':pattern,
+            'max_pixels':SINGLE_IMAGE_PIXELS,'max_file_bytes':max_file}, directory))
+        if not records or records[0].get('error_code'):
+            raise StandaloneImageError((records[0].get('error_code') if records else 'image_corrupt') or 'image_corrupt',
+                                       '图片无法准备为识别页。')
+        if not records[0].get('image_path'):
+            raise StandaloneImageError('image_corrupt','图片无法准备为识别页。')
+        return records[0]['image_path']
 
     def _seal_recognition(self, image_path, stamp, number, scale):
         path=Path(image_path)
@@ -447,14 +532,16 @@ class Reader:
     def _render_single(self, document, document_id, page_number, kind):
         """按同一渲染参数补一张图。不调用 OCR。"""
         source=self.storage.path(document['storage_key'])
-        scale=self.settings.pdf_render_scale
+        standalone=self._is_standalone_document(document, source)
+        scale=1 if standalone else self.settings.pdf_render_scale
+        engine='source' if standalone else 'pdfium'
         stamp=document.get('sha256')
         target=stable_render_path(self.storage.root, document_id, page_number, scale, stamp)
         used=png_bytes(self.storage.root/'readings')
         if used>=DISK_BYTES:
             raise ReadingError('磁盘字节上限已超过，未降低画质。')
         key=artifact_key(source_sha256=stamp or 'nosha', page=page_number, kind=kind,
-            engine='pdfium', dpi=dpi_for_scale(scale), color='rgb', orientation=0, crop=None,
+            engine=engine, dpi=dpi_for_scale(scale), color='rgb', orientation=0, crop=None,
             transform_version=TRANSFORM_VERSION)
         directory=self.storage.root/'readings'/str(document_id)/uuid4().hex
         directory.mkdir(parents=True)
@@ -463,13 +550,21 @@ class Reader:
         with GenerationLease(self.storage.root, key, owner):
             if self._usable_image(target, kind):
                 if inspect_artifact(target)['state']=='unsealed':
-                    if kind=='recognition':
-                        self._seal_recognition(target, stamp, page_number, scale)
-                    else:
-                        seal_rendered_png(target, root=self.storage.root,
-                            relative_path=image_key_for(self.storage.root, target),
-                            source_sha256=stamp or 'nosha', page=page_number, kind=kind, scale=scale)
+                    self._seal_page(target, stamp, page_number, scale, standalone=standalone)
                 return image_key_for(self.storage.root, target)
+            if standalone:
+                try:
+                    path=self._materialize_standalone_page(source, target, used=used, directory=directory)
+                    self._seal_page(path, stamp, page_number, scale, standalone=True)
+                except StandaloneImageError as exc:
+                    if exc.error_code in {'image_budget_exceeded','disk_budget_exceeded'}:
+                        raise ReadingError('单图或磁盘上限已超过，未降低画质。') from exc
+                    raise ReadingError('页面预览无法生成。') from exc
+                except ArtifactLimitError as exc:
+                    raise ReadingError('单图或磁盘上限已超过，未降低画质。') from exc
+                except ArtifactError as exc:
+                    raise ReadingError('页面预览无法生成。') from exc
+                return image_key_for(self.storage.root, path)
             records=list(worker_records(self.settings.pdf_python,'pdf_worker',{
                 'mode':'read','source':str(source),'pages':[page_number],'output_dir':str(target.parent),
                 'render_scale':scale,'image_pattern':pattern,'render_pages':[page_number],
@@ -501,18 +596,14 @@ class Reader:
         if row is None or row['status']!='succeeded':
             raise ReadingError('该页尚无阅读结果。')
         kind='recognition' if row['method']=='ocr' else 'preview'
-        scale=self.settings.pdf_render_scale
+        standalone=self._is_standalone_document(document)
+        scale=1 if standalone else self.settings.pdf_render_scale
         stamp=document.get('sha256')
         current=self.storage.path(row['image_key']) if row.get('image_key') else stable_render_path(
             self.storage.root, document_id, page_number, scale, stamp)
         if row.get('image_key') and self._usable_image(current, kind):
             if inspect_artifact(current)['state']=='unsealed':
-                if kind=='recognition':
-                    self._seal_recognition(current, stamp, page_number, scale)
-                else:
-                    seal_rendered_png(current, root=self.storage.root,
-                        relative_path=image_key_for(self.storage.root, current),
-                        source_sha256=stamp or 'nosha', page=page_number, kind=kind, scale=scale)
+                self._seal_page(current, stamp, page_number, scale, standalone=standalone)
             return row['image_key']
         key=self._render_single(document, document_id, page_number, kind)
         saved=self.database.set_page_image(document_id, version['pipeline_version'], page_number, key)

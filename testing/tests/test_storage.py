@@ -53,3 +53,62 @@ def test_concurrent_blob_publication_preserves_bytes(tmp_path):
     assert len({r['storage_key'] for r in results}) == 1
     assert store.path(results[0]['storage_key']).read_bytes() == body
     assert not list((tmp_path / 'staging').glob('*.part'))
+
+
+def _png_bytes(width=1, height=1):
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
+
+    raw = b''.join(b'\x00' + b'\xff\x00\x00' * width for _ in range(height))
+    return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b'')
+
+
+def _jpeg_bytes():
+    from PIL import Image
+    from io import BytesIO
+    buffer = BytesIO()
+    Image.new('RGB', (4, 3), 'white').save(buffer, format='JPEG')
+    return buffer.getvalue()
+
+
+def test_storage_registers_jpeg_and_png(tmp_path):
+    store = Storage(tmp_path, 10_000_000)
+    jpeg = _jpeg_bytes()
+    png = _png_bytes()
+    saved_jpeg = store.save('project', '执照.JPG', io.BytesIO(jpeg))
+    saved_png = store.save('project', '扫描件.png', io.BytesIO(png))
+    assert saved_jpeg['status'] == 'registered' and saved_png['status'] == 'registered'
+    assert '仅登记 PDF' not in saved_jpeg['reason'] and '仅登记 PDF' not in saved_png['reason']
+    assert store.path(saved_jpeg['storage_key']).read_bytes() == jpeg
+    assert store.path(saved_png['storage_key']).read_bytes() == png
+
+
+def test_storage_rejects_image_header_mismatch(tmp_path):
+    store = Storage(tmp_path, 10_000_000)
+    jpeg_as_png = store.save('project', '假图.png', io.BytesIO(_jpeg_bytes()))
+    png_as_jpeg = store.save('project', '假图.jpeg', io.BytesIO(_png_bytes()))
+    text_as_jpg = store.save('project', '说明.jpg', io.BytesIO(b'hello'))
+    assert jpeg_as_png['status'] == 'invalid' and 'PNG' in jpeg_as_png['reason']
+    assert png_as_jpeg['status'] == 'invalid' and 'JPEG' in png_as_jpeg['reason']
+    assert text_as_jpg['status'] == 'invalid'
+    assert '仅登记 PDF' not in jpeg_as_png['reason']
+
+
+def test_storage_pdf_and_office_classification_unchanged(tmp_path):
+    store = Storage(tmp_path, 10_000_000)
+    pdf = store.save('project', '合同.pdf', io.BytesIO(b'%PDF-1.7 body'))
+    empty = store.save('project', 'empty.pdf', io.BytesIO(b''))
+    fake_pdf = store.save('project', 'fake.pdf', io.BytesIO(b'hello'))
+    text = store.save('project', '说明.txt', io.BytesIO(b'hello'))
+    broken_docx = store.save('project', '章程.docx', io.BytesIO(b'not-a-zip'))
+    assert pdf['status'] == 'registered'
+    assert empty['status'] == 'invalid' and '空' in empty['reason']
+    assert fake_pdf['status'] == 'invalid' and 'PDF' in fake_pdf['reason']
+    assert text['status'] == 'unsupported'
+    assert '当前阶段仅登记 PDF 供后续解析；此格式暂不支持处理。' not in text['reason']
+    assert 'JPG' in text['reason']
+    assert broken_docx['status'] == 'invalid'
+    assert 'Office' in broken_docx['reason'] or '压缩包' in broken_docx['reason']

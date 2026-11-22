@@ -52,8 +52,8 @@ class Storage:
                     size += len(block)
                     if size > self.limit:
                         raise UploadTooLarge()
-                    if len(head) < 5:
-                        head = (head + block)[:5]
+                    if len(head) < 16:
+                        head = (head + block)[:16]
                     digest.update(block)
                     output.write(block)
                 output.flush()
@@ -63,16 +63,10 @@ class Storage:
             office = classify_saved_file(filename, temporary, self.soffice_resolver)
             if office is not None:
                 status, reason = office
-            elif size == 0:
-                # 登记阶段只做空文件、扩展名和 PDF 头部筛查。
-                # 文件能否打开、是否加密、是否扫描件，由后续 PDF 预检确定。
-                status, reason = "invalid", "文件为空，请检查原件。"
-            elif not filename.lower().endswith(".pdf"):
-                status, reason = "unsupported", "当前阶段仅登记 PDF 供后续解析；此格式暂不支持处理。"
-            elif head != b"%PDF-":
-                status, reason = "invalid", "未识别到 PDF 文件头，请检查文件格式。"
             else:
-                status, reason = "registered", "已登记，待解析。尚未检查正文、加密或扫描状态。"
+                # 登记阶段只做空文件、扩展名和文件头筛查；不打开完整解码。
+                from .standalone_images import classify_non_office_file
+                status, reason = classify_non_office_file(filename, size, head)
             sha = digest.hexdigest()
             key = f"documents/{project_id}/{sha}.bin"
             target = self.path(key)

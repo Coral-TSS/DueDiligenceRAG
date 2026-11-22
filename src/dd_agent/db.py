@@ -13,7 +13,7 @@ import psycopg
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 from .db_connections import MeasuredCursor, open_connection
-from .material_metadata import MetadataError, metadata_sql, validate_name, validate_role
+from .material_metadata import CATEGORIES, MetadataError, metadata_sql, validate_category, validate_name, validate_role
 
 
 class Database:
@@ -58,7 +58,7 @@ class Database:
         try:
             with self.connect() as conn:
                 row = conn.execute("SELECT max(version) AS version FROM dd_agent.schema_version").fetchone()
-                if row["version"] != 20:
+                if row["version"] != 22:
                     return {"status": "needs_migration", "message": "数据库版本与应用不符，请检查迁移版本。"}
         except (psycopg.errors.UndefinedTable, psycopg.errors.InvalidSchemaName):
             return {"status": "needs_migration", "message": "数据库已连接，请先运行 python -m dd_agent init-db 初始化表。"}
@@ -155,6 +155,8 @@ class Database:
             rows=conn.execute('''SELECT d.id AS document_id,d.status,d.reason,d.byte_size,
                 d.category,d.subject_id,sub.name AS subject_name,d.date_kind,d.point_date,d.period_start,d.period_end,
                 r.page_count,r.pipeline_version AS reading_version,
+                (SELECT j.status FROM dd_agent.processing_jobs j
+                 WHERE j.document_id=d.id ORDER BY j.created_at DESC,j.id DESC LIMIT 1) AS processing_status,
                 ARRAY(SELECT s.filename FROM dd_agent.document_sources s
                       WHERE s.document_id=d.id ORDER BY s.first_seen_at,s.filename) AS filenames
                 FROM dd_agent.documents d LEFT JOIN dd_agent.document_readings r ON r.document_id=d.id
@@ -162,29 +164,65 @@ class Database:
                 WHERE d.project_id=%s AND (%s::uuid IS NULL OR d.id>%s::uuid)'''+clause+'''
                 ORDER BY d.id LIMIT %s''',(project_id,after,after,*meta_args,limit+1)).fetchall()
             items=rows[:limit]
+            counts=conn.execute(
+                'SELECT category, count(*)::int AS n FROM dd_agent.documents WHERE project_id=%s GROUP BY category',
+                (project_id,)).fetchall()
+            category_counts={code: 0 for code in CATEGORIES}
+            for row in counts:
+                if row['category'] in category_counts:
+                    category_counts[row['category']]=row['n']
             return dict(items=items,total_documents=total,
-                        next_cursor=str(items[-1]['document_id']) if len(rows)>limit else None)
+                        next_cursor=str(items[-1]['document_id']) if len(rows)>limit else None,
+                        category_counts=category_counts)
 
-    def register(self, project_id, stored):
+    def register(self, project_id, stored, category=None):
         # 项目＋内容摘要的唯一约束解决并发去重；不要先查“没有”再无条件插入。
+        # 目录只在首次登记时写入；内容重复的再次导入不改已有目录。
+        if category is None or category == '':
+            category = 'other'
+        else:
+            category = validate_category(category)
         with self.connect() as conn:
             row = conn.execute(
-                """INSERT INTO dd_agent.documents (id, project_id, sha256, byte_size, storage_key, status, reason)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """INSERT INTO dd_agent.documents (id, project_id, sha256, byte_size, storage_key, status, reason, category)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (project_id, sha256) DO NOTHING RETURNING *""",
-                (uuid4(), project_id, stored["sha256"], stored["byte_size"], stored["storage_key"], stored["status"], stored["reason"]),
+                (uuid4(), project_id, stored["sha256"], stored["byte_size"], stored["storage_key"], stored["status"], stored["reason"], category),
             ).fetchone()
             duplicate = row is None
             if duplicate:
                 row = conn.execute("SELECT * FROM dd_agent.documents WHERE project_id = %s AND sha256 = %s", (project_id, stored["sha256"])).fetchone()
-                # 先前只因当时找不到 soffice 而未支持。同一原件再次上传且现在可以转换时，改为待处理。
-                # 宏、密码和损坏的结论不含这句，不会被改回可解析。
-                if stored['status'] == 'registered' and row['status'] == 'unsupported' and '未找到 LibreOffice 的 soffice' in (row['reason'] or ''):
+                # 先前因找不到 soffice，或因当时只接受 PDF 而拒绝的图片，再次导入且现已可登记时，改为待处理。
+                # 宏、密码、损坏和文件头不符的结论不会被改回可解析；目录也不改。
+                from .standalone_images import can_upgrade_unsupported
+                if can_upgrade_unsupported(row['status'], row['reason'], stored['status']):
                     row = conn.execute('''UPDATE dd_agent.documents SET status=%s, reason=%s
                         WHERE project_id=%s AND id=%s RETURNING *''',
                         (stored['status'], stored['reason'], project_id, row['id'])).fetchone()
             conn.execute("INSERT INTO dd_agent.document_sources (document_id, filename) VALUES (%s, %s) ON CONFLICT DO NOTHING", (row["id"], stored["filename"]))
             return self._with_sources(conn, self._project_document(conn, project_id, row["id"])), duplicate
+
+    def list_legacy_unsupported_documents(self):
+        # 只列出旧版「仅登记 PDF／此格式暂不支持」的拒绝行，供启动时就地重分类。不改目录。
+        with self.connect() as conn:
+            return conn.execute("""SELECT d.id, d.project_id, d.status, d.reason, d.byte_size, d.storage_key,
+                ARRAY(SELECT s.filename FROM dd_agent.document_sources s
+                      WHERE s.document_id=d.id ORDER BY s.first_seen_at, s.filename) AS filenames
+                FROM dd_agent.documents d
+                WHERE d.status = 'unsupported'
+                  AND (d.reason LIKE %s OR d.reason LIKE %s)""",
+                ('%当前阶段仅登记 PDF%', '%此格式暂不支持处理%')).fetchall()
+
+    def apply_legacy_image_upgrade(self, document_id, status, reason):
+        # 只改 status／reason；目录、主体和日期保持原样。条件再收紧一次，避免误清其他结论。
+        if status != 'registered':
+            return None
+        with self.connect() as conn:
+            return conn.execute("""UPDATE dd_agent.documents SET status=%s, reason=%s
+                WHERE id=%s AND status='unsupported'
+                  AND (reason LIKE %s OR reason LIKE %s)
+                RETURNING id, status, reason, category, subject_id, date_kind, point_date, period_start, period_end""",
+                (status, reason, document_id, '%当前阶段仅登记 PDF%', '%此格式暂不支持处理%')).fetchone()
 
     def subjects(self, project_id):
         with self.connect() as conn:

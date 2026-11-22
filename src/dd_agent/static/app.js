@@ -1,21 +1,29 @@
 "use strict";
-// 材料工作区：项目切换、逐个上传、登记清单和原件下载，不直接执行模型推理。
+// 材料工作区：项目切换、按固定目录归集、逐个上传、登记清单和原件下载，不直接执行模型推理。
 // “全卷已读”来自基础阅读计数，不表示全部增强、向量化或法律审查已经完成。
 const $ = (id) => document.getElementById(id);
-let selected = null, projects = [], ready = false, uploading = false, generation = 0, limit = 0;
+let selected = null, projects = [], ready = false, uploading = false, processingBatch = false, generation = 0, limit = 0;
 // 材料清单按 material-catalog 分批读取：每批 50 份，续读用游标，避免一次取回整个项目。
 let materials = [], materialCursor = null, materialTotal = 0, loadingMaterials = false;
 let coverageItems = [], coverageCursor = null;
+let selectedFolder = "other";
+let folderCounts = {};
 const GAP_LABELS = {unprocessed: "未处理", failed: "失败", unknown: "未知", empty_text: "空文本", pending_rebuild: "待重建"};
 const statusLabels = {registered: "已登记 · 待解析", unsupported: "暂不支持", invalid: "文件无效"};
+const processingLabels = {
+  queued: "排队中", running: "处理中", pause_requested: "正在暂停",
+  paused: "已暂停", completed: "已处理", partial: "部分完成", failed: "处理失败",
+};
 const CATEGORIES = [
-  ["uncategorized", "未分类"], ["business_license", "营业执照"], ["articles", "公司章程"],
-  ["shareholder_resolution", "股东会决议"], ["board_resolution", "董事会决议"], ["equity_structure", "股权结构／名册"],
-  ["audit_report", "审计报告"], ["financial_statement", "财务报表"], ["major_contract", "重大合同"],
-  ["litigation", "诉讼／仲裁文书"], ["ip_certificate", "知识产权证书"], ["regulatory_filing", "监管报送／批复"],
-  ["hr_labor", "劳动／人事材料"], ["interview_record", "访谈记录"], ["other", "其他"],
+  ["incorporation", "公司的设立、变更"], ["organizational_docs", "公司的组织性文件"],
+  ["shareholders", "股东及实际控制人"], ["outbound_investment", "对外股权投资"], ["business", "公司的业务"],
+  ["major_contracts", "公司的重大合同"], ["major_assets", "公司拥有或使用的主要资产"], ["ip", "公司的知识产权"],
+  ["litigation_admin", "公司的诉讼、行政处罚"], ["environmental", "公司的环境保护"], ["product_quality", "公司的产品服务质量"],
+  ["labor_hr", "公司的劳动关系及人力资源"], ["finance", "财务相关"], ["attachments", "附件"],
+  ["subsidiary_aic", "子公司工商档案"], ["other", "其他"],
 ];
-const categoryLabel = code => CATEGORIES.find(item => item[0] === code)?.[1] || "未分类";
+const categoryLabel = code => CATEGORIES.find(item => item[0] === code)?.[1] || "其他";
+const ROLE_LABELS = {target:"目标公司",subsidiary:"子公司",shareholder:"股东",counterparty:"交易对手",other:"其他"};
 let subjectRows = [];
 let editingId = null;
 async function api(path, options = {}) {
@@ -37,8 +45,10 @@ function controls() {
   $("upload").textContent = uploading ? "正在逐个导入…" : "导入所选文件";
   $("create-subject").disabled = !ready || !selected || uploading;
   $("subject-name").disabled = !ready || !selected || uploading;
-  $("batch-apply").disabled = !ready || !selected || uploading;
   $("editor-save").disabled = !ready || !selected || uploading;
+  const canProcess = ready && selected && !uploading && !processingBatch;
+  if ($("process-folder")) $("process-folder").disabled = !canProcess;
+  if ($("process-all")) $("process-all").disabled = !canProcess;
   document.querySelectorAll(".project").forEach(b => { b.disabled = false; });
 }
 function renderProjects() {
@@ -47,7 +57,7 @@ function renderProjects() {
   for (const p of projects) {
     const b = document.createElement("button"); b.className = "project"; b.textContent = p.name;
     b.setAttribute("aria-current", String(p.id === selected));
-    b.onclick = () => selectProject(p.id); $("projects").append(b);
+    b.onclick = () => selectProject(p.id, {preferNonEmptyFolder: true}); $("projects").append(b);
   }
   controls();
 }
@@ -59,19 +69,19 @@ function rememberProject(id) {
   const link = $("search-link");
   if (link) link.href = id ? `/search?project=${id}` : "/search";
 }
-async function selectProject(id) {
+async function selectProject(id, {preferNonEmptyFolder = false} = {}) {
   selected = id; rememberProject(id); generation++; editingId = null; subjectRows = [];
   $("files").value = ""; $("upload-results").replaceChildren();
   $("editor-panel").hidden = true; $("subject-rename-form").hidden = true; $("subject-error").textContent = "";
   $("project-title").textContent = projects.find(p => p.id === id)?.name || "选择或创建一个项目";
-  renderProjects(); await loadMaterials({reset: true});
+  renderProjects(); await loadMaterials({reset: true, preferNonEmptyFolder});
 }
 function cell(text) { const td = document.createElement("td"); td.textContent = text; return td; }
 function size(bytes) { return bytes < 1024 ? `${bytes} B` : bytes < 1048576 ? `${(bytes / 1024).toFixed(1)} KiB` : `${(bytes / 1048576).toFixed(1)} MiB`; }
 function dateLabel(row) {
   if (row.date_kind === "point" && row.point_date) return row.point_date;
   if (row.date_kind === "period" && row.period_start) return `${row.period_start} 至 ${row.period_end}`;
-  return "未填写";
+  return "";
 }
 function fillSelect(id, pairs, blank) {
   const select = $(id);
@@ -83,71 +93,151 @@ function fillSelect(id, pairs, blank) {
     const option = document.createElement("option"); option.value = value; option.textContent = label; select.append(option);
   }
 }
+function folderHint() {
+  const name = categoryLabel(selectedFolder);
+  const help = $("upload-help");
+  if (!help) return;
+  const cap = size(limit || 0);
+  const base = limit ? `可多选；逐个导入，单个失败不会中断其他文件。单文件上限 ${cap}。` : "可多选；逐个导入，单个失败不会中断其他文件。";
+  help.textContent = selected ? `导入会归入当前目录「${name}」。${base}` : base;
+}
+function renderFolders() {
+  const nav = $("folder-list");
+  if (!nav) return;
+  nav.replaceChildren();
+  for (const [code, label] of CATEGORIES) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "folder";
+    button.setAttribute("aria-current", String(code === selectedFolder));
+    const name = document.createElement("span"); name.className = "folder-name"; name.textContent = label;
+    const count = document.createElement("span"); count.className = "folder-count";
+    const n = folderCounts[code] || 0;
+    count.textContent = String(n);
+    button.append(name, count);
+    button.setAttribute("aria-label", `${label}，${n} 份`);
+    button.onclick = () => selectFolder(code);
+    nav.append(button);
+  }
+}
+function selectFolder(code) {
+  if (code === selectedFolder) return;
+  selectedFolder = code;
+  renderFolders();
+  folderHint();
+  if (selected) loadMaterials({reset: true});
+}
+function moveSelect(row) {
+  const wrap = document.createElement("label");
+  wrap.className = "muted";
+  wrap.append("移动到 ");
+  const select = document.createElement("select");
+  select.className = "move-folder";
+  select.setAttribute("aria-label", `将 ${row.filenames[0]} 移动到目录`);
+  for (const [value, label] of CATEGORIES) {
+    const option = document.createElement("option"); option.value = value; option.textContent = label; select.append(option);
+  }
+  select.value = row.category || "other";
+  select.onchange = async () => {
+    if (!selected) return;
+    $("list-error").textContent = "";
+    try {
+      await api(`/api/projects/${selected}/documents/metadata`, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({document_ids: [row.document_id], category: {set: true, value: select.value}}),
+      });
+      await loadMaterials({reset: true});
+    } catch (error) {
+      $("list-error").textContent = error.message;
+      select.value = row.category || "other";
+    }
+  };
+  wrap.append(select);
+  return wrap;
+}
+function fileNameCell(row) {
+  const td = cell(row.filenames[0]);
+  if (row.filenames.length > 1) {
+    const extra = document.createElement("small");
+    extra.textContent = `其他来源：${row.filenames.slice(1).join("、")}`;
+    td.append(extra);
+  }
+  const bits = [row.subject_name, dateLabel(row)].filter(Boolean);
+  if (bits.length) {
+    const meta = document.createElement("small");
+    meta.className = "file-meta";
+    meta.textContent = bits.join(" · ");
+    td.append(meta);
+  }
+  return td;
+}
 function renderMaterials() {
   // 只重画已加载的批次；每项都是目录字段，不带正文。
   $("documents").replaceChildren();
-  $("document-count").textContent = materialTotal ? `已显示 ${materials.length} / ${materialTotal} 份材料` : "";
+  const folderName = categoryLabel(selectedFolder);
+  $("document-count").textContent = selected ? `「${folderName}」已显示 ${materials.length} / ${materialTotal} 份` : "";
   $("empty").hidden = materials.length > 0;
-  $("empty").textContent = "项目已创建，还没有材料。可以从上方导入原件，或创建主体。";
+  $("empty").textContent = selected
+    ? `「${folderName}」里还没有材料。导入时会归入当前目录。`
+    : "项目已创建，还没有材料。可以从上方导入原件。";
   $("documents-table").hidden = !materials.length;
-  $("batch-panel").hidden = !materials.length;
   $("more-materials").hidden = materialCursor === null;
   for (const d of materials) {
-    const row = document.createElement("tr"), name = cell(d.filenames[0]);
-    if (d.filenames.length > 1) { const extra = document.createElement("small"); extra.textContent = `其他来源：${d.filenames.slice(1).join("、")}`; name.append(extra); }
-    const pick = cell(""); const box = document.createElement("input");
-    box.type = "checkbox"; box.className = "pick-material"; box.value = d.document_id; box.checked = false;
-    pick.append(box);
-    const state = cell(""); const badge = document.createElement("span"); badge.className = `badge ${d.status}`;
+    const row = document.createElement("tr");
+    const state = cell(""); const badge = document.createElement("span");
     const reason = document.createElement("small");
-    if (d.reading_version) {
+    const job = d.processing_status;
+    if (job && ["queued","running","pause_requested","paused","failed","partial"].includes(job)) {
+      badge.className = `badge ${job}`;
+      badge.textContent = processingLabels[job] || job;
+      reason.textContent = d.reading_version ? `已读取 ${d.page_count} 页。` : (d.reason || "");
+    } else if (d.reading_version) {
       // page_count 是材料页数，不是成功页数；成功／失败数量请到识别结果页查看。
+      badge.className = "badge registered";
       badge.textContent = `已读取 · ${d.page_count} 页`;
       reason.textContent = "成功与失败页数以识别结果页为准。";
     } else {
-      badge.textContent = statusLabels[d.status] || d.status;
+      badge.className = `badge ${d.status}`;
+      badge.textContent = job === "completed" ? "已处理" : (statusLabels[d.status] || d.status);
       reason.textContent = d.reason || "";
     }
     state.append(badge, reason);
-    const download = cell(""); const link = document.createElement("a"); link.textContent = "下载"; link.href = `/api/projects/${selected}/documents/${d.document_id}/file`; link.setAttribute("aria-label", `下载 ${d.filenames[0]}`); download.append(link);
-    const readingLink = document.createElement("a"); readingLink.textContent = "自动处理与识别结果"; readingLink.href = `/reader?project=${selected}&document=${d.document_id}`; const readingRow = document.createElement("small"); readingRow.append(readingLink); download.append(readingRow);
+    const actions = document.createElement("td");
+    actions.className = "row-actions";
+    const link = document.createElement("a"); link.textContent = "下载"; link.href = `/api/projects/${selected}/documents/${d.document_id}/file`; link.setAttribute("aria-label", `下载 ${d.filenames[0]}`);
+    const readingLink = document.createElement("a"); readingLink.textContent = "识别结果"; readingLink.href = `/reader?project=${selected}&document=${d.document_id}`;
     const edit = document.createElement("button"); edit.type = "button"; edit.className = "secondary"; edit.textContent = "材料信息";
-    edit.onclick = () => openEditor(d); download.append(edit);
-    row.append(pick, name, cell(categoryLabel(d.category)), cell(d.subject_name || "未填写"), cell(dateLabel(d)), state, cell(size(d.byte_size)), cell(new Date(d.created_at).toLocaleString("zh-CN", {hour12:false})), download);
+    edit.onclick = () => openEditor(d);
+    actions.append(link, readingLink, edit, moveSelect(d));
+    row.append(fileNameCell(d), cell(categoryLabel(d.category)), state, cell(size(d.byte_size)), cell(new Date(d.created_at).toLocaleString("zh-CN", {hour12:false})), actions);
     $("documents").append(row);
   }
 }
 function subjectOptions() {
-  return subjectRows.map(row => [row.id, `${row.name}（${{target:"目标公司",subsidiary:"子公司",shareholder:"股东",counterparty:"交易对手",other:"其他"}[row.role] || "其他"}）`]);
+  return subjectRows.map(row => [row.id, `${row.name}（${ROLE_LABELS[row.role] || "其他"}）`]);
+}
+function syncSubjectTools() {
+  const selectedId = $("editor-subject") ? $("editor-subject").value : "";
+  const open = $("subject-rename-open");
+  const form = $("subject-rename-form");
+  if (open) open.hidden = !selectedId;
+  if (form && !selectedId) form.hidden = true;
 }
 function renderSubjects() {
-  $("subjects").replaceChildren();
-  if (!subjectRows.length) {
-    $("subject-status").textContent = "当前项目还没有主体。可以创建主体后再绑定材料。";
-    return;
-  }
-  $("subject-status").textContent = `本项目 ${subjectRows.length} 个主体。`;
-  for (const row of subjectRows) {
-    const item = document.createElement("li");
-    const rename = document.createElement("button"); rename.type = "button"; rename.className = "secondary"; rename.textContent = "改名";
-    rename.onclick = () => {
-      $("subject-rename-id").value = row.id; $("subject-rename-name").value = row.name; $("subject-rename-form").hidden = false;
-    };
-    item.textContent = `${row.name} · ${{target:"目标公司",subsidiary:"子公司",shareholder:"股东",counterparty:"交易对手",other:"其他"}[row.role] || "其他"} `;
-    item.append(rename); $("subjects").append(item);
-  }
-  fillSelect("editor-subject", subjectOptions(), "未填写");
-  fillSelect("batch-subject", subjectOptions(), "未填写");
+  const select = $("editor-subject");
+  const previous = select ? select.value : "";
+  fillSelect("editor-subject", subjectOptions(), "未指定");
+  if (select && (previous === "" || subjectRows.some(row => row.id === previous))) select.value = previous;
+  syncSubjectTools();
 }
 async function loadSubjects(project, token) {
-  $("subject-status").textContent = "正在读取主体…";
   $("subject-error").textContent = "";
   try {
     const rows = await api(`/api/projects/${project}/subjects`);
     if (token !== generation) return;
     subjectRows = rows; renderSubjects();
   } catch (error) {
-    if (token === generation) { $("subject-error").textContent = error.message; $("subject-status").textContent = "主体暂时无法读取。"; }
+    if (token === generation) $("subject-error").textContent = error.message;
   }
 }
 function openEditor(row) {
@@ -155,24 +245,17 @@ function openEditor(row) {
   $("editor-panel").hidden = false;
   $("editor-title").textContent = `材料信息 · ${row.filenames[0]}`;
   $("editor-error").textContent = "";
+  $("subject-error").textContent = "";
+  $("subject-rename-form").hidden = true;
   fillSelect("editor-category", CATEGORIES);
-  fillSelect("editor-subject", subjectOptions(), "未填写");
-  $("editor-category").value = row.category || "uncategorized";
+  fillSelect("editor-subject", subjectOptions(), "未指定");
+  $("editor-category").value = row.category || "other";
   $("editor-subject").value = row.subject_id || "";
   $("editor-date-kind").value = row.date_kind || "none";
   $("editor-point").value = row.point_date || "";
   $("editor-period-start").value = row.period_start || "";
   $("editor-period-end").value = row.period_end || "";
-}
-function checkedDocumentIds() {
-  const ids = [];
-  const walk = el => {
-    if (!el) return;
-    if (el.className === "pick-material" && el.checked && el.value) ids.push(el.value);
-    for (const child of el.children || []) walk(child);
-  };
-  walk($("documents"));
-  return ids;
+  syncSubjectTools();
 }
 function clearCoverage(message) {
   coverageItems = []; coverageCursor = null;
@@ -227,14 +310,26 @@ async function loadCoverage(project, token, cursor) {
     if (token === generation && error) error.textContent = errorValue.message;
   }
 }
-async function loadMaterials({reset = false} = {}) {
+
+function preferFolderWithMaterials() {
+  // 打开项目时，如果当前目录是空的、别的目录有材料，就先进入有材料的目录，避免看起来像“全部丢了”。
+  if ((folderCounts[selectedFolder] || 0) > 0) return false;
+  const found = CATEGORIES.find(([code]) => (folderCounts[code] || 0) > 0);
+  if (!found) return false;
+  selectedFolder = found[0];
+  return true;
+}
+
+async function loadMaterials({reset = false, preferNonEmptyFolder = false} = {}) {
   // 保存本次项目与请求代次，丢弃切换项目后才返回的旧响应。
   const current = selected, token = ++generation;
   if (!current) {
-    materials = []; materialCursor = null; materialTotal = 0;
+    materials = []; materialCursor = null; materialTotal = 0; folderCounts = {};
     $("empty").hidden = false; $("empty").textContent = "先创建项目，再将收集到的材料导入这里。";
-    $("documents-table").hidden = true; $("batch-panel").hidden = true; $("editor-panel").hidden = true;
+    $("documents-table").hidden = true; $("editor-panel").hidden = true;
     $("more-materials").hidden = true; $("document-count").textContent = "";
+    if ($("process-status")) $("process-status").textContent = "";
+    renderFolders(); folderHint();
     clearCoverage("先选择项目，再查看覆盖缺口。不按全库统计。");
     return;
   }
@@ -245,10 +340,16 @@ async function loadMaterials({reset = false} = {}) {
   try {
     const query = new URLSearchParams({limit: "50"});
     if (materialCursor) query.set("after", materialCursor);
+    if (selectedFolder) query.append("categories", selectedFolder);
     const data = await api(`/api/projects/${current}/material-catalog?${query}`);
     if (token !== generation) return;
     materials = materials.concat(data.items); materialCursor = data.next_cursor; materialTotal = data.total_documents;
-    renderMaterials();
+    if (data.category_counts) folderCounts = data.category_counts;
+    if (preferNonEmptyFolder && preferFolderWithMaterials()) {
+      renderFolders(); folderHint();
+      return loadMaterials({reset: true});
+    }
+    renderFolders(); renderMaterials(); folderHint();
     await loadSubjects(current, token);
   } catch (error) {
     if (token === generation) { $("list-error").textContent = error.message; $("empty").textContent = "材料暂时无法读取，请检查连接后重试。"; }
@@ -267,12 +368,13 @@ async function refresh() {
     $("health-title").textContent = ready ? "工作区已就绪" : "工作区需要配置";
     $("health-message").textContent = health.message;
     $("health-title").closest("section").classList.toggle("ready", ready);
-    $("upload-help").textContent = `可多选；逐个导入，单个失败不会中断其他文件。单文件上限 ${size(limit)}。`;
+    folderHint();
     if (ready) {
       projects = await api("/api/projects");
       const requested = new URLSearchParams(location.search).get("project");
-      selected = projects.some(p => p.id === requested) ? requested : null;
-      await selectProject(selected);
+      const fallback = projects[0] ? projects[0].id : null;
+      selected = projects.some(p => p.id === requested) ? requested : fallback;
+      await selectProject(selected, {preferNonEmptyFolder: true});
     }
   } catch (error) { ready = false; $("health-title").textContent = "暂时无法连接"; $("health-message").textContent = error.message; }
   finally { controls(); $("retry").disabled = false; }
@@ -289,7 +391,7 @@ $("project-form").onsubmit = async (event) => {
 $("files").onchange = controls;
 $("upload-form").onsubmit = async (event) => {
   event.preventDefault(); if (uploading || !selected) return;
-  const files = Array.from($("files").files), project = selected, token = generation;
+  const files = Array.from($("files").files), project = selected, token = generation, folder = selectedFolder;
   uploading = true; controls(); $("retry").disabled = true; $("upload-results").replaceChildren();
   try {
     for (let i = 0; i < files.length; i++) {
@@ -300,6 +402,7 @@ $("upload-form").onsubmit = async (event) => {
       try {
         if (file.size > limit) throw new Error(`超过 ${size(limit)} 上限，未上传。`);
         const data = new FormData(); data.append("file", file);
+        if (folder) data.append("category", folder);
         const result = await api(`/api/projects/${project}/documents`, {method:"POST", body:data});
         if (token !== generation) continue;
         line.textContent = `${file.name}：${result.duplicate ? "内容重复，已保留来源名" : statusLabels[result.document.status]}`;
@@ -311,11 +414,35 @@ $("upload-form").onsubmit = async (event) => {
     if (token === generation) await loadMaterials({reset: true});
   } finally { uploading = false; $("files").value = ""; controls(); $("retry").disabled = false; }
 };
+async function processBatch(scope) {
+  if (!selected || processingBatch) return;
+  processingBatch = true; controls();
+  const status = $("process-status");
+  if (status) status.textContent = scope === "folder" ? "正在将本目录已登记材料加入队列…" : "正在将全部已登记材料加入队列…";
+  $("list-error").textContent = "";
+  try {
+    const body = scope === "folder" ? {category: selectedFolder} : {};
+    const result = await api(`/api/projects/${selected}/processing`, {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+    });
+    if (status) status.textContent = result.message || `已加入队列 ${result.queued || 0} 份。`;
+    await loadMaterials({reset: true});
+  } catch (error) {
+    if (status) status.textContent = "";
+    $("list-error").textContent = error.message;
+  } finally {
+    processingBatch = false; controls();
+  }
+}
+$("process-folder").onclick = () => processBatch("folder");
+$("process-all").onclick = () => processBatch("all");
 $("retry").onclick = refresh;
 $("more-materials").onclick = () => loadMaterials();
 fillSelect("editor-category", CATEGORIES);
-fillSelect("batch-category", CATEGORIES);
+renderFolders();
+folderHint();
 $("editor-cancel").onclick = () => { $("editor-panel").hidden = true; editingId = null; };
+$("editor-subject").onchange = syncSubjectTools;
 $("editor-save").onclick = async () => {
   if (!selected || !editingId) return;
   const kind = $("editor-date-kind").value;
@@ -340,9 +467,20 @@ $("subject-form").onsubmit = async event => {
   event.preventDefault(); if (!selected) return;
   $("subject-error").textContent = "";
   try {
-    await api(`/api/projects/${selected}/subjects`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name:$("subject-name").value, role:$("subject-role").value})});
-    $("subject-name").value = ""; await loadSubjects(selected, generation);
+    const created = await api(`/api/projects/${selected}/subjects`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name:$("subject-name").value, role:$("subject-role").value})});
+    $("subject-name").value = "";
+    await loadSubjects(selected, generation);
+    if (created && created.id) $("editor-subject").value = created.id;
+    syncSubjectTools();
   } catch (error) { $("subject-error").textContent = error.message; }
+};
+$("subject-rename-open").onclick = () => {
+  const id = $("editor-subject").value;
+  if (!id) return;
+  const row = subjectRows.find(item => item.id === id);
+  $("subject-rename-id").value = id;
+  $("subject-rename-name").value = row ? row.name : "";
+  $("subject-rename-form").hidden = false;
 };
 $("subject-rename-form").onsubmit = async event => {
   event.preventDefault(); if (!selected) return;
@@ -350,24 +488,10 @@ $("subject-rename-form").onsubmit = async event => {
   $("subject-error").textContent = "";
   try {
     await api(`/api/projects/${selected}/subjects/${id}`, {method:"PATCH", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name:$("subject-rename-name").value})});
-    $("subject-rename-form").hidden = true; await loadSubjects(selected, generation);
+    $("subject-rename-form").hidden = true;
+    await loadSubjects(selected, generation);
+    $("editor-subject").value = id;
+    syncSubjectTools();
   } catch (error) { $("subject-error").textContent = error.message; }
-};
-$("batch-apply").onclick = async () => {
-  if (!selected) return;
-  const ids = checkedDocumentIds();
-  const body = {document_ids: ids};
-  if ($("batch-category-toggle").checked) body.category = {set: true, value: $("batch-category").value};
-  if ($("batch-subject-toggle").checked) body.subject = {set: true, value: $("batch-subject").value || null};
-  if ($("batch-date-toggle").checked) {
-    const kind = $("batch-date-kind").value;
-    body.date = {set: true, kind, point_date: kind === "point" ? $("batch-point").value || null : null, period_start: kind === "period" ? $("batch-period-start").value || null : null, period_end: kind === "period" ? $("batch-period-end").value || null : null};
-  }
-  $("batch-error").textContent = "";
-  if (!ids.length) { $("batch-error").textContent = "请先勾选材料。"; return; }
-  try {
-    await api(`/api/projects/${selected}/documents/metadata`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
-    await loadMaterials({reset: true});
-  } catch (error) { $("batch-error").textContent = error.message; }
 };
 controls(); refresh();

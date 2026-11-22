@@ -61,14 +61,14 @@ def test_parent_child_chunk_uses_the_reference_version_without_one_source_revisi
 
 def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_url):
     migrations = sorted(path.name for path in Path('src/dd_agent/migrations').glob('*.sql'))
-    assert migrations[-1].startswith('019_')
+    assert migrations[-1].startswith('022_')
     tool = next(item for item in TOOLS if item['name'] == 'list_subjects')
     assert tool['inputSchema']['required'] == ['project_id']
     assert tool['inputSchema']['additionalProperties'] is False
 
     app = application(tmp_path, database_url, migrate=True, limit=2_000_000)
     with app.state.database.connect() as conn:
-        assert conn.execute('SELECT max(version) AS version FROM dd_agent.schema_version').fetchone()['version'] == 19
+        assert conn.execute('SELECT max(version) AS version FROM dd_agent.schema_version').fetchone()['version'] == 22
     models = TinyModels()
     service = EvidenceService(
         Settings(database_url=database_url, data_dir=tmp_path, search_index_mode='page'),
@@ -90,10 +90,10 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
         office_id = office.json()['document']['id']
         assert http.patch(
             f'/api/projects/{project_id}/documents/{articles}/metadata',
-            json=_meta('articles', subject_id, 'point', '2023-06-01')).status_code == 200
+            json=_meta('organizational_docs', subject_id, 'point', '2023-06-01')).status_code == 200
         assert http.patch(
             f'/api/projects/{project_id}/documents/{office_id}/metadata',
-            json=_meta('financial_statement', subject_id, 'period', start='2023-01-01', end='2023-12-31')).status_code == 200
+            json=_meta('finance', subject_id, 'period', start='2023-01-01', end='2023-12-31')).status_code == 200
 
     database = app.state.database
     _index(database, service, project_id, articles, '注册资本章程甲。')
@@ -146,7 +146,7 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
 
             documents = _payload(session.call('tools/call', {'name': 'list_documents', 'arguments': {'project_id': project_id}}, 10))
             article_row = next(row for row in documents['documents'] if row['id'] == articles)
-            assert article_row['category'] == 'articles'
+            assert article_row['category'] == 'organizational_docs'
             assert article_row['subject_id'] == subject_id
             assert article_row['subject_name'] == '甲公司'
             assert article_row['date_kind'] == 'point' and article_row['point_date'] == '2023-06-01'
@@ -162,7 +162,7 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
             pdf = hits['注册资本章程甲。']
             _assert_old_hit(pdf, project_id, articles, '章程.pdf', 'page')
             assert pdf['page_number'] == 1
-            assert pdf['category'] == 'articles'
+            assert pdf['category'] == 'organizational_docs'
             assert pdf['subject_id'] == subject_id
             assert pdf['subject_name'] == '甲公司'
             assert pdf['subject_role'] == 'target'
@@ -176,7 +176,7 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
 
             plain_hit = hits['注册资本未填主体。']
             _assert_old_hit(plain_hit, project_id, plain, '未填.pdf', 'page')
-            assert plain_hit['category'] == 'uncategorized'
+            assert plain_hit['category'] == 'other'
             assert plain_hit['date_kind'] == 'none'
             assert plain_hit['subject_id'] is None
             assert plain_hit['subject_name'] is None
@@ -193,7 +193,7 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
 
             office_hit = hits['注册资本办公说明。']
             _assert_old_hit(office_hit, project_id, office_id, '说明.docx', 'source_unit')
-            assert office_hit['category'] == 'financial_statement'
+            assert office_hit['category'] == 'finance'
             assert office_hit['subject_id'] == subject_id
             assert office_hit['subject_name'] == '甲公司'
             assert office_hit['subject_role'] == 'target'
@@ -223,7 +223,7 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
             assert read['source_revision'] == revision
             assert read['locator']['kind'] == 'pdf' and read['locator']['page'] == 1
             assert read['locator_label'] == 'PDF 第 1 页'
-            _assert_material(read, 'articles', subject_id, '甲公司', 'target', 'point', '2023-06-01', None, None)
+            _assert_material(read, 'organizational_docs', subject_id, '甲公司', 'target', 'point', '2023-06-01', None, None)
 
             ranged = _payload(session.call('tools/call', {'name': 'read_evidence', 'arguments': {
                 'project_id': project_id, 'document_id': articles, 'page_from': 1, 'page_to': 1, 'limit': 4000}}, 13))
@@ -231,14 +231,14 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
             assert ranged['items'][0]['source_revision'] == revision
             assert ranged['items'][0]['page_number'] == 1
             assert 'category' not in ranged['items'][0]
-            _assert_material(ranged, 'articles', subject_id, '甲公司', 'target', 'point', '2023-06-01', None, None)
+            _assert_material(ranged, 'organizational_docs', subject_id, '甲公司', 'target', 'point', '2023-06-01', None, None)
 
             plain_read = _payload(session.call('tools/call', {'name': 'read_evidence', 'arguments': {
                 'project_id': project_id, 'evidence_id': plain_hit['chunk_id']}}, 14))
             assert plain_read['text'] == '注册资本未填主体。'
             assert plain_read['index_kind'] == 'page'
             assert plain_read['source_revision']
-            _assert_material(plain_read, 'uncategorized', None, None, None, 'none', None, None, None)
+            _assert_material(plain_read, 'other', None, None, None, 'none', None, None, None)
 
             office_read = _payload(session.call('tools/call', {'name': 'read_evidence', 'arguments': {
                 'project_id': project_id, 'evidence_id': office_hit['chunk_id']}}, 15))
@@ -248,13 +248,13 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
             assert office_read['locator']['kind'] == 'docx_paragraph'
             assert office_read['formula_state'] == ''
             assert 'PDF 第' not in office_read['locator_label']
-            _assert_material(office_read, 'financial_statement', subject_id, '甲公司', 'target', 'period', None, '2023-01-01', '2023-12-31')
+            _assert_material(office_read, 'finance', subject_id, '甲公司', 'target', 'period', None, '2023-01-01', '2023-12-31')
 
             office_range = _payload(session.call('tools/call', {'name': 'read_evidence', 'arguments': {
                 'project_id': project_id, 'document_id': office_id, 'limit': 4000}}, 16))
             assert any(item.get('unit_id') and item['locator']['kind'] == 'docx_paragraph' for item in office_range['items'])
             assert 'category' not in office_range['items'][0]
-            _assert_material(office_range, 'financial_statement', subject_id, '甲公司', 'target', 'period', None, '2023-01-01', '2023-12-31')
+            _assert_material(office_range, 'finance', subject_id, '甲公司', 'target', 'period', None, '2023-01-01', '2023-12-31')
             denied = session.call('tools/call', {'name': 'read_evidence', 'arguments': {
                 'project_id': other_id, 'evidence_id': pdf['chunk_id']}}, 17)
             assert denied['result']['isError'] is True
@@ -286,7 +286,7 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
             'project_id': project_id, 'evidence_id': hits['注册资本章程甲。']['chunk_id'], 'limit': 80}, 4)
         assert read['text'] == '注册资本章程甲。'
         assert read['source_revision'] == revision
-        _assert_material(read, 'articles', subject_id, '甲公司', 'target', 'point', '2023-06-01', None, None)
+        _assert_material(read, 'organizational_docs', subject_id, '甲公司', 'target', 'point', '2023-06-01', None, None)
 
 
 def _meta(category, subject, kind, point=None, start=None, end=None):

@@ -3,11 +3,12 @@
 // 片段、相关分数、机器文字状态与来源链接分别展示；相关性不能替代事实核实。
 const node = id => document.getElementById(id);
 const CATEGORIES = [
-  ["uncategorized", "未分类"], ["business_license", "营业执照"], ["articles", "公司章程"],
-  ["shareholder_resolution", "股东会决议"], ["board_resolution", "董事会决议"], ["equity_structure", "股权结构／名册"],
-  ["audit_report", "审计报告"], ["financial_statement", "财务报表"], ["major_contract", "重大合同"],
-  ["litigation", "诉讼／仲裁文书"], ["ip_certificate", "知识产权证书"], ["regulatory_filing", "监管报送／批复"],
-  ["hr_labor", "劳动／人事材料"], ["interview_record", "访谈记录"], ["other", "其他"],
+  ["incorporation", "公司的设立、变更"], ["organizational_docs", "公司的组织性文件"],
+  ["shareholders", "股东及实际控制人"], ["outbound_investment", "对外股权投资"], ["business", "公司的业务"],
+  ["major_contracts", "公司的重大合同"], ["major_assets", "公司拥有或使用的主要资产"], ["ip", "公司的知识产权"],
+  ["litigation_admin", "公司的诉讼、行政处罚"], ["environmental", "公司的环境保护"], ["product_quality", "公司的产品服务质量"],
+  ["labor_hr", "公司的劳动关系及人力资源"], ["finance", "财务相关"], ["attachments", "附件"],
+  ["subsidiary_aic", "子公司工商档案"], ["other", "其他"],
 ];
 function selectedBoxes(containerId) {
   const found = [];

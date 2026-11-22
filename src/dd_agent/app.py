@@ -10,7 +10,7 @@ from uuid import UUID
 from threading import Event
 import anyio
 
-from fastapi import FastAPI, HTTPException, Path as PathParam, Query, Request, UploadFile
+from fastapi import FastAPI, Form, HTTPException, Path as PathParam, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -119,6 +119,10 @@ class BatchMetadataInput(BaseModel):
     date: FlaggedDate | None = None
 
 
+class BatchProcessingInput(BaseModel):
+    category: str | None = None
+
+
 
 
 
@@ -166,7 +170,14 @@ def create_app(settings=None):
         # 关闭浏览器页面不会触发这里的退出，停止后端服务才会调用 jobs.close()。
         provider.start()
         try:
-            if app.state.database.health()['status']=='ready':app.state.jobs.wake()
+            if app.state.database.health()['status']=='ready':
+                # 把旧版「仅登记 PDF」而拒绝的 JPG／PNG 就地改为已登记；不入队，也不自动开始处理。
+                from .standalone_images import upgrade_legacy_unsupported_images
+                try:
+                    upgrade_legacy_unsupported_images(database, storage)
+                except (OSError, psycopg.Error):
+                    pass
+                app.state.jobs.wake()
             yield
         finally:
             app.state.jobs.close()
@@ -371,16 +382,21 @@ def create_app(settings=None):
         return {'documents': [public_document(row) for row in updated]}
 
     @app.post("/api/projects/{project_id}/documents")
-    def register(project_id: UUID, file: UploadFile):
+    def register(project_id: UUID, file: UploadFile, category: str | None = Form(default=None)):
         # 先落盘再登记元数据；Storage 不持有数据库，Database 不负责读取上传流。
+        # 可选目录只在首次登记时生效；重复内容不改已有目录。未传则归入「其他」。
         require_project(project_id)
+        if category is not None:
+            category = category.strip() or None
+        if category is not None:
+            category = validate_category(category)
         try:
             stored = storage.save(project_id, file.filename, file.file)
         except UploadTooLarge:
             raise HTTPException(413, "文件超过大小上限，请缩小文件或调整 DDA_MAX_UPLOAD_MB。") from None
         finally:
             file.file.close()
-        doc, duplicate = database.register(project_id, stored)
+        doc, duplicate = database.register(project_id, stored, category)
         return JSONResponse(jsonable_encoder({"document": public_document(doc), "duplicate": duplicate}), status_code=200 if duplicate else 201)
 
     @app.get("/api/projects/{project_id}/documents/{document_id}/file")
@@ -549,6 +565,15 @@ def create_app(settings=None):
         # latest() 返回数据库状态＋执行锁的派生判断；读取状态不强制继续任务。
         require_document(project_id, document_id)
         return app.state.jobs.latest(project_id, document_id)
+
+    @app.post('/api/projects/{project_id}/processing', status_code=202)
+    def process_project(project_id: UUID, body: BatchProcessingInput | None = None):
+        # 按项目或当前目录把已登记且尚未成功处理的材料加入同一队列，不在此请求内跑识别。
+        require_project(project_id)
+        category = None if body is None else body.category
+        if category is not None:
+            category = category.strip() or None
+        return app.state.jobs.enqueue_many(project_id, category=category)
 
     @app.post('/api/projects/{project_id}/documents/{document_id}/processing', status_code=202)
     def process_document(project_id: UUID, document_id: UUID):
