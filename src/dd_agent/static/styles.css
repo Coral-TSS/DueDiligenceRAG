@@ -59,7 +59,9 @@ td small{display:block;color:#75858c;font-size:11px;margin-top:4px}
 .badge{display:inline-block;border-radius:5px;padding:3px 7px;background:#edf2f6;color:#465c75;white-space:nowrap}
 .badge.invalid,.badge.unsupported,.badge.failed{background:#fff2df;color:#8f651b}
 .badge.queued,.badge.running,.badge.pause_requested{background:#e7eef8;color:#2c4a74}
-.badge.paused,.badge.partial{background:#f3efe4;color:#6a5a2b}
+.badge.paused,.badge.partial,.badge.empty,.badge.indexing_incomplete{background:#f3efe4;color:#6a5a2b}
+.badge.image_failed{background:#fff2df;color:#8f651b}
+.badge.complete{background:#e7f2ea;color:#1d6b3a}
 a{color:#24645c;text-underline-offset:3px}
 .upload-result{padding:6px 10px;font-size:12px;border-left:2px solid #b5d3c7;margin:7px 0;background:#f7faf8;overflow-wrap:anywhere}
 .upload-result.failed{border-color:#dfaaa4;color:#9b3730}

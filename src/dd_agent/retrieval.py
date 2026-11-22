@@ -267,6 +267,7 @@ class EvidenceService:
         self.database = database if database is not None else Database(self.settings.database_url)
         self.models = models or LocalModels(self.settings)
         self.model_results = ModelResults()
+        self.image_recognizer = None
 
     def version(self):
         # 索引版本由“分块规则＋Embedding 指纹”组成，不是任务进度或上传时间。
@@ -537,7 +538,7 @@ class EvidenceService:
         return response
 
     def index_office(self, project_id, document_id):
-        return self._office().index(project_id, document_id)
+        return self._office().index(project_id, document_id, image_recognizer=self.image_recognizer)
 
     def _office(self):
         from .office import OfficeIndex

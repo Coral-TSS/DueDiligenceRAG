@@ -319,7 +319,12 @@ def create_app(settings=None):
         try:
             scope = parse_filters(purpose='list', categories=categories, subject_ids=subject_ids,
                                   date_point=date_point, period_start=period_start, period_end=period_end)
-            return MaterialCatalog(database,project_id).list_materials(limit,after,scope)
+            catalog = MaterialCatalog(database,project_id).list_materials(limit,after,scope)
+            from .coverage_gaps import index_versions
+            from .office import annotate_office_outcomes
+            _page_version, office_version = index_versions(app.state.evidence)
+            catalog['items'] = annotate_office_outcomes(database, catalog['items'], office_version)
+            return catalog
         except LookupError as exc:
             raise HTTPException(404,str(exc)) from None
 

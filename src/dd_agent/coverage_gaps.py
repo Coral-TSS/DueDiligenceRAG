@@ -166,9 +166,9 @@ def index_versions(evidence):
     profile = cached() if cached is not None else models.profile()
     if not profile:
         return None, None
+    from .office import office_version
     page = hashlib.sha256((CHUNK_VERSION + profile).encode()).hexdigest()
-    office = hashlib.sha256(('office-unit-v1' + profile).encode()).hexdigest()
-    return page, office
+    return page, office_version(profile)
 
 
 def _cursor(value):
