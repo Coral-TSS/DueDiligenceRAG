@@ -24,6 +24,29 @@ from .model_admission import FairAdmission, AdmissionError, current_control
 from .maintenance import LogPump, append_error, rotate_log
 
 LIGHT_KINDS = {'embedding', 'reranker'}
+# getpass.getuser() 依次读取这四个变量，都没有时才 import Unix 的 pwd。
+# Windows 没有 pwd。worker 环境若丢掉 USERNAME，导入 transformers 会在 torch inductor 缓存路径处失败。
+_IDENTITY_ENV = {'USER', 'USERNAME', 'LOGNAME', 'LNAME'}
+_WORKER_ENV_KEYS = {
+    'SYSTEMROOT', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'COMSPEC',
+} | _IDENTITY_ENV
+
+
+def worker_process_env(directory, **extra):
+    """构造模型／分词 worker 的环境。
+
+    只保留启动解释器和 Windows 所需的系统变量，并转发 getpass 的身份变量。
+    TORCHINDUCTOR_CACHE_DIR 固定在该 worker 目录下，torch 2.11 的 cache_dir()
+    因此不必调用 getuser()。不复制数据库连接或 API 密钥。
+    """
+    directory = Path(directory)
+    env = {key: value for key, value in os.environ.items() if key.upper() in _WORKER_ENV_KEYS}
+    env.update(PYTHONUTF8='1', PYTHONIOENCODING='utf-8', HF_HUB_OFFLINE='1',
+        PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True', PADDLE_PDX_CACHE_HOME=str(directory / 'cache'),
+        PYTORCH_CUDA_ALLOC_CONF=os.environ.get('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True'),
+        TORCHINDUCTOR_CACHE_DIR=str((directory / 'torchinductor').resolve()))
+    env.update(extra)
+    return env
 
 
 def residence_action(kind, *, resident_kind, partner_kind, resident_same, partner_same):
@@ -231,10 +254,7 @@ class ModelRuntime:
             log_path=self.directory/'model-runtime.log'
             if self.resident is None and self.partner is None:
                 rotate_log(log_path)
-            env={k:v for k,v in os.environ.items() if k.upper() in {'SYSTEMROOT','WINDIR','PATH','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC'}}
-            env.update(PYTHONUTF8='1',PYTHONIOENCODING='utf-8',HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',
-                PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True',PADDLE_PDX_CACHE_HOME=str(self.directory/'cache'),DDA_WORKER_METRICS='0',
-                PYTORCH_CUDA_ALLOC_CONF=os.environ.get('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True'))
+            env=worker_process_env(self.directory, TRANSFORMERS_OFFLINE='1', DDA_WORKER_METRICS='0')
             nonce=uuid4().hex
             process=subprocess.Popen([str(spec.python),str(spec.script),'--serve',nonce],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
             pump=LogPump(process.stderr, log_path)
