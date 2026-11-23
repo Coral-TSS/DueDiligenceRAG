@@ -33,12 +33,20 @@ Linux / macOS 在仓库根目录执行同样的四条命令，把 `Scripts\pytho
 ```powershell
 $env:EVAL_LLM_API_KEY="只留在本机会话里的密钥"
 $env:EVAL_LLM_BASE_URL="https://api.deepseek.com"
-$env:EVAL_LLM_MODEL="deepseek-chat"
+$env:EVAL_LLM_MODEL="deepseek-flash"
 ```
 
-未设置 `EVAL_LLM_API_KEY` 时回退到 `OPENAI_API_KEY`。未设置 `EVAL_LLM_BASE_URL` 时回退到 `OPENAI_BASE_URL`。只使用 OpenAI 时，设置 `OPENAI_API_KEY` 即可。未设置 `EVAL_LLM_MODEL` 时，接口地址里包含 `deepseek` 则用 `deepseek-chat`，否则用 `gpt-4o-mini`。
+未设置 `EVAL_LLM_API_KEY` 时回退到 `OPENAI_API_KEY`。未设置 `EVAL_LLM_BASE_URL` 时回退到 `OPENAI_BASE_URL`。只使用 OpenAI 时，设置 `OPENAI_API_KEY` 即可。未设置 `EVAL_LLM_MODEL` 时，接口地址里包含 `deepseek` 则用 `deepseek-flash`，否则用 `gpt-4o-mini`。`deepseek-chat` 已在 2026-07-24 停用，不要再把它当作默认模型。显式设置 `EVAL_LLM_MODEL` 时仍用该名字。
 
-RAGAS 通过 OpenAI 兼容客户端调用 `llm_factory(..., provider="openai")`，因此 DeepSeek 的 `base_url` 会保留。日志只打印模型名和是否已配置密钥，不打印密钥。兼容接口若不接受 JSON `response_format`，可再设 `EVAL_RAGAS_INSTRUCTOR_MODE=md_json`。
+`deepseek-flash` 默认开启思考。思考写在 `reasoning_content` 里，并占用补全额度。额度用尽时 `finish_reason` 为 `length`，`message.content` 为空，RAGAS 读不到结构化结果。生成答案、RAGAS 裁判和 TruLens 裁判在 DeepSeek 上都会关闭思考。请求通过 OpenAI 兼容的 `extra_body` 发送：
+
+```json
+{"thinking": {"type": "disabled"}, "reasoning_effort": "none"}
+```
+
+`thinking.type=disabled` 优先于 `reasoning_effort`。同一请求把 `max_tokens` 设为 8192，用来盖过 RAGAS 默认的 1024，并与 DeepSeek 非思考模式的默认补全额度同一量级。接口地址包含 `deepseek`，或模型名以 `deepseek` 开头时才附加这些字段；其他接口不改。请求不声明 `tools`，因此不会打开 `deepseek_web_search`、`deepseek_read_url` 或其他工具。`deepseek-flash` 在非思考模式下会忽略传入的 `temperature` 和 `top_p`。
+
+RAGAS 通过 OpenAI 兼容客户端调用 `llm_factory(..., provider="openai")`，因此 DeepSeek 的 `base_url` 会保留。思考开关会同时放进 `llm_factory` 的参数，并绑在客户端的 `chat.completions.create` 上；instructor 若丢掉 `extra_body`，绑定仍会补上。TruLens 收到的是同一个已经绑好的客户端。它若先走 Responses API，则用 `reasoning.effort=none` 关闭思考。日志只打印模型名、是否已配置密钥，以及思考模式是否已关闭，不打印密钥。兼容接口若不接受 JSON `response_format`，可再设 `EVAL_RAGAS_INSTRUCTOR_MODE=md_json`。
 
 ## 数据集
 
@@ -101,6 +109,16 @@ D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligen
 
 可用 `--project-id` 覆盖数据集中的项目 UUID，用 `--out` 指定结果目录。
 
+检索和生成已经写进 `records.json` 之后，可以只打分。仍然需要裁判模型密钥，但不连接数据库，不加载本地检索模型，也不再调用生成。
+
+```powershell
+D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligenceRAG\testing\quality\rag_eval\run_ragas.py --score-from D:\EvalData\rag\output\records.json --out D:\EvalData\rag\output
+```
+
+这条命令只写 `ragas_scores.json` 和 `ragas_scores.csv`。它不改写 `records.json` 和 `traces.json`，即使 `--out` 就是这两份文件所在的目录。不能和 `--dataset`、`--retrieve-only` 或 `--project-id` 一起用。
+
+记录文件是上面这条 RAGAS 命令写出的 JSON 数组，也可以是含非空 `records` 数组的对象。每条要有 `user_input`（或 `question`）、字符串数组 `retrieved_contexts`，以及非空 `response`（或 `answer`）。`reference` 可空；缺了的条目仍按上面的规则跳过 ContextRecall 和 FactualCorrectness。`--retrieve-only` 留下的空答案不能打分。
+
 ## TruLens
 
 追踪 `retrieve`（RETRIEVAL）、`generate_completion`（GENERATION）和 `query`（RECORD_ROOT）。反馈是幻觉三角：Groundedness、Answer Relevance、Context Relevance。`query` 会把该条的过滤字段传给 `retrieve`。
@@ -113,6 +131,12 @@ D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligen
 
 ```powershell
 D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligenceRAG\testing\quality\rag_eval\run_trulens.py --dataset D:\EvalData\rag\dataset.local.json --app-version candidate --out D:\CodeWork\DueDiligenceRAG\testing\quality\rag_eval\output
+```
+
+同一份 `records.json` 也可以交给 TruLens。它按 `user_input` 回放已经保存的片段和答案，再让裁判模型打幻觉三角。不调用 `EvidenceService`，也不再生成答案。问题文本不能重复。它会写 `trulens_answers.json`、能取到时的 `trulens_leaderboard.json`，以及 `trulens.sqlite`；同样不改写 `records.json` 或 `traces.json`。
+
+```powershell
+D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligenceRAG\testing\quality\rag_eval\run_trulens.py --score-from D:\EvalData\rag\output\records.json --out D:\EvalData\rag\trulens-score --app-version scored
 ```
 
 评测结束后打开本机面板（会一直占用这个进程，直到面板关闭）：
@@ -129,7 +153,7 @@ D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligen
 | --- | --- |
 | `records.json` | RAGAS 路径。含问题、检索片段、答案和 reference |
 | `traces.json` | 检索状态、片段数、coverage 和本条过滤条件 |
-| `ragas_scores.json` / `ragas_scores.csv` | 完整 RAGAS 打分 |
+| `ragas_scores.json` / `ragas_scores.csv` | 完整 RAGAS 打分。`--score-from` 只写这两个分数文件 |
 | `trulens_answers.json` | TruLens 路径的答案、片段数和过滤条件 |
 | `trulens_leaderboard.json` | 能取到排行榜时写出 |
 | `trulens.sqlite` | TruLens 会话库，按 `--app-version` 累积 |

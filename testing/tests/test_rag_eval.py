@@ -3,6 +3,7 @@ import importlib.util
 import inspect
 import json
 import sys
+import types
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,19 +25,51 @@ def _load_pipeline():
 
 
 pipeline = _load_pipeline()
+DEEPSEEK_EXTRA_BODY = pipeline.DEEPSEEK_EXTRA_BODY
+DEEPSEEK_MAX_TOKENS = pipeline.DEEPSEEK_MAX_TOKENS
 GENERATION_SYSTEM = pipeline.GENERATION_SYSTEM
 NO_CONTEXT_ANSWER = pipeline.NO_CONTEXT_ANSWER
 QueryApp = pipeline.QueryApp
 RagPipeline = pipeline.RagPipeline
+RecordReplay = pipeline.RecordReplay
 RetrievalPipeline = pipeline.RetrievalPipeline
+bind_completion_options = pipeline.bind_completion_options
+completion_kwargs = pipeline.completion_kwargs
+completion_text = pipeline.completion_text
 contexts_from_search = pipeline.contexts_from_search
 describe_judge_llm = pipeline.describe_judge_llm
 filter_payload = pipeline.filter_payload
 judge_llm_config = pipeline.judge_llm_config
 load_dataset = pipeline.load_dataset
+load_score_records = pipeline.load_score_records
 metric_skip_message = pipeline.metric_skip_message
 prepare_run = pipeline.prepare_run
 select_metric_names = pipeline.select_metric_names
+
+
+_SCRIPTS = {}
+
+
+def _load_script(name):
+    if name not in _SCRIPTS:
+        spec = importlib.util.spec_from_file_location(name, EVAL_DIR / f'{name}.py')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _SCRIPTS[name] = module
+    return _SCRIPTS[name]
+
+
+def _score_record(**overrides):
+    record = {
+        'id': 'q1',
+        'user_input': '示例主体的法定代表人是谁？',
+        'retrieved_contexts': ['办公材料片段'],
+        'response': '材料未记载。',
+        'reference': '甲',
+    }
+    record.update(overrides)
+    return record
 
 
 PROJECT = '11111111-1111-1111-1111-111111111111'
@@ -328,6 +361,12 @@ def test_generation_uses_only_retrieved_context_and_does_not_log_the_key(monkeyp
     sent = chat.calls[0]
     assert sent['model'] == 'deepseek-chat'
     assert sent['temperature'] == 0
+    assert sent['max_tokens'] == DEEPSEEK_MAX_TOKENS
+    assert sent['extra_body'] == DEEPSEEK_EXTRA_BODY
+    assert sent['extra_body']['thinking'] == {'type': 'disabled'}
+    assert sent['extra_body']['reasoning_effort'] == 'none'
+    assert 'tools' not in sent
+    assert 'deepseek_web_search' not in json.dumps(sent, ensure_ascii=False)
     assert sent['messages'][0]['content'] == GENERATION_SYSTEM
     assert '办公材料片段' in sent['messages'][1]['content']
     assert 'eval-key' not in json.dumps(sent, ensure_ascii=False)
@@ -336,6 +375,7 @@ def test_generation_uses_only_retrieved_context_and_does_not_log_the_key(monkeyp
         'model': 'deepseek-chat',
         'base_url': 'https://api.deepseek.com',
         'api_key_set': True,
+        'thinking_disabled': True,
     }
     assert 'eval-key' not in json.dumps(info)
 
@@ -348,9 +388,12 @@ def test_judge_env_prefers_eval_variables_and_hides_query_secrets(monkeypatch):
     monkeypatch.delenv('OPENAI_BASE_URL', raising=False)
     config = judge_llm_config()
     assert config['api_key'] == 'eval-key'
-    assert config['model'] == 'deepseek-chat'
+    assert config['model'] == 'deepseek-flash'
+    assert completion_kwargs(config)['extra_body'] == DEEPSEEK_EXTRA_BODY
+    assert completion_kwargs(config)['max_tokens'] == DEEPSEEK_MAX_TOKENS
     info = describe_judge_llm(config)
     assert info['base_url'] == 'https://api.deepseek.com'
+    assert info['thinking_disabled'] is True
     assert 'hidden' not in json.dumps(info)
     assert 'eval-key' not in json.dumps(info)
 
@@ -361,6 +404,8 @@ def test_judge_env_prefers_eval_variables_and_hides_query_secrets(monkeypatch):
     fallback = judge_llm_config()
     assert fallback['api_key'] == 'openai-key'
     assert fallback['model'] == 'gpt-4o-mini'
+    assert completion_kwargs(fallback) == {}
+    assert describe_judge_llm(fallback)['thinking_disabled'] is False
     with pytest.raises(RuntimeError, match='EVAL_LLM_API_KEY') as caught:
         monkeypatch.delenv('OPENAI_API_KEY', raising=False)
         pipeline.require_api_key()
@@ -409,6 +454,9 @@ def test_package_stays_out_of_product_dependencies_and_ignores_local_artifacts()
     assert 'output/' in local_ignore
     assert '*.local.json' in local_ignore
     assert 'D:\\CodeWork\\DueDiligenceRAG' in readme
+    assert 'deepseek-flash' in readme
+    assert '--score-from' in readme
+    assert 'thinking' in readme
     assert '尽调报告Agent' not in readme
     assert 'dsh-eval' in readme and 'RG-04' in readme
     for path in EVAL_DIR.rglob('*'):
@@ -436,6 +484,10 @@ def test_trulens_wrapper_forwards_filters_and_ragas_uses_current_metrics():
     assert 'llm_factory' in ragas
     assert "factory_kwargs = {'provider': 'openai', 'client': client}" in ragas
     assert 'ContextRecall' in ragas and 'Faithfulness' in ragas and 'FactualCorrectness' in ragas
+    assert 'completion_kwargs(config)' in ragas
+    assert '--score-from' in ragas and '--score-from' in trulens
+    assert 'openai_client(config)' in trulens
+    assert 'RecordReplay' in trulens
 
 
 def test_framework_imports_when_the_eval_environment_is_installed():
@@ -459,3 +511,357 @@ def test_framework_imports_when_the_eval_environment_is_installed():
     assert SpanAttributes.SpanType.GENERATION
     assert SpanAttributes.SpanType.RECORD_ROOT
     assert hasattr(Faithfulness, 'score') or hasattr(Faithfulness, 'ascore')
+
+
+def test_openai_generation_does_not_send_deepseek_options(monkeypatch):
+    monkeypatch.setenv('EVAL_LLM_API_KEY', 'eval-key')
+    monkeypatch.setenv('EVAL_LLM_MODEL', 'gpt-4o-mini')
+    monkeypatch.setenv('EVAL_LLM_BASE_URL', 'https://api.openai.com/v1')
+    chat = FakeChat()
+    pipeline = RagPipeline(service=FakeSearch(), chat=chat)
+    record, _found = pipeline.run_item(PROJECT, {
+        'id': 'gen',
+        'question': '示例问题',
+        'reference': '甲',
+    }, generate=True)
+    assert record['response'] == '材料未记载。'
+    sent = chat.calls[0]
+    assert sent['model'] == 'gpt-4o-mini'
+    assert 'extra_body' not in sent
+    assert 'max_tokens' not in sent
+    assert 'reasoning_effort' not in sent
+    assert completion_kwargs() == {}
+
+
+def test_named_deepseek_model_disables_thinking_without_a_deepseek_url():
+    options = completion_kwargs({
+        'api_key': 'eval-key',
+        'base_url': 'https://gateway.example/v1',
+        'model': 'deepseek-flash',
+    })
+    assert options['extra_body']['thinking'] == {'type': 'disabled'}
+    assert options['max_tokens'] == DEEPSEEK_MAX_TOKENS
+
+
+def test_bound_client_keeps_thinking_disabled_and_preserves_caller_fields():
+    class Completions:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return kwargs
+
+    class Responses:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(('create', kwargs))
+            return kwargs
+
+        def parse(self, **kwargs):
+            self.calls.append(('parse', kwargs))
+            return kwargs
+
+    completions = Completions()
+    responses = Responses()
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions),
+        responses=responses,
+    )
+    options = completion_kwargs({
+        'base_url': 'https://api.deepseek.com',
+        'model': 'deepseek-flash',
+    })
+    original = completions.create
+    assert bind_completion_options(client, {}) is client
+    assert completions.create.__func__ is original.__func__
+    bind_completion_options(client, options)
+    wrapped = completions.create
+    bind_completion_options(client, options)
+    assert completions.create is wrapped
+    client.chat.completions.create(
+        model='deepseek-flash',
+        max_tokens=100,
+        extra_body={'thinking': {'type': 'enabled'}, 'keep': 1},
+    )
+    sent = completions.calls[0]
+    assert sent['max_tokens'] == 100
+    assert sent['extra_body']['keep'] == 1
+    assert sent['extra_body']['thinking'] == {'type': 'disabled'}
+    assert sent['extra_body']['reasoning_effort'] == 'none'
+    assert 'tools' not in sent
+    client.chat.completions.create(model='deepseek-flash')
+    assert completions.calls[1]['max_tokens'] == DEEPSEEK_MAX_TOKENS
+    client.responses.create(model='deepseek-flash', reasoning={'summary': 'auto'})
+    client.responses.parse(model='deepseek-flash')
+    created = responses.calls[0][1]['reasoning']
+    assert created['effort'] == 'none'
+    assert created['summary'] == 'auto'
+    assert responses.calls[1][1]['reasoning'] == {'effort': 'none'}
+    assert 'max_tokens' not in responses.calls[0][1]
+    assert 'extra_body' not in responses.calls[0][1]
+
+
+def test_length_finish_with_empty_content_is_rejected():
+    message = SimpleNamespace(content='', reasoning_content='思考占满了额度')
+    choice = SimpleNamespace(message=message, finish_reason='length')
+    with pytest.raises(RuntimeError, match='reasoning_content'):
+        completion_text(SimpleNamespace(choices=[choice]))
+    plain = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='材料未记载。'), finish_reason='stop')],
+    )
+    assert completion_text(plain) == '材料未记载。'
+
+
+def test_score_records_accept_saved_shapes_and_reject_blank_answers(tmp_path):
+    path = tmp_path / 'records.json'
+    path.write_text(json.dumps([_score_record(reference='  ')], ensure_ascii=False), encoding='utf-8')
+    loaded = load_score_records(path)
+    assert loaded[0]['reference'] == ''
+    assert loaded[0]['retrieved_contexts'] == ['办公材料片段']
+    wrapped = tmp_path / 'wrapped.json'
+    wrapped.write_text(json.dumps({'records': [_score_record(answer='材料未记载。')]}, ensure_ascii=False), encoding='utf-8')
+    # response is already present; answer is ignored when response exists.
+    assert load_score_records(wrapped)[0]['response'] == '材料未记载。'
+    alias = tmp_path / 'alias.json'
+    body = _score_record()
+    body.pop('response')
+    body.pop('user_input')
+    body['question'] = '示例主体的法定代表人是谁？'
+    body['answer'] = '甲。'
+    alias.write_text(json.dumps([body], ensure_ascii=False), encoding='utf-8')
+    aliased = load_score_records(alias)[0]
+    assert aliased['user_input'] == '示例主体的法定代表人是谁？'
+    assert aliased['response'] == '甲。'
+    blank = tmp_path / 'blank.json'
+    blank.write_text(json.dumps([_score_record(response='  ')], ensure_ascii=False), encoding='utf-8')
+    with pytest.raises(ValueError, match='response 为空'):
+        load_score_records(blank)
+    missing = tmp_path / 'missing.json'
+    missing.write_text('[]', encoding='utf-8')
+    with pytest.raises(ValueError, match='非空'):
+        load_score_records(missing)
+    with pytest.raises(FileNotFoundError):
+        load_score_records(tmp_path / 'absent.json')
+
+
+def test_record_replay_returns_the_stored_answer_without_retrieval():
+    records = [
+        _score_record(),
+        _score_record(id='q2', user_input='示例主体的注册资本是多少？', response='材料未记载。', reference=''),
+    ]
+    replay = RecordReplay(records)
+    app = QueryApp(replay, PROJECT)
+    answer = app.query(records[0]['user_input'], filters=None)
+    assert answer == '材料未记载。'
+    assert app.last_contexts == ['办公材料片段']
+    assert replay.generate('示例主体的注册资本是多少？', []) == '材料未记载。'
+    with pytest.raises(ValueError, match='重复问题'):
+        RecordReplay([_score_record(), _score_record(id='q9')])
+
+
+def test_ragas_score_from_writes_scores_without_retrieval(tmp_path, monkeypatch):
+    monkeypatch.setenv('EVAL_LLM_API_KEY', 'eval-key')
+    monkeypatch.setenv('EVAL_LLM_BASE_URL', 'https://api.deepseek.com')
+    monkeypatch.delenv('EVAL_LLM_MODEL', raising=False)
+    script = _load_script('run_ragas')
+    source = tmp_path / 'records.json'
+    records = [_score_record(), _score_record(
+        id='q2',
+        user_input='示例主体的注册资本是多少？',
+        response='材料未记载。',
+        reference='',
+    )]
+    source.write_text(json.dumps(records, ensure_ascii=False), encoding='utf-8')
+    original = source.read_text(encoding='utf-8')
+    out = tmp_path / 'out'
+    out.mkdir()
+    (out / 'records.json').write_text('keep-records', encoding='utf-8')
+    (out / 'traces.json').write_text('keep-traces', encoding='utf-8')
+    seen = {}
+
+    def fake_score(rows, llm=None, scorers=None):
+        seen['rows'] = rows
+        return {
+            'metrics_run': ['Faithfulness'],
+            'metrics_skipped': ['LLMContextRecall', 'FactualCorrectness'],
+            'missing_reference_ids': ['q2'],
+            'metric_keys': {},
+            'note': 'fixture',
+            'aggregates': {'faithfulness': 1.0},
+            'rows': [
+                {'id': row['id'], 'user_input': row['user_input'], 'faithfulness': 1.0}
+                for row in rows
+            ],
+        }
+
+    def explode(*args, **kwargs):
+        raise AssertionError('score-from 不应构造检索管道')
+
+    monkeypatch.setattr(script, 'score_records', fake_score)
+    monkeypatch.setattr(script, 'RagPipeline', explode)
+    script.main(['--score-from', str(source), '--out', str(out)])
+    assert [row['id'] for row in seen['rows']] == ['q1', 'q2']
+    assert seen['rows'][0]['retrieved_contexts'] == ['办公材料片段']
+    scores = json.loads((out / 'ragas_scores.json').read_text(encoding='utf-8'))
+    assert scores['rows'][0]['faithfulness'] == 1.0
+    csv_text = (out / 'ragas_scores.csv').read_text(encoding='utf-8-sig')
+    assert 'faithfulness' in csv_text and 'q1' in csv_text
+    assert (out / 'records.json').read_text(encoding='utf-8') == 'keep-records'
+    assert (out / 'traces.json').read_text(encoding='utf-8') == 'keep-traces'
+    assert source.read_text(encoding='utf-8') == original
+    with pytest.raises(ValueError, match='retrieve-only'):
+        script.main(['--score-from', str(source), '--retrieve-only'])
+    with pytest.raises(ValueError, match='project-id'):
+        script.main(['--score-from', str(source), '--project-id', PROJECT])
+    with pytest.raises(SystemExit):
+        script.parse_args(['--dataset', str(source), '--score-from', str(source)])
+    with pytest.raises(SystemExit):
+        script.parse_args([])
+
+
+def test_score_records_aggregates_and_redacts_without_ragas(monkeypatch):
+    monkeypatch.setenv('EVAL_LLM_API_KEY', 'eval-key')
+    script = _load_script('run_ragas')
+
+    class Metric:
+        def __init__(self, value):
+            self.value = value
+            self.calls = []
+
+        def score(self, **kwargs):
+            self.calls.append(kwargs)
+            if self.value is None:
+                raise RuntimeError('failed with eval-key')
+            return SimpleNamespace(value=self.value)
+
+    good = Metric(0.5)
+    records = [_score_record(), _score_record(id='q2', user_input='第二个示例问题是什么？')]
+    scored = script.score_records(records, scorers=[
+        ('faithfulness', good, script._faithfulness_kwargs),
+    ])
+    assert scored['aggregates']['faithfulness'] == 0.5
+    assert good.calls[0]['retrieved_contexts'] == ['办公材料片段']
+    assert 'eval-key' not in json.dumps(good.calls[0], ensure_ascii=False)
+    with pytest.raises(RuntimeError, match='打分失败') as caught:
+        script.score_records(records, scorers=[
+            ('faithfulness', Metric(None), script._faithfulness_kwargs),
+        ])
+    assert 'eval-key' not in str(caught.value)
+
+
+def test_ragas_factory_forwards_deepseek_options_without_tools(monkeypatch):
+    monkeypatch.setenv('EVAL_LLM_API_KEY', 'eval-key')
+    monkeypatch.setenv('EVAL_LLM_BASE_URL', 'https://api.deepseek.com')
+    monkeypatch.delenv('EVAL_LLM_MODEL', raising=False)
+    script = _load_script('run_ragas')
+    captured = {}
+    sentinel = object()
+
+    def fake_client(config, async_client=False):
+        captured['async_client'] = async_client
+        captured['config_model'] = config['model']
+        return sentinel
+
+    def llm_factory(model, **kwargs):
+        captured['model'] = model
+        captured['kwargs'] = kwargs
+        return 'llm'
+
+    fake_llms = types.ModuleType('ragas.llms')
+    fake_llms.llm_factory = llm_factory
+    monkeypatch.setitem(sys.modules, 'ragas.llms', fake_llms)
+    monkeypatch.setattr(script, 'openai_client', fake_client)
+    assert script.make_ragas_llm() == 'llm'
+    assert captured['async_client'] is True
+    assert captured['model'] == 'deepseek-flash'
+    assert captured['kwargs']['provider'] == 'openai'
+    assert captured['kwargs']['client'] is sentinel
+    assert captured['kwargs']['extra_body']['thinking'] == {'type': 'disabled'}
+    assert captured['kwargs']['extra_body']['reasoning_effort'] == 'none'
+    assert captured['kwargs']['max_tokens'] == DEEPSEEK_MAX_TOKENS
+    assert 'tools' not in captured['kwargs']
+
+
+def test_trulens_score_from_replays_records_without_retrieval(tmp_path, monkeypatch):
+    monkeypatch.setenv('EVAL_LLM_API_KEY', 'eval-key')
+    monkeypatch.setenv('EVAL_LLM_BASE_URL', 'https://api.deepseek.com')
+    monkeypatch.delenv('EVAL_LLM_MODEL', raising=False)
+    script = _load_script('run_trulens')
+    source = tmp_path / 'records.json'
+    source.write_text(json.dumps([_score_record(search_status='candidates')], ensure_ascii=False), encoding='utf-8')
+    out = tmp_path / 'trulens-out'
+    built = {}
+
+    class DummyTru:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_build(project_id, app_version, database_url, pipeline=None):
+        assert pipeline is not None
+        assert pipeline.__class__.__name__ == 'RecordReplay'
+        built['pipeline'] = pipeline
+        built['database_url'] = database_url
+        app = script.QueryApp(pipeline, project_id)
+        session = SimpleNamespace(get_leaderboard=lambda: [{'Groundedness': 0.5}])
+        return session, app, DummyTru()
+
+    def explode(*args, **kwargs):
+        raise AssertionError('score-from 不应构造检索管道')
+
+    monkeypatch.setattr(script, 'build_wrapped_app', fake_build)
+    monkeypatch.setattr(script, 'RagPipeline', explode)
+    script.main([
+        '--score-from', str(source),
+        '--out', str(out),
+        '--app-version', 'scored',
+    ])
+    answers = json.loads((out / 'trulens_answers.json').read_text(encoding='utf-8'))
+    assert answers[0]['answer'] == '材料未记载。'
+    assert answers[0]['context_count'] == 1
+    assert answers[0]['search_status'] == 'candidates'
+    assert answers[0]['replayed'] is True
+    assert answers[0]['app_version'] == 'scored'
+    board = json.loads((out / 'trulens_leaderboard.json').read_text(encoding='utf-8'))
+    assert board[0]['Groundedness'] == 0.5
+    assert not (out / 'records.json').exists()
+    assert not (out / 'traces.json').exists()
+    assert 'trulens.sqlite' in built['database_url']
+    with pytest.raises(ValueError, match='重复问题'):
+        duplicate = tmp_path / 'dup.json'
+        duplicate.write_text(json.dumps([
+            _score_record(),
+            _score_record(id='q9'),
+        ], ensure_ascii=False), encoding='utf-8')
+        script.main(['--score-from', str(duplicate), '--out', str(tmp_path / 'dup-out')])
+
+
+def test_trulens_provider_receives_a_bound_client_for_deepseek(monkeypatch):
+    monkeypatch.setenv('EVAL_LLM_API_KEY', 'eval-key')
+    monkeypatch.setenv('EVAL_LLM_BASE_URL', 'https://api.deepseek.com')
+    monkeypatch.delenv('EVAL_LLM_MODEL', raising=False)
+    script = _load_script('run_trulens')
+    sentinel = object()
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    fake_mod = types.ModuleType('trulens.providers.openai')
+    fake_mod.OpenAI = FakeOpenAI
+    monkeypatch.setitem(sys.modules, 'trulens.providers.openai', fake_mod)
+    monkeypatch.setattr(script, 'openai_client', lambda config: sentinel)
+    provider = script.make_provider()
+    assert provider.kwargs == {'model_engine': 'deepseek-flash', 'client': sentinel}
+    monkeypatch.delenv('EVAL_LLM_BASE_URL', raising=False)
+    monkeypatch.setenv('EVAL_LLM_MODEL', 'gpt-4o-mini')
+    plain = script.make_provider()
+    assert plain.kwargs['model_engine'] == 'gpt-4o-mini'
+    assert plain.kwargs['api_key'] == 'eval-key'
+    assert 'client' not in plain.kwargs
+    assert 'extra_body' not in plain.kwargs
