@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -55,13 +56,23 @@ def parse_args(argv=None):
 def make_ragas_llm(config=None):
     """OpenAI 兼容客户端 + llm_factory。DeepSeek 也走 provider=openai，以保留 base_url。
 
-    客户端预先绑上思考开关。llm_factory 的 kwargs 再送一遍，用来盖过 RAGAS 默认的
-    max_tokens=1024；instructor 若丢掉 extra_body，客户端绑定仍会补上。
+    集合指标的 score() 会 asyncio.run(ascore())，ascore 再 await llm.agenerate()。
+    因此这里必须是异步客户端，而且 chat.completions.create 必须仍是协程函数。
+    思考开关若用普通函数包住 AsyncCompletions.create，instructor 会把它当成同步调用，
+    返回值是未等待的协程，读取 choices 失败。
+    llm_factory 的 kwargs 再送一遍思考开关，用来盖过 RAGAS 默认的 max_tokens=1024；
+    instructor 若丢掉 extra_body，客户端绑定仍会补上。
     """
     config = require_api_key(config or judge_llm_config())
     from ragas.llms import llm_factory
 
     client = openai_client(config, async_client=True)
+    create = getattr(getattr(getattr(client, 'chat', None), 'completions', None), 'create', None)
+    if not inspect.iscoroutinefunction(create):
+        raise RuntimeError(
+            'RAGAS 裁判需要异步客户端，但 chat.completions.create 不是协程函数。'
+            '这样 Faithfulness 会在未等待的协程上读取 choices。'
+        )
     factory_kwargs = {'provider': 'openai', 'client': client}
     factory_kwargs.update(completion_kwargs(config))
     mode = (os.environ.get('EVAL_RAGAS_INSTRUCTOR_MODE') or '').strip().lower()

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import os
 from pathlib import Path
@@ -366,16 +367,55 @@ def _apply_responses_kwargs(kwargs):
     return kwargs
 
 
+def _is_coroutine_callable(func):
+    """沿着 __wrapped__ 判断是不是异步调用。
+
+    OpenAI 的 AsyncCompletions.create 本身不是协程函数，真正的协程在 __wrapped__ 上，
+    但调用它仍会返回协程。只看外层会把它包成同步函数，instructor 随后读取 choices 失败。
+    """
+    seen = set()
+    current = func
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if inspect.iscoroutinefunction(current):
+            return True
+        wrapped = getattr(current, '__wrapped__', None)
+        current = wrapped if wrapped is not None else getattr(current, '__func__', None)
+    return False
+
+
+def _close_awaitable(result):
+    close = getattr(result, 'close', None)
+    if close is not None:
+        close()
+
+
 def _bind_method(owner, name, transform):
     if owner is None or not hasattr(owner, name):
         return
     current = getattr(owner, name)
     if getattr(current, '_dda_eval_bound', False):
         return
-
-    def wrapped(*args, **kwargs):
-        transform(kwargs)
-        return current(*args, **kwargs)
+    if _is_coroutine_callable(current):
+        # 必须仍是协程函数。同步包装会把 AsyncCompletions.create 的协程原样返回，
+        # instructor 再去读 choices，Faithfulness 就报 'coroutine' object has no attribute 'choices'。
+        async def wrapped(*args, **kwargs):
+            transform(kwargs)
+            result = current(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+    else:
+        def wrapped(*args, **kwargs):
+            transform(kwargs)
+            result = current(*args, **kwargs)
+            if inspect.isawaitable(result):
+                _close_awaitable(result)
+                raise RuntimeError(
+                    '同步客户端的补全调用返回了未等待的协程，无法读取 choices。'
+                    '生成和 TruLens 使用同步客户端；RAGAS 的异步客户端必须保持 create 为协程函数。'
+                )
+            return result
 
     wrapped._dda_eval_bound = True
     try:
@@ -389,6 +429,8 @@ def bind_completion_options(client, options):
 
     RAGAS 的 instructor 和 TruLens 自己发请求，调用方不一定能把 extra_body 传进去。
     绑在 chat.completions.create 上之后，后一层丢掉该参数也会重新补上。
+    原来的 create 若是协程函数，绑定后必须仍是协程函数并在内部 await，
+    否则 Faithfulness.score() 里的 agenerate 会拿到未等待的协程。
     TruLens 会先试 Responses API，那边用 reasoning.effort=none。
     不改写 reasoning_effort 这个顶层参数：TruLens 发现不支持时会删掉它再重试，
     包一层又加回去会让重试失败。
@@ -422,6 +464,12 @@ def openai_client(config, *, async_client=False):
 
 def completion_text(completion):
     """取出正文。思考把额度用完、正文为空时直接失败，避免把空答案送去打分。"""
+    if inspect.isawaitable(completion):
+        _close_awaitable(completion)
+        raise RuntimeError(
+            '生成结果是未等待的协程，无法读取 choices。'
+            '评测生成使用同步客户端。'
+        )
     choice = completion.choices[0] if getattr(completion, 'choices', None) else None
     message = getattr(choice, 'message', None) if choice is not None else None
     content = getattr(message, 'content', '') if message is not None else ''

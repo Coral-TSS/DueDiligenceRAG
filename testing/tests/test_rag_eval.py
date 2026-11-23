@@ -1,4 +1,5 @@
 """RAG 评测包的离线检查。不连接数据库，不加载模型，不读客户文件或密钥。"""
+import asyncio
 import importlib.util
 import inspect
 import json
@@ -592,7 +593,9 @@ def test_bound_client_keeps_thinking_disabled_and_preserves_caller_fields():
     assert sent['extra_body']['thinking'] == {'type': 'disabled'}
     assert sent['extra_body']['reasoning_effort'] == 'none'
     assert 'tools' not in sent
-    client.chat.completions.create(model='deepseek-flash')
+    second = client.chat.completions.create(model='deepseek-flash')
+    assert not inspect.iscoroutine(second)
+    assert not inspect.iscoroutinefunction(client.chat.completions.create)
     assert completions.calls[1]['max_tokens'] == DEEPSEEK_MAX_TOKENS
     client.responses.create(model='deepseek-flash', reasoning={'summary': 'auto'})
     client.responses.parse(model='deepseek-flash')
@@ -602,6 +605,123 @@ def test_bound_client_keeps_thinking_disabled_and_preserves_caller_fields():
     assert responses.calls[1][1]['reasoning'] == {'effort': 'none'}
     assert 'max_tokens' not in responses.calls[0][1]
     assert 'extra_body' not in responses.calls[0][1]
+
+
+def _completion(content='材料未记载。'):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=content),
+            finish_reason='stop',
+        )],
+    )
+
+
+def test_openai_style_async_create_stays_awaitable_after_binding():
+    """AsyncCompletions.create 外层不是协程函数，协程藏在 __wrapped__。"""
+
+    async def raw_create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _completion('{"statements":[]}')
+
+    def sdk_create(self, **kwargs):
+        return raw_create(self, **kwargs)
+
+    sdk_create.__wrapped__ = raw_create
+
+    class Completions:
+        def __init__(self):
+            self.calls = []
+
+        create = sdk_create
+
+    completions = Completions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions), responses=None)
+    assert not inspect.iscoroutinefunction(completions.create)
+    assert inspect.iscoroutinefunction(completions.create.__wrapped__)
+    bind_completion_options(client, completion_kwargs({
+        'base_url': 'https://api.deepseek.com',
+        'model': 'deepseek-flash',
+    }))
+    create = client.chat.completions.create
+    assert inspect.iscoroutinefunction(create)
+    pending = create(model='deepseek-flash')
+    assert inspect.iscoroutine(pending) and not hasattr(pending, 'choices')
+    pending.close()
+    result = asyncio.run(create(model='deepseek-flash'))
+    assert result.choices[0].message.content == '{"statements":[]}'
+    assert completions.calls[-1]['extra_body']['thinking'] == {'type': 'disabled'}
+
+
+def test_async_judge_binding_stays_a_coroutine_and_returns_choices():
+    """instructor 用 iscoroutinefunction 决定要不要 await。同步包装会把协程当成补全结果。"""
+
+    class Completions:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return _completion('{"statements":[]}')
+
+    class Responses:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(('create', kwargs))
+            return _completion()
+
+        async def parse(self, **kwargs):
+            self.calls.append(('parse', kwargs))
+            return _completion()
+
+    completions = Completions()
+    responses = Responses()
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions),
+        responses=responses,
+    )
+    options = completion_kwargs({
+        'base_url': 'https://api.deepseek.com',
+        'model': 'deepseek-flash',
+    })
+    bind_completion_options(client, options)
+    create = client.chat.completions.create
+    assert inspect.iscoroutinefunction(create)
+    pending = create(model='deepseek-flash')
+    assert inspect.iscoroutine(pending)
+    assert not hasattr(pending, 'choices')
+    pending.close()
+    result = asyncio.run(create(
+        model='deepseek-flash',
+        extra_body={'thinking': {'type': 'enabled'}},
+    ))
+    assert not inspect.iscoroutine(result)
+    assert result.choices[0].message.content == '{"statements":[]}'
+    assert completions.calls[-1]['extra_body']['thinking'] == {'type': 'disabled'}
+    assert completions.calls[-1]['max_tokens'] == DEEPSEEK_MAX_TOKENS
+    parsed = asyncio.run(client.responses.parse(model='deepseek-flash'))
+    assert parsed.choices[0].message.content == '材料未记载。'
+    assert responses.calls[-1][1]['reasoning'] == {'effort': 'none'}
+
+
+def test_generation_rejects_an_unawaited_coroutine(monkeypatch):
+    monkeypatch.setenv('EVAL_LLM_API_KEY', 'eval-key')
+    monkeypatch.setenv('EVAL_LLM_BASE_URL', 'https://api.deepseek.com')
+    monkeypatch.setenv('EVAL_LLM_MODEL', 'deepseek-flash')
+
+    class Completions:
+        async def create(self, **kwargs):
+            return _completion()
+
+    chat = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    pipeline = RagPipeline(service=FakeSearch(), chat=chat)
+    with pytest.raises(RuntimeError, match='未等待的协程'):
+        pipeline.run_item(PROJECT, {
+            'id': 'gen',
+            'question': '示例问题',
+            'reference': '甲',
+        }, generate=True)
 
 
 def test_length_finish_with_empty_content_is_rejected():
@@ -758,12 +878,17 @@ def test_ragas_factory_forwards_deepseek_options_without_tools(monkeypatch):
     monkeypatch.delenv('EVAL_LLM_MODEL', raising=False)
     script = _load_script('run_ragas')
     captured = {}
-    sentinel = object()
+
+    class Completions:
+        async def create(self, **kwargs):
+            return _completion()
+
+    judge = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
 
     def fake_client(config, async_client=False):
         captured['async_client'] = async_client
         captured['config_model'] = config['model']
-        return sentinel
+        return judge
 
     def llm_factory(model, **kwargs):
         captured['model'] = model
@@ -776,13 +901,43 @@ def test_ragas_factory_forwards_deepseek_options_without_tools(monkeypatch):
     monkeypatch.setattr(script, 'openai_client', fake_client)
     assert script.make_ragas_llm() == 'llm'
     assert captured['async_client'] is True
+    assert inspect.iscoroutinefunction(judge.chat.completions.create)
     assert captured['model'] == 'deepseek-flash'
     assert captured['kwargs']['provider'] == 'openai'
-    assert captured['kwargs']['client'] is sentinel
+    assert captured['kwargs']['client'] is judge
     assert captured['kwargs']['extra_body']['thinking'] == {'type': 'disabled'}
     assert captured['kwargs']['extra_body']['reasoning_effort'] == 'none'
     assert captured['kwargs']['max_tokens'] == DEEPSEEK_MAX_TOKENS
     assert 'tools' not in captured['kwargs']
+
+    class SyncCompletions:
+        def create(self, **kwargs):
+            return _completion()
+
+    sync_judge = SimpleNamespace(chat=SimpleNamespace(completions=SyncCompletions()))
+    monkeypatch.setattr(script, 'openai_client', lambda config, async_client=False: sync_judge)
+    with pytest.raises(RuntimeError, match='协程函数'):
+        script.make_ragas_llm()
+
+
+def test_sync_wrapper_refuses_to_treat_a_coroutine_as_a_completion():
+    class Completions:
+        def create(self, **kwargs):
+            async def pending():
+                return _completion()
+
+            return pending()
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions()),
+        responses=None,
+    )
+    bind_completion_options(client, completion_kwargs({
+        'base_url': 'https://api.deepseek.com',
+        'model': 'deepseek-flash',
+    }))
+    with pytest.raises(RuntimeError, match='未等待的协程'):
+        client.chat.completions.create(model='deepseek-flash')
 
 
 def test_trulens_score_from_replays_records_without_retrieval(tmp_path, monkeypatch):
