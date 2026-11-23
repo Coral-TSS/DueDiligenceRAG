@@ -98,3 +98,9 @@ recognition-results/
 
 # 含真实客户字段（企业名称／注册号／住址）的质量参考脚本，仅本地保留
 testing/scripts/quality/annotate_sample.py
+
+# 检索评测的独立环境、本机黄金集和运行产物
+.venv-eval/
+dataset.local.json
+*.local.json
+testing/quality/rag_eval/output/

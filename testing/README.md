@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | `tests/` | 当前正式自动测试，应保留 | 应用启动不依赖；修改代码后用它回归 |
 | `scripts/quality/` | 图像质量试验脚本；样本输出只留本机，不入库 | 不参与日常业务流程 |
+| `quality/rag_eval/` | 检索质量评测（RAGAS / TruLens）。黄金集由使用者在本机提供 | 不参与应用运行，依赖装在 `.venv-eval` |
 | `scripts/performance/` | 两页合成样本与真实／快速性能基线 | 仅独立测试，结果写 runs/ |
 | `runs/` | 新测试产生的日志、XML、临时图片、隔离测试 PostgreSQL | 可重建；只应在对应测试库已停止后清理 |
 | `cache/` | pytest 缓存与测试 Python 字节码 | 可重建，不是测试代码或客户原件 |
@@ -38,3 +39,5 @@
 阶段基线可运行 `.\.venv-dev\Scripts\python.exe testing/scripts/performance/baseline.py`；加 `--models` 使用真实 OCR／视觉／向量／重排模型。仅处理两页合成样本并使用隔离库。2026-10-26 的结果是完整回归 88 passed／2 skipped，真实模型 1 passed；同版本复用时 OCR 调用为零。
 
 阅读器行为回归位于 `tests/test_reader_regressions.py`，执行 `scripts/frontend/reader-regression.cjs`。需要 Node.js 22+：`node` 在 `PATH` 上，或设置 `DDA_TEST_NODE`。这组用真实前端脚本与受控 DOM／网络响应验证缓存失效、按需读取、失败切页和请求竞态，不需要安装浏览器或模型。
+
+`quality/rag_eval/` 评测检索质量，安装和运行见该目录的 README。它不是 RG-04 固定集，也不是 Harness 的 dsh-eval。黄金集用 `--dataset` 指向仓库外的文件，不入库。
