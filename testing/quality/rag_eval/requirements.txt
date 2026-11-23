@@ -1,0 +1,7 @@
+# 只装进独立评测环境 .venv-eval，不要装进 .venv-dev，也不要写进 pyproject.toml。
+# 使用当前 ragas 与 trulens。不要安装已弃用的 trulens-eval。
+ragas>=0.4.3
+trulens>=2.5
+trulens-providers-openai>=2.5
+openai>=1.40
+python-dotenv>=1.0

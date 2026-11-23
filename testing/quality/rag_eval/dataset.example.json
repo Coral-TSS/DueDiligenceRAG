@@ -1,0 +1,26 @@
+{
+  "comment": "合成示例，不是客户材料，也不是 RG-04 固定集。全零 project_id 不能直接运行。把 project_id 换成已索引项目的 UUID，另存为仓库外的 JSON，再用 --dataset 指向它。reference 和真实问答不要提交。",
+  "customer_data": false,
+  "project_id": "00000000-0000-0000-0000-000000000000",
+  "items": [
+    {
+      "id": "ex-001",
+      "question": "示例主体的法定代表人是谁？",
+      "reference": "",
+      "document_id": null,
+      "document_ids": [],
+      "categories": [],
+      "subject_ids": [],
+      "date_point": null,
+      "period_start": null,
+      "period_end": null,
+      "page_from": null,
+      "page_to": null
+    },
+    {
+      "id": "ex-002",
+      "question": "示例主体的注册资本是多少？",
+      "reference": ""
+    }
+  ]
+}
