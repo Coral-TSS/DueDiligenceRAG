@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,14 @@ QUESTION_MIN = 1
 QUESTION_MAX = 500
 ZERO_PROJECT_ID = '00000000-0000-0000-0000-000000000000'
 NO_CONTEXT_ANSWER = '检索没有返回可用片段，因此无法根据材料作答。'
+DEEPSEEK_MODEL = 'deepseek-flash'
+# 非思考模式的官方默认补全额度是 8K。显式写出，用来盖过 RAGAS 的 1024。
+DEEPSEEK_MAX_TOKENS = 8192
+# thinking.type 优先于 reasoning_effort。两者都关掉，避免网关只认其中一个。
+DEEPSEEK_EXTRA_BODY = {
+    'thinking': {'type': 'disabled'},
+    'reasoning_effort': 'none',
+}
 GENERATION_SYSTEM = (
     '你只根据给定的检索片段作答。片段里没有的信息必须明确写成“材料未记载”，'
     '不要推断，也不要补充片段以外的知识。用中文回答。'
@@ -257,8 +266,34 @@ def judge_llm_config():
     base_url = (os.environ.get('EVAL_LLM_BASE_URL') or os.environ.get('OPENAI_BASE_URL') or '').strip() or None
     model = (os.environ.get('EVAL_LLM_MODEL') or '').strip()
     if not model:
-        model = 'deepseek-chat' if base_url and 'deepseek' in base_url.lower() else 'gpt-4o-mini'
+        model = DEEPSEEK_MODEL if base_url and 'deepseek' in base_url.lower() else 'gpt-4o-mini'
     return {'api_key': api_key, 'base_url': base_url, 'model': model}
+
+
+def uses_deepseek(config=None):
+    """接口地址或模型名表明这是 DeepSeek。deepseek-chat 已停用，默认名是 deepseek-flash。"""
+    config = config or judge_llm_config()
+    base_url = str(config.get('base_url') or '').lower()
+    model = str(config.get('model') or '').lower()
+    return 'deepseek' in base_url or model.startswith('deepseek')
+
+
+def completion_kwargs(config=None):
+    """DeepSeek 补全请求要附带的字段。其他接口返回空字典。
+
+    deepseek-flash 默认思考。思考写进 reasoning_content，占满 max_tokens 后
+    finish_reason=length，message.content 为空，RAGAS 读不到 JSON。
+    官方关闭方式是 thinking.type=disabled（OpenAI SDK 用 extra_body 送出）。
+    reasoning_effort=none 是同一开关的另一种写法，type 优先。
+    不声明 tools，因此不会打开 deepseek_web_search 或 deepseek_read_url。
+    """
+    config = config or judge_llm_config()
+    if not uses_deepseek(config):
+        return {}
+    return {
+        'extra_body': copy.deepcopy(DEEPSEEK_EXTRA_BODY),
+        'max_tokens': DEEPSEEK_MAX_TOKENS,
+    }
 
 
 def describe_judge_llm(config=None):
@@ -269,7 +304,20 @@ def describe_judge_llm(config=None):
         'model': config.get('model'),
         'base_url': base_url.split('?', 1)[0] or None,
         'api_key_set': bool(config.get('api_key')),
+        'thinking_disabled': bool(completion_kwargs(config)),
     }
+
+
+def format_judge_log(config=None, suffix=''):
+    info = describe_judge_llm(config)
+    thinking = '已关闭' if info['thinking_disabled'] else '未改动'
+    text = (
+        f"裁判模型：{info['model']}，接口：{info['base_url'] or '默认 OpenAI'}，"
+        f"已配置密钥：{info['api_key_set']}，思考模式：{thinking}"
+    )
+    if suffix:
+        text = f'{text}，{suffix}'
+    return text
 
 
 def require_api_key(config=None):
@@ -288,6 +336,117 @@ def redact_secrets(text, config=None):
     if secret:
         rendered = rendered.replace(secret, '***')
     return rendered
+
+
+def apply_completion_kwargs(kwargs, options):
+    """把思考开关并进一次 chat.completions 调用。调用方写过的 max_tokens 保留。"""
+    if not options:
+        return kwargs
+    extra = {}
+    incoming = kwargs.get('extra_body')
+    if isinstance(incoming, dict):
+        extra.update(incoming)
+    forced = options.get('extra_body')
+    if isinstance(forced, dict):
+        extra.update(copy.deepcopy(forced))
+    if extra:
+        kwargs['extra_body'] = extra
+    for key, value in options.items():
+        if key == 'extra_body':
+            continue
+        kwargs.setdefault(key, value)
+    return kwargs
+
+
+def _apply_responses_kwargs(kwargs):
+    """Responses API 用 reasoning.effort=none 关闭思考，不把 chat 的 max_tokens 带过去。"""
+    reasoning = dict(kwargs.get('reasoning') or {})
+    reasoning['effort'] = 'none'
+    kwargs['reasoning'] = reasoning
+    return kwargs
+
+
+def _bind_method(owner, name, transform):
+    if owner is None or not hasattr(owner, name):
+        return
+    current = getattr(owner, name)
+    if getattr(current, '_dda_eval_bound', False):
+        return
+
+    def wrapped(*args, **kwargs):
+        transform(kwargs)
+        return current(*args, **kwargs)
+
+    wrapped._dda_eval_bound = True
+    try:
+        setattr(owner, name, wrapped)
+    except (AttributeError, TypeError):
+        return
+
+
+def bind_completion_options(client, options):
+    """在客户端上固定 DeepSeek 的思考开关。
+
+    RAGAS 的 instructor 和 TruLens 自己发请求，调用方不一定能把 extra_body 传进去。
+    绑在 chat.completions.create 上之后，后一层丢掉该参数也会重新补上。
+    TruLens 会先试 Responses API，那边用 reasoning.effort=none。
+    不改写 reasoning_effort 这个顶层参数：TruLens 发现不支持时会删掉它再重试，
+    包一层又加回去会让重试失败。
+    """
+    if not options or client is None:
+        return client
+    chat = getattr(client, 'chat', None)
+    completions = getattr(chat, 'completions', None) if chat is not None else None
+    _bind_method(
+        completions,
+        'create',
+        lambda kwargs: apply_completion_kwargs(kwargs, options),
+    )
+    responses = getattr(client, 'responses', None)
+    _bind_method(responses, 'create', _apply_responses_kwargs)
+    _bind_method(responses, 'parse', _apply_responses_kwargs)
+    return client
+
+
+def openai_client(config, *, async_client=False):
+    if async_client:
+        from openai import AsyncOpenAI as Client
+    else:
+        from openai import OpenAI as Client
+
+    kwargs = {'api_key': config['api_key']}
+    if config.get('base_url'):
+        kwargs['base_url'] = config['base_url']
+    return bind_completion_options(Client(**kwargs), completion_kwargs(config))
+
+
+def completion_text(completion):
+    """取出正文。思考把额度用完、正文为空时直接失败，避免把空答案送去打分。"""
+    choice = completion.choices[0] if getattr(completion, 'choices', None) else None
+    message = getattr(choice, 'message', None) if choice is not None else None
+    content = getattr(message, 'content', '') if message is not None else ''
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get('text') or ''))
+            else:
+                parts.append(str(getattr(part, 'text', part) or ''))
+        content = ''.join(parts)
+    text = content.strip() if isinstance(content, str) else str(content or '').strip()
+    if text:
+        return text
+    finish = getattr(choice, 'finish_reason', None) if choice is not None else None
+    reasoning = getattr(message, 'reasoning_content', None) if message is not None else None
+    if finish == 'length' or reasoning:
+        raise RuntimeError(
+            '模型没有返回答案正文'
+            f'（finish_reason={finish}）。'
+            'DeepSeek 默认把补全额度写进 reasoning_content，正文因此为空。'
+            '评测请求已关闭思考（thinking.type=disabled）。'
+            '请确认 EVAL_LLM_BASE_URL 指向的接口接受该字段。'
+        )
+    return ''
 
 
 class RetrievalPipeline:
@@ -328,7 +487,7 @@ class RagPipeline(RetrievalPipeline):
         if not contexts:
             return NO_CONTEXT_ANSWER
         config = require_api_key()
-        client = self._chat if self._chat is not None else _openai_client(config)
+        client = self._chat if self._chat is not None else openai_client(config)
         joined = '\n\n---\n\n'.join(contexts)
         completion = client.chat.completions.create(
             model=config['model'],
@@ -337,17 +496,9 @@ class RagPipeline(RetrievalPipeline):
                 {'role': 'system', 'content': GENERATION_SYSTEM},
                 {'role': 'user', 'content': f'问题：{question}\n\n检索片段：\n{joined}'},
             ],
+            **completion_kwargs(config),
         )
-        content = completion.choices[0].message.content if completion.choices else ''
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict):
-                    parts.append(str(part.get('text') or ''))
-                else:
-                    parts.append(str(getattr(part, 'text', part) or ''))
-            content = ''.join(parts)
-        return (content or '').strip()
+        return completion_text(completion)
 
     def run_item(self, project_id, item, *, generate=True):
         question = item['question'].strip()
@@ -362,15 +513,6 @@ class RagPipeline(RetrievalPipeline):
             'search_status': found.get('status') if isinstance(found, dict) else None,
         }
         return record, found
-
-
-def _openai_client(config):
-    from openai import OpenAI
-
-    kwargs = {'api_key': config['api_key']}
-    if config.get('base_url'):
-        kwargs['base_url'] = config['base_url']
-    return OpenAI(**kwargs)
 
 
 class QueryApp:
@@ -415,6 +557,95 @@ def write_json(path, payload):
         json.dumps(payload, ensure_ascii=False, indent=2, default=str) + '\n',
         encoding='utf-8',
     )
+
+
+def load_score_records(path):
+    """读取已经生成过的 records.json。不检索，也不重新生成答案。"""
+    file = Path(path)
+    if not file.is_file():
+        raise FileNotFoundError(f'找不到记录文件：{file}')
+    try:
+        payload = json.loads(file.read_text(encoding='utf-8'))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'记录文件不是合法 JSON：{exc}') from exc
+    if isinstance(payload, dict) and isinstance(payload.get('records'), list):
+        payload = payload['records']
+    if not isinstance(payload, list) or not payload:
+        raise ValueError('记录文件必须是非空 JSON 数组，或含非空 records 数组的对象。')
+    return [normalize_score_record(item, index) for index, item in enumerate(payload)]
+
+
+def normalize_score_record(item, index):
+    label = f'第 {index + 1} 条'
+    if not isinstance(item, dict):
+        raise ValueError(f'{label}必须是对象。')
+    question = item.get('user_input', item.get('question'))
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError(f'{label}缺少 user_input。')
+    contexts = item.get('retrieved_contexts', item.get('contexts'))
+    if not isinstance(contexts, list) or not all(isinstance(text, str) for text in contexts):
+        raise ValueError(f'{label}的 retrieved_contexts 必须是字符串数组。')
+    if 'response' in item:
+        response = item.get('response')
+    elif 'answer' in item:
+        response = item.get('answer')
+    else:
+        raise ValueError(f'{label}缺少 response，不能在没有答案的记录上打分。')
+    if not isinstance(response, str) or not response.strip():
+        raise ValueError(
+            f'{label}的 response 为空。请使用已经生成答案的 records.json，'
+            '而不是 --retrieve-only 的记录。'
+        )
+    reference = item.get('reference', '')
+    if reference is None:
+        reference = ''
+    if not isinstance(reference, str):
+        raise ValueError(f'{label}的 reference 须为字符串。')
+    item_id = item.get('id')
+    if item_id is None or str(item_id).strip() == '':
+        item_id = f'item-{index + 1}'
+    record = {
+        'id': str(item_id).strip(),
+        'user_input': question.strip(),
+        'retrieved_contexts': list(contexts),
+        'response': response.strip(),
+        'reference': reference.strip(),
+    }
+    if item.get('search_status') is not None:
+        record['search_status'] = item.get('search_status')
+    return record
+
+
+class RecordReplay:
+    """按已保存的记录回放片段和答案。不调用 EvidenceService，也不再生成。"""
+
+    def __init__(self, records):
+        self.by_question = {}
+        for record in records:
+            question = record['user_input']
+            if question in self.by_question:
+                raise ValueError(
+                    f'记录里有重复问题，TruLens 无法按问题回放：{record.get("id") or question}'
+                )
+            self.by_question[question] = record
+
+    def retrieve(self, project_id, question, item=None):
+        record = self._record(question)
+        found = {
+            'status': record.get('search_status'),
+            'coverage': None,
+        }
+        return list(record['retrieved_contexts']), found
+
+    def generate(self, question, contexts):
+        return self._record(question)['response']
+
+    def _record(self, question):
+        key = str(question or '').strip()
+        try:
+            return self.by_question[key]
+        except KeyError as exc:
+            raise ValueError(f'记录里没有这个问题：{key}') from exc
 
 
 def write_csv(path, rows):

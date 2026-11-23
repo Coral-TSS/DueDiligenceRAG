@@ -15,9 +15,13 @@ from pipeline import (  # noqa: E402
     REPO_ROOT,
     QueryApp,
     RagPipeline,
-    describe_judge_llm,
+    RecordReplay,
+    completion_kwargs,
     filter_payload,
+    format_judge_log,
     judge_llm_config,
+    load_score_records,
+    openai_client,
     prepare_run,
     redact_secrets,
     require_api_key,
@@ -27,7 +31,12 @@ from pipeline import (  # noqa: E402
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='用 TruLens 追踪并评测本机尽调检索。')
-    parser.add_argument('--dataset', required=True, help='黄金集 JSON。可以放在仓库外。')
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--dataset', help='黄金集 JSON。可以放在仓库外。')
+    source.add_argument(
+        '--score-from',
+        help='已有 records.json。回放片段和答案后再打分，不检索、不生成。',
+    )
     parser.add_argument('--out', default=str(ROOT / 'output'), help='结果目录')
     parser.add_argument('--project-id', default='', help='覆盖数据集里的 project_id')
     parser.add_argument('--dashboard', action='store_true', help='评测后打开本机 TruLens dashboard')
@@ -48,6 +57,12 @@ def make_provider(config=None):
     config = require_api_key(config or judge_llm_config())
     from trulens.providers.openai import OpenAI
 
+    options = completion_kwargs(config)
+    if options:
+        # 把已经关掉思考的客户端交给 TruLens。extra_body 不是 OpenAI 构造参数，
+        # 不能放进 provider 的 kwargs，否则会在建客户端时被拒绝。
+        client = openai_client(config)
+        return OpenAI(model_engine=config['model'], client=client)
     kwargs = {'model_engine': config['model'], 'api_key': config['api_key']}
     if config.get('base_url'):
         kwargs['base_url'] = config['base_url']
@@ -126,11 +141,11 @@ def open_session(database_url):
     return TruSession(database_url=database_url)
 
 
-def build_wrapped_app(project_id, app_version, database_url):
+def build_wrapped_app(project_id, app_version, database_url, pipeline=None):
     from trulens.apps.app import TruApp
 
     provider = make_provider()
-    pipeline = RagPipeline()
+    pipeline = pipeline if pipeline is not None else RagPipeline()
     app = build_instrumented_app(pipeline, project_id)
     # TruSession 是单例。必须先带数据库地址创建，TruApp 里再次调用才会沿用这个文件。
     session = open_session(database_url)
@@ -167,21 +182,78 @@ def retrieve_only(dataset, project_id, out):
     print(f'已按 --retrieve-only 写出检索记录，未生成答案，也未调用 TruLens。输出目录：{out}')
 
 
+def write_leaderboard(session, out):
+    try:
+        board = session.get_leaderboard()
+        if board is not None:
+            write_json(out / 'trulens_leaderboard.json', json_ready(board))
+            print(board)
+    except Exception as exc:
+        print(f'尚未生成 leaderboard：{redact_secrets(exc)}')
+
+
+def maybe_dashboard(args, session):
+    if args.dashboard:
+        from trulens.dashboard import run_dashboard
+
+        run_dashboard(session)
+
+
+def score_from(args, out):
+    """回放已有记录再打分。不检索、不生成，也不改写 records.json / traces.json。"""
+    if args.retrieve_only:
+        raise ValueError('--score-from 只做打分，不能与 --retrieve-only 同时使用。')
+    if str(args.project_id or '').strip():
+        raise ValueError('--score-from 不检索，不能同时覆盖 --project-id。')
+    require_api_key()
+    records = load_score_records(args.score_from)
+    replay = RecordReplay(records)
+    print(format_judge_log(
+        suffix=f'应用版本：{args.app_version}，根据已有记录回放片段和答案，不检索、不生成',
+    ))
+    out.mkdir(parents=True, exist_ok=True)
+    session, app, tru_app = build_wrapped_app(
+        'score-from',
+        args.app_version,
+        sqlite_url(out / 'trulens.sqlite'),
+        pipeline=replay,
+    )
+    answers = []
+    with tru_app:
+        for record in records:
+            answer = app.query(record['user_input'], filters=None)
+            preview = answer[:120].replace('\n', ' ')
+            print(f"{record['id']}: {preview}")
+            answers.append({
+                'id': record['id'],
+                'question': record['user_input'],
+                'answer': answer,
+                'context_count': len(app.last_contexts),
+                'search_status': (app.last_found or {}).get('status') if isinstance(app.last_found, dict) else None,
+                'filters': {},
+                'app_version': args.app_version,
+                'replayed': True,
+            })
+    write_json(out / 'trulens_answers.json', answers)
+    write_leaderboard(session, out)
+    print(f'已根据已有记录打分，未改写 records.json 或 traces.json。结果已写入：{out}')
+    maybe_dashboard(args, session)
+
+
 def main(argv=None):
     args = parse_args(argv)
-    dataset, project_id = prepare_run(args.dataset, args.project_id)
     out = Path(args.out)
+    if args.score_from:
+        score_from(args, out)
+        return
+    dataset, project_id = prepare_run(args.dataset, args.project_id)
     out.mkdir(parents=True, exist_ok=True)
     if args.retrieve_only:
         retrieve_only(dataset, project_id, out)
         return
 
     require_api_key()
-    info = describe_judge_llm()
-    print(
-        f"裁判模型：{info['model']}，接口：{info['base_url'] or '默认 OpenAI'}，"
-        f"已配置密钥：{info['api_key_set']}，应用版本：{args.app_version}"
-    )
+    print(format_judge_log(suffix=f'应用版本：{args.app_version}'))
     session, app, tru_app = build_wrapped_app(
         project_id,
         args.app_version,
@@ -204,18 +276,9 @@ def main(argv=None):
                 'app_version': args.app_version,
             })
     write_json(out / 'trulens_answers.json', answers)
-    try:
-        board = session.get_leaderboard()
-        if board is not None:
-            write_json(out / 'trulens_leaderboard.json', json_ready(board))
-            print(board)
-    except Exception as exc:
-        print(f'尚未生成 leaderboard：{redact_secrets(exc)}')
+    write_leaderboard(session, out)
     print(f'结果已写入：{out}')
-    if args.dashboard:
-        from trulens.dashboard import run_dashboard
-
-        run_dashboard(session)
+    maybe_dashboard(args, session)
 
 
 if __name__ == '__main__':

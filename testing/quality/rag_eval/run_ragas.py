@@ -14,9 +14,12 @@ if str(ROOT) not in sys.path:
 from pipeline import (  # noqa: E402
     REPO_ROOT,
     collect_records,
-    describe_judge_llm,
+    completion_kwargs,
+    format_judge_log,
     judge_llm_config,
+    load_score_records,
     metric_skip_message,
+    openai_client,
     prepare_run,
     RagPipeline,
     redact_secrets,
@@ -29,7 +32,12 @@ from pipeline import (  # noqa: E402
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='用 RAGAS 评测本机尽调检索（及可选生成）。')
-    parser.add_argument('--dataset', required=True, help='黄金集 JSON。可以放在仓库外。')
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--dataset', help='黄金集 JSON。可以放在仓库外。')
+    source.add_argument(
+        '--score-from',
+        help='已有 records.json。只打分，不检索、不生成，也不改写 records.json / traces.json。',
+    )
     parser.add_argument(
         '--out',
         default=str(ROOT / 'output'),
@@ -45,16 +53,17 @@ def parse_args(argv=None):
 
 
 def make_ragas_llm(config=None):
-    """OpenAI 兼容客户端 + llm_factory。DeepSeek 也走 provider=openai，以保留 base_url。"""
+    """OpenAI 兼容客户端 + llm_factory。DeepSeek 也走 provider=openai，以保留 base_url。
+
+    客户端预先绑上思考开关。llm_factory 的 kwargs 再送一遍，用来盖过 RAGAS 默认的
+    max_tokens=1024；instructor 若丢掉 extra_body，客户端绑定仍会补上。
+    """
     config = require_api_key(config or judge_llm_config())
-    from openai import AsyncOpenAI
     from ragas.llms import llm_factory
 
-    kwargs = {'api_key': config['api_key']}
-    if config.get('base_url'):
-        kwargs['base_url'] = config['base_url']
-    client = AsyncOpenAI(**kwargs)
+    client = openai_client(config, async_client=True)
     factory_kwargs = {'provider': 'openai', 'client': client}
+    factory_kwargs.update(completion_kwargs(config))
     mode = (os.environ.get('EVAL_RAGAS_INSTRUCTOR_MODE') or '').strip().lower()
     if mode in {'md_json', 'markdown'}:
         import instructor
@@ -108,13 +117,14 @@ def metric_value(metric, **kwargs):
     return float(value)
 
 
-def score_records(records, llm=None):
+def score_records(records, llm=None, scorers=None):
     selection = select_metric_names(records)
     message = metric_skip_message(selection)
     if message:
         print(message)
-    llm = llm or make_ragas_llm()
-    scorers = build_scorers(llm, selection['selected'])
+    if scorers is None:
+        llm = llm or make_ragas_llm()
+        scorers = build_scorers(llm, selection['selected'])
     rows = []
     for record in records:
         row = {'id': record['id'], 'user_input': record['user_input']}
@@ -144,8 +154,27 @@ def score_records(records, llm=None):
     }
 
 
+def score_from(args, out):
+    """只对已有记录打分。不调用检索和生成，也不改写 records.json / traces.json。"""
+    if args.retrieve_only:
+        raise ValueError('--score-from 只做打分，不能与 --retrieve-only 同时使用。')
+    if str(args.project_id or '').strip():
+        raise ValueError('--score-from 不检索，不能同时覆盖 --project-id。')
+    require_api_key()
+    records = load_score_records(args.score_from)
+    print(format_judge_log(suffix='根据已有记录打分，不检索、不生成'))
+    scores = score_records(records)
+    write_json(out / 'ragas_scores.json', scores)
+    write_csv(out / 'ragas_scores.csv', scores['rows'])
+    print(f'已根据已有记录打分，未改写 records.json 或 traces.json。结果已写入：{out}')
+
+
 def main(argv=None):
     args = parse_args(argv)
+    out = Path(args.out)
+    if args.score_from:
+        score_from(args, out)
+        return
     dataset, project_id = prepare_run(args.dataset, args.project_id)
     if not args.retrieve_only:
         require_api_key()
@@ -156,17 +185,12 @@ def main(argv=None):
         dataset['items'],
         generate=not args.retrieve_only,
     )
-    out = Path(args.out)
     write_json(out / 'records.json', records)
     write_json(out / 'traces.json', traces)
     if args.retrieve_only:
         print(f'已按 --retrieve-only 写出检索记录，未调用 RAGAS。输出目录：{out}')
         return
-    info = describe_judge_llm()
-    print(
-        f"裁判模型：{info['model']}，接口：{info['base_url'] or '默认 OpenAI'}，"
-        f"已配置密钥：{info['api_key_set']}"
-    )
+    print(format_judge_log())
     scores = score_records(records)
     write_json(out / 'ragas_scores.json', scores)
     write_csv(out / 'ragas_scores.csv', scores['rows'])

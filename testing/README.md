@@ -40,4 +40,4 @@
 
 阅读器行为回归位于 `tests/test_reader_regressions.py`，执行 `scripts/frontend/reader-regression.cjs`。需要 Node.js 22+：`node` 在 `PATH` 上，或设置 `DDA_TEST_NODE`。这组用真实前端脚本与受控 DOM／网络响应验证缓存失效、按需读取、失败切页和请求竞态，不需要安装浏览器或模型。
 
-`quality/rag_eval/` 评测检索质量，安装和运行见该目录的 README。它不是 RG-04 固定集，也不是 Harness 的 dsh-eval。黄金集用 `--dataset` 指向仓库外的文件，不入库。
+`quality/rag_eval/` 评测检索质量，安装和运行见该目录的 README。它不是 RG-04 固定集，也不是 Harness 的 dsh-eval。黄金集用 `--dataset` 指向仓库外的文件，不入库。已经生成的 `records.json` 可以用 `run_ragas.py --score-from` 或 `run_trulens.py --score-from` 单独打分。
