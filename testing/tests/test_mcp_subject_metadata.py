@@ -201,7 +201,7 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
             assert office_hit['point_date'] is None
             assert office_hit['period_start'] == '2023-01-01'
             assert office_hit['period_end'] == '2023-12-31'
-            assert office_hit['locator'] == {'kind': 'docx_paragraph', 'paragraph': 1}
+            assert office_hit['locator'] == {'kind': 'docx_paragraphs', 'paragraph_from': 1, 'paragraph_to': 1}
             assert office_hit['locator_label']
             assert 'PDF 第' not in office_hit['locator_label']
             assert office_hit['unit_id']
@@ -245,14 +245,14 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
             assert '注册资本办公说明' in office_read['text']
             assert office_read['index_kind'] == 'source_unit'
             assert office_read['index_version'] == office_version
-            assert office_read['locator']['kind'] == 'docx_paragraph'
+            assert office_read['locator']['kind'] == 'docx_paragraphs'
             assert office_read['formula_state'] == ''
             assert 'PDF 第' not in office_read['locator_label']
             _assert_material(office_read, 'finance', subject_id, '甲公司', 'target', 'period', None, '2023-01-01', '2023-12-31')
 
             office_range = _payload(session.call('tools/call', {'name': 'read_evidence', 'arguments': {
                 'project_id': project_id, 'document_id': office_id, 'limit': 4000}}, 16))
-            assert any(item.get('unit_id') and item['locator']['kind'] == 'docx_paragraph' for item in office_range['items'])
+            assert any(item.get('unit_id') and item['locator']['kind'] == 'docx_paragraphs' for item in office_range['items'])
             assert 'category' not in office_range['items'][0]
             _assert_material(office_range, 'finance', subject_id, '甲公司', 'target', 'period', None, '2023-01-01', '2023-12-31')
             denied = session.call('tools/call', {'name': 'read_evidence', 'arguments': {
@@ -276,7 +276,7 @@ def test_subjects_and_material_metadata_on_both_transports(tmp_path, database_ur
         assert hits['注册资本章程甲。']['source_revision'] == revision
         assert hits['注册资本章程甲。']['index_version'] == page_version
         assert 'locator' not in hits['注册资本章程甲。']
-        assert hits['注册资本办公说明。']['locator']['kind'] == 'docx_paragraph'
+        assert hits['注册资本办公说明。']['locator']['kind'] == 'docx_paragraphs'
         assert hits['注册资本办公说明。']['unit_id']
         assert hits['注册资本办公说明。']['formula_state'] == ''
         assert hits['注册资本办公说明。']['index_version'] == office_version

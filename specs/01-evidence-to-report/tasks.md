@@ -1,10 +1,10 @@
 # 项目任务清单
 
-更新：2026-11-10。基线是默认分支 `eaf3fac`（含 PR #15）。PC-ISO、PC-UI、PC-FMT 已在 PR #12 落地。RG-02、RG-03、RG-07 的仓库内部分和 RG-04 脚手架已有工程测试；本机与真实模型未验收。评测集和真实模型由用户在本机运行。RG-07 已增加 Streamable HTTP `/mcp`，状态仍是工程完成、本机验收待定；用 dsh 连本机仍待用户在 Windows 上验收。
+更新：2026-11-23。基线是默认分支 `eaf3fac`（含 PR #15）。PC-ISO、PC-UI、PC-FMT 已在 PR #12 落地。RG-02、RG-03、RG-07 的仓库内部分和 RG-04 脚手架已有工程测试；本机与真实模型未验收。评测集和真实模型由用户在本机运行。RG-07 已增加 Streamable HTTP `/mcp`，状态仍是工程完成、本机验收待定；用 dsh 连本机仍待用户在 Windows 上验收。PC-FMT-ROW 把 Office 检索单元改成完整事实，索引版本 `office-unit-v2`；不自动重建，用户须重新处理 Office 材料。
 
 本文件只有下面这一张表。状态、顺序和依赖只改这张表，不再另开章节、阶段表或“下一步”列表。细节见 [spec.md](./spec.md)、[plan.md](./plan.md)、[project-center-spec.md](./project-center-spec.md)、[project-center-plan.md](./project-center-plan.md)、[project-center-test-design.md](./project-center-test-design.md)、[material-metadata-spec.md](./material-metadata-spec.md)、[material-metadata-test-design.md](./material-metadata-test-design.md)。回归数字和过程在 [tasks-history.md](./tasks-history.md)；那份说明**不是**任务清单，也不维护当前状态。
 
-读表顺序：待做、工程完成、本机验收待定、待核实、待确认、暂缓、放弃、移交、已完成。同一状态内看“顺序”。工程完成不等于客户整卷或真实模型质量验收。迁移文件仍到 `019_material_metadata.sql`，健康检查要求 schema 19。本轮没有新迁移。
+读表顺序：待做、工程完成、本机验收待定、待核实、待确认、暂缓、放弃、移交、已完成。同一状态内看“顺序”。工程完成不等于客户整卷或真实模型质量验收。迁移文件到 `022_drop_uncategorized.sql`，健康检查要求 schema 22。PC-FMT-ROW 没有新迁移。
 
 | 顺序 | ID | 目标 | 状态 | 依赖 | 验收／证据 |
 | --- | --- | --- | --- | --- | --- |
@@ -24,6 +24,7 @@
 | 32 | OBS-03 | GPU 上复测或排除调度等待。不靠加长测试等待关闭 | 待核实 | 无 | [历史说明](./tasks-history.md#obs) |
 | 33 | OBS-04 | 继续观察测试库初始化、连接和关闭等待 | 待核实 | 无 | 运行目录里的 database-lifecycle.jsonl，不入库长文 |
 | 10 | PC-FMT | 首批按 DOCX、再 XLSX、再 PPTX 解析。用户已确认并实施 | 工程完成、本机验收待定 | 无 | PR #12 提交 `2e6c00b`、`8435bb8`。实现在 `src/dd_agent/office.py`，断言在 `testing/tests/test_office_formats.py`。同上运行 `20261110-024545-0e8a9d`（528 通过、29 失败、16 跳过）。未做本机验收 |
+| 11 | PC-FMT-ROW | Office 检索单元改为完整事实：Excel 按数据行配表头，Word 正文按标题合并、表格按行，PPT 在长度内按幻灯片或形状合并。索引版本 office-unit-v2。不自动重建；用户须重新处理 Office 后再跑检索评测 | 工程完成、本机验收待定 | PC-FMT | 无新迁移，不改材料类别。断言在 `testing/tests/test_office_units.py` 及原 Office 测试。重新处理的步骤见 [README](../../README.md)。未做本机或真实模型验收 |
 | — | RG-05l3 | 清理预览。别名 l3 | 暂缓 | 无 | [plan 的 RG-05l](./plan.md#rg-05l可证明安全的回收)。不删除原件 |
 | — | RG-05l4 | 回收无引用缓存。别名 l4 | 暂缓 | 无 | 同上 |
 | — | JV-01 | 可选 Jev 重排：核实外发边界并冻结本地基线。不是入库加速 | 暂缓 | RG-04 | [Jev 实验](./plan.md#jev四组实验与融合算法) |

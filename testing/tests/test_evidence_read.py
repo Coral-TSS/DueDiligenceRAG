@@ -171,12 +171,12 @@ def test_office_evidence_keeps_its_locator_and_rejects_the_other_project(tmp_pat
     assert found.status_code == 200, found.text
     body = found.json()
     assert body['index_kind'] == 'source_unit'
-    assert body['locator']['kind'] == 'docx_paragraph'
+    assert body['locator']['kind'] == 'docx_paragraphs'
     assert 'PDF 第' not in body['locator_label']
     assert '甲公司章程约定注册资本' in body['text']
     assert denied.status_code == 404
     assert '章程约定注册资本' not in denied.text
     assert denied.json()['detail'] == '证据不存在或不属于当前项目。'
     assert ranged.status_code == 200, ranged.text
-    assert any(item['locator']['kind'] == 'docx_paragraph' for item in ranged.json()['items'])
+    assert any(item['locator']['kind'] == 'docx_paragraphs' for item in ranged.json()['items'])
     assert 'PDF 第' not in ranged.text

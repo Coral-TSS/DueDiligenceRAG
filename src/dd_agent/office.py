@@ -1,18 +1,31 @@
 """现代 DOCX／XLSX／PPTX 的登记、来源单元和向量。旧版 DOC／XLS／PPT 先转换再走同一条解析。不把它们写成 PDF 页。
 
-Word 嵌入图走现有 OCR，识别出的文字才入库。材料只有在应入库的向量都写进当前索引版本后才算处理完成。
+检索单元按完整事实切，而不是按单元格或自然段各切一条。Excel 每个数据行配上工作表名和列名，
+只有一列的说明文字再按行范围合并；Word 表格一行配上表头，正文在同一标题下合并；
+幻灯片在长度内合并形状文字。
+超长单元再按 chunks.MAX_CHARS 切开，原文不截断。Word 嵌入图走现有 OCR，识别出的文字才入库。
+材料只有在应入库的向量都写进当前索引版本后才算处理完成。
+
+INDEX_UNIT_VERSION 变了之后，旧 Office 向量不再命中当前检索，覆盖缺口会标成待重建。
+这里不自动重跑处理，要等用户对那份材料再次处理。
 """
 import json
+import re
 import zipfile
+import xml.etree.ElementTree as ET
 from io import BytesIO
 from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
+from .chunks import MAX_CHARS, split_text
+from .chunks import _HEADING
 from .lexical import document_tsvector
 
 
 PARSE_VERSION = 'office-v1'
+# 单元形状版本。只影响 office_version() 的哈希，不改表结构，也不触发自动重建。
+INDEX_UNIT_VERSION = 'office-unit-v2'
 _PACKAGE = {
     '.docx': 'word/document.xml',
     '.xlsx': 'xl/workbook.xml',
@@ -40,7 +53,7 @@ def office_version(profile):
     if not profile:
         return None
     import hashlib
-    return hashlib.sha256(('office-unit-v1' + profile).encode()).hexdigest()
+    return hashlib.sha256((INDEX_UNIT_VERSION + profile).encode()).hexdigest()
 
 
 def _has_index_text(text):
@@ -185,16 +198,72 @@ def classify_saved_file(filename, path, soffice_resolver=None):
     return 'registered', '已登记，待解析。尚未提取段落、表格、单元格或幻灯片文字。'
 
 
+def _bounds(start, end):
+    if start is None:
+        return ''
+    if end is None or end == start:
+        return str(start)
+    return f'{start}–{end}'
+
+
+def _column_number(letter):
+    number = 0
+    for char in str(letter):
+        if not char.isalpha():
+            return None
+        number = number * 26 + (ord(char.upper()) - 64)
+    return number or None
+
+
+def _column_bounds(columns):
+    if not columns:
+        return ''
+    if len(columns) == 1:
+        return str(columns[0])
+    if all(isinstance(item, int) for item in columns):
+        if list(columns) == list(range(columns[0], columns[0] + len(columns))):
+            return f'{columns[0]}–{columns[-1]}'
+        return '、'.join(str(item) for item in columns)
+    numbers = [_column_number(item) for item in columns]
+    if all(numbers) and numbers == list(range(numbers[0], numbers[0] + len(numbers))):
+        return f'{columns[0]}–{columns[-1]}'
+    return '、'.join(str(item) for item in columns)
+
+
 def locator_label(locator, formula_state=''):
     kind = locator.get('kind')
     if kind == 'docx_paragraph':
         label = f"段落 {locator['paragraph']}"
+    elif kind == 'docx_paragraphs':
+        label = '段落 ' + _bounds(locator.get('paragraph_from'), locator.get('paragraph_to'))
+        heading = locator.get('heading_paragraph')
+        if heading and heading != locator.get('paragraph_from'):
+            label += f'，标题在段落 {heading}'
     elif kind == 'docx_table_cell':
         label = f"表{locator['table']} 行{locator['row']} 列{locator['column']}"
+    elif kind == 'docx_table_row':
+        row = _bounds(locator.get('row'), locator.get('row_to', locator.get('row')))
+        label = f"表{locator['table']} 行{row}"
+        columns = locator.get('columns') or []
+        if columns:
+            label += ' 列' + _column_bounds(columns)
     elif kind == 'xlsx_cell':
         label = f"工作表{locator['sheet']} 行{locator['row']} 列{locator['column']}"
+    elif kind == 'xlsx_rows':
+        label = f"工作表{locator.get('sheet')} 行{_bounds(locator.get('row_from'), locator.get('row_to'))}"
+        columns = locator.get('columns') or []
+        if columns:
+            label += ' 列' + _column_bounds(columns)
     elif kind == 'pptx_paragraph':
         label = f"幻灯片{locator['slide']} 形状{locator['shape']} 段落{locator['paragraph']}"
+    elif kind == 'pptx_slide':
+        label = f"幻灯片{locator.get('slide')}"
+        if locator.get('shape_from'):
+            label += ' 形状' + _bounds(locator.get('shape_from'), locator.get('shape_to', locator.get('shape_from')))
+    elif kind == 'pptx_shape':
+        label = f"幻灯片{locator.get('slide')} 形状{locator.get('shape')}"
+        if locator.get('paragraph_from'):
+            label += ' 段落' + _bounds(locator.get('paragraph_from'), locator.get('paragraph_to'))
     elif kind == 'docx_image':
         part = str(locator.get('part') or 'document')
         ordinal = locator.get('ordinal', 1)
@@ -206,8 +275,14 @@ def locator_label(locator, formula_state=''):
             label = f"图片 {ordinal}"
     else:
         label = '来源'
+    parts = locator.get('parts')
+    part = locator.get('part')
+    if isinstance(parts, int) and parts > 1 and isinstance(part, int):
+        label += f'（{part}/{parts}）'
     if formula_state == 'not_recalculated':
         label += '（含公式，未重算）'
+    if locator.get('unknown_columns') and formula_state != 'unknown':
+        label += '（部分公式未知）'
     return label
 
 
@@ -218,12 +293,70 @@ def _key(locator):
 def parse_office(filename, blob):
     ext = _extension(filename)
     if ext == '.docx':
-        return _parse_docx(blob)
+        return _bound_units(_parse_docx(blob))
     if ext == '.xlsx':
-        return _parse_xlsx(blob)
+        return _bound_units(_parse_xlsx(blob))
     if ext == '.pptx':
-        return _parse_pptx(blob)
+        return _bound_units(_parse_pptx(blob))
     return []
+
+
+def _pieces(text):
+    """把超长原文切成不超过 MAX_CHARS 的片段。重叠可以有，缺字不行。"""
+    parts = [item['text'] for item in split_text(text) if item.get('text')]
+    if parts and all(len(part) <= MAX_CHARS for part in parts):
+        return parts
+    return _hard_slices(text, MAX_CHARS)
+
+
+def _hard_slices(text, limit):
+    slices = []
+    cursor = 0
+    while cursor < len(text):
+        stop = min(cursor + limit, len(text))
+        if stop < len(text):
+            window = text[cursor:stop]
+            cut = max(window.rfind('\n'), window.rfind('。'), window.rfind('；'), window.rfind('|'))
+            if cut >= max(1, limit // 3):
+                stop = cursor + cut + 1
+        piece = text[cursor:stop].strip()
+        if piece:
+            slices.append(piece)
+        if stop <= cursor:
+            stop = min(cursor + limit, len(text))
+        cursor = stop
+    return slices
+
+
+def _bound_units(units):
+    bounded = []
+    for unit in units:
+        text = unit['text']
+        if unit['status'] != 'succeeded' or len(text) <= MAX_CHARS:
+            bounded.append(unit)
+            continue
+        pieces = _pieces(text) or [text]
+        total = len(pieces)
+        for index, piece in enumerate(pieces, 1):
+            locator = dict(unit['locator'])
+            if total > 1:
+                locator['part'] = index
+                locator['parts'] = total
+            bounded.append(_unit(
+                locator, piece, formula_state=unit['formula_state'],
+                status=unit['status'], error_code=unit['error_code']))
+    return bounded
+
+
+def _is_heading(paragraph, text):
+    style = paragraph.style
+    name = (style.name or '') if style is not None else ''
+    style_id = (getattr(style, 'style_id', '') or '') if style is not None else ''
+    if name.startswith('Heading') or name.startswith('标题') or style_id.startswith('Heading'):
+        return True
+    if name in {'Title', '标题'} or style_id == 'Title':
+        return True
+    return _HEADING.match(text) is not None
 
 
 def _parse_docx(blob):
@@ -231,27 +364,340 @@ def _parse_docx(blob):
     from .docx_images import blob_with_missing_targets
     # 缺图时 python-docx 会拒绝打开整包。先补空部件，只为读出文字；图片是否提出仍按原件判断。
     document = Document(BytesIO(blob_with_missing_targets(blob)))
+    units = _docx_paragraph_units(document)
+    for table_index, table in enumerate(document.tables, 1):
+        units.extend(_docx_table_units(table_index, table))
+    return units
+
+
+def _docx_paragraph_units(document):
     units = []
+    group = []
+    heading_index = None
+    heading_text = ''
+
+    def flush():
+        nonlocal group
+        if group:
+            units.extend(_pack_paragraphs(group, heading_index, heading_text))
+        group = []
+
     for index, paragraph in enumerate(document.paragraphs, 1):
         text = paragraph.text.strip()
-        if text:
-            units.append(_unit({'kind': 'docx_paragraph', 'paragraph': index}, text))
-    for table_index, table in enumerate(document.tables, 1):
-        for row_index, row in enumerate(table.rows, 1):
-            for column_index, cell in enumerate(row.cells, 1):
-                paragraphs = [item.text.strip() for item in cell.paragraphs if item.text.strip()]
-                for paragraph_index, text in enumerate(paragraphs, 1):
-                    units.append(_unit({
-                        'kind': 'docx_table_cell', 'table': table_index, 'row': row_index,
-                        'column': column_index, 'paragraph': paragraph_index,
-                    }, text))
+        if not text:
+            continue
+        if _is_heading(paragraph, text):
+            flush()
+            heading_index = index
+            heading_text = text
+            group = [(index, text)]
+            continue
+        group.append((index, text))
+    flush()
     return units
+
+
+def _pack_paragraphs(group, heading_index, heading_text):
+    units = []
+    current = []
+
+    def emit(batch, prefix_heading=False):
+        if not batch:
+            return
+        body = '\n'.join(text for _, text in batch)
+        locator = {
+            'kind': 'docx_paragraphs',
+            'paragraph_from': batch[0][0],
+            'paragraph_to': batch[-1][0],
+        }
+        if (prefix_heading and heading_text and heading_index
+                and batch[0][0] != heading_index
+                and len(heading_text) + 1 + len(body) <= MAX_CHARS):
+            body = heading_text + '\n' + body
+            locator['heading_paragraph'] = heading_index
+        _append_text_units(units, locator, body)
+
+    for index, text in group:
+        if len(text) > MAX_CHARS:
+            emit(current, prefix_heading=bool(current) and current[0][0] != heading_index)
+            current = []
+            pieces = _pieces(text)
+            total = len(pieces)
+            for part, piece in enumerate(pieces, 1):
+                body = piece
+                locator = {
+                    'kind': 'docx_paragraphs',
+                    'paragraph_from': index,
+                    'paragraph_to': index,
+                }
+                if (heading_text and heading_index and index != heading_index
+                        and len(heading_text) + 1 + len(piece) <= MAX_CHARS):
+                    body = heading_text + '\n' + piece
+                    locator['heading_paragraph'] = heading_index
+                if total > 1:
+                    locator['part'] = part
+                    locator['parts'] = total
+                units.append(_unit(locator, body))
+            continue
+        prospective = current + [(index, text)]
+        joined = '\n'.join(item for _, item in prospective)
+        if heading_text and prospective and prospective[0][0] != heading_index:
+            joined = heading_text + '\n' + joined
+        if current and len(joined) > MAX_CHARS:
+            emit(current, prefix_heading=current[0][0] != heading_index)
+            current = [(index, text)]
+        else:
+            current = prospective
+    emit(current, prefix_heading=bool(current) and current[0][0] != heading_index)
+    return units
+
+
+def _append_text_units(units, locator, text):
+    if len(text) <= MAX_CHARS:
+        units.append(_unit(locator, text))
+        return
+    pieces = _pieces(text)
+    total = len(pieces)
+    for index, piece in enumerate(pieces, 1):
+        piece_locator = dict(locator)
+        if total > 1:
+            piece_locator['part'] = index
+            piece_locator['parts'] = total
+        units.append(_unit(piece_locator, piece))
+
+
+def _word_row_cells(row):
+    entries = []
+    seen = []
+    column = 1 + (getattr(row, 'grid_cols_before', 0) or 0)
+    for cell in row.cells:
+        if any(cell is previous for previous in seen):
+            column += 1
+            continue
+        seen.append(cell)
+        texts = [paragraph.text.strip() for paragraph in cell.paragraphs if paragraph.text.strip()]
+        text = ' '.join(texts)
+        if text:
+            entries.append((column, text))
+        column += 1
+    return entries
+
+
+def _docx_table_units(table_index, table):
+    rows = []
+    for row_index, row in enumerate(table.rows, 1):
+        cells = _word_row_cells(row)
+        if cells:
+            rows.append((row_index, cells))
+    if not rows:
+        return []
+    titles, rest = _leading_titles(rows)
+    if not rest:
+        rest = rows
+        titles = []
+    labels = _label_map(rest) if _row_is_header(rest) else None
+    data = rest[1:] if labels else rest
+    if labels and not data:
+        data = rest
+        labels = None
+    units = []
+    prefix = [f'表{table_index}', *titles]
+    for row_index, cells in data:
+        fields, unknown = _fields_for_cells(cells, labels)
+        locator = {
+            'kind': 'docx_table_row',
+            'table': table_index,
+            'row': row_index,
+        }
+        units.extend(_units_from_fields(locator, prefix, fields, unknown, row_key='row', row_value=row_index))
+    return units
+
+
+_NUMERIC_TEXT = re.compile(r'^[+-]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d+)?(?:%|％)?$')
+_YEAR_TEXT = re.compile(r'^(?:19|20)\d{2}年?$')
+
+
+def _is_numeric_text(text):
+    raw = ''.join(str(text).split())
+    raw = raw.replace('＋', '+').replace('－', '-').replace('−', '-')
+    for suffix in ('万元', '亿元', '元', '万', '亿'):
+        if raw.endswith(suffix) and len(raw) > len(suffix):
+            raw = raw[:-len(suffix)]
+            break
+    raw = raw.replace(',', '').replace('，', '')
+    return _NUMERIC_TEXT.match(raw) is not None
+
+
+def _header_like(raw, text):
+    if isinstance(raw, bool):
+        return False
+    if isinstance(raw, (int, float)):
+        number = float(raw)
+        if not number.is_integer():
+            return False
+        year = int(number)
+        return 1900 <= year <= 2100
+    stripped = str(text).strip()
+    if _YEAR_TEXT.match(stripped):
+        return True
+    return not _is_numeric_text(stripped)
+
+
+def _leading_titles(rows):
+    """rows 是 (row_number, cells)。横跨多列之前的单格行当成标题，不拿去当列名。"""
+    titles = []
+    rest = list(rows)
+    while rest and len(rest[0][1]) == 1 and any(len(cells) >= 2 for _, cells in rest[1:]):
+        cell = rest[0][1][0]
+        if _cell_unknown(cell):
+            break
+        titles.append(_cell_text(cell))
+        rest = rest[1:]
+    return titles, rest
+
+
+def _row_is_header(rows):
+    if len(rows) < 2:
+        return False
+    known = [cell for cell in rows[0][1] if not _cell_unknown(cell)]
+    if len(known) < 2 or not all(_header_like(_cell_raw(cell), _cell_text(cell)) for cell in known):
+        return False
+    later = [cell for _, cells in rows[1:] for cell in cells if not _cell_unknown(cell)]
+    later_numeric = any(not _header_like(_cell_raw(cell), _cell_text(cell)) for cell in later)
+    if later_numeric or len(known) >= 3:
+        return True
+    widths = [len([cell for cell in cells if not _cell_unknown(cell)]) for _, cells in rows]
+    if all(width == 2 for width in widths) and not later_numeric:
+        return False
+    return False
+
+
+def _label_map(rows):
+    header = [cell for cell in rows[0][1] if not _cell_unknown(cell) and _cell_text(cell)]
+    counts = {}
+    for cell in header:
+        counts[_cell_text(cell)] = counts.get(_cell_text(cell), 0) + 1
+    labels = {}
+    for cell in header:
+        text = _cell_text(cell)
+        column = _cell_column(cell)
+        labels[_cell_key(cell)] = f'{text}（{column}）' if counts[text] > 1 else text
+    return labels
+
+
+def _fields_for_cells(cells, labels):
+    unknown = [_cell_column(cell) for cell in cells if _cell_unknown(cell)]
+    known = [cell for cell in cells if not _cell_unknown(cell) and _cell_text(cell)]
+    if labels is None and len(known) == 2 and not unknown:
+        left, right = known
+        field = _Field(
+            f'{_cell_text(left)}: {_cell_text(right)}',
+            [_cell_column(left), _cell_column(right)],
+            [_cell_state(left), _cell_state(right)])
+        return [field], unknown
+    fields = []
+    for cell in known:
+        label = labels.get(_cell_key(cell)) if labels else None
+        if not label:
+            label = _cell_column(cell)
+        fields.append(_Field(f'{label}: {_cell_text(cell)}', [_cell_column(cell)], [_cell_state(cell)]))
+    return fields, unknown
+
+
+class _Field:
+    def __init__(self, text, columns, states):
+        self.text = text
+        self.columns = list(columns)
+        self.states = list(states)
+
+
+def _units_from_fields(locator, prefix, fields, unknown, *, row_key, row_value):
+    if not fields:
+        if not unknown:
+            return []
+        blank = dict(locator)
+        blank['columns'] = list(unknown)
+        blank['unknown_columns'] = list(unknown)
+        return [_unit(blank, '', formula_state='unknown')]
+    packed = _pack_fields(prefix, fields)
+    total = len(packed)
+    units = []
+    for index, (text, columns, states) in enumerate(packed, 1):
+        piece = dict(locator)
+        piece[row_key] = row_value
+        piece['columns'] = columns
+        if unknown:
+            piece['unknown_columns'] = list(unknown)
+        if total > 1:
+            piece['part'] = index
+            piece['parts'] = total
+        formula_state = 'not_recalculated' if 'not_recalculated' in states else ''
+        units.append(_unit(piece, text, formula_state=formula_state))
+    return units
+
+
+def _pack_fields(prefix, fields):
+    if not fields:
+        return []
+    label = fields[0]
+    chunks = []
+    current = [label]
+    for field in fields[1:]:
+        if _joined_length(prefix, current + [field]) <= MAX_CHARS:
+            current.append(field)
+            continue
+        chunks.append(current)
+        if field is not label and _joined_length(prefix, [label, field]) <= MAX_CHARS:
+            current = [label, field]
+        else:
+            current = [field]
+    if current:
+        chunks.append(current)
+    packed = []
+    for chunk in chunks:
+        packed.extend(_expand_chunk(prefix, chunk))
+    return packed
+
+
+def _joined_length(prefix, fields):
+    return len(_render(prefix, fields))
+
+
+def _render(prefix, fields):
+    parts = [part for part in prefix if part]
+    parts.extend(field.text for field in fields)
+    return ' | '.join(parts)
+
+
+def _expand_chunk(prefix, fields):
+    text = _render(prefix, fields)
+    columns = []
+    states = []
+    for field in fields:
+        for column in field.columns:
+            if column not in columns:
+                columns.append(column)
+        states.extend(field.states)
+    if len(text) <= MAX_CHARS:
+        return [(text, columns, states)]
+    head = _render(prefix, fields[:1]) if fields else ' | '.join(part for part in prefix if part)
+    pieces = []
+    for piece in _pieces(text):
+        if head and head not in piece and len(head) + 3 + len(piece) <= MAX_CHARS:
+            piece = head + ' | ' + piece
+        if len(piece) <= MAX_CHARS:
+            pieces.append((piece, columns, states))
+            continue
+        for smaller in _hard_slices(piece, MAX_CHARS):
+            pieces.append((smaller, columns, states))
+    return pieces
 
 
 def _parse_xlsx(blob):
     from openpyxl import load_workbook
     formulas = load_workbook(BytesIO(blob), data_only=False, read_only=True)
     cached = load_workbook(BytesIO(blob), data_only=True, read_only=True)
+    merges = _xlsx_merges(blob)
     units = []
     try:
         for name in formulas.sheetnames:
@@ -259,26 +705,271 @@ def _parse_xlsx(blob):
             if getattr(sheet, 'sheet_state', 'visible') != 'visible':
                 continue
             values = cached[name]
-            for row in sheet.iter_rows():
-                for cell in row:
-                    if cell.value is None:
-                        continue
-                    formula = isinstance(cell.value, str) and cell.value.startswith('=')
-                    cached_cell = values.cell(cell.row, cell.column)
-                    cached_value = cached_cell.value
-                    locator = {'kind': 'xlsx_cell', 'sheet': name, 'row': cell.row, 'column': cell.column_letter}
-                    if formula and (cached_value is None or (isinstance(cached_value, str) and cached_value.startswith('='))):
-                        units.append(_unit(locator, '', formula_state='unknown'))
-                    elif formula:
-                        units.append(_unit(locator, str(cached_value), formula_state='not_recalculated'))
-                    else:
-                        text = str(cell.value).strip()
-                        if text:
-                            units.append(_unit(locator, text))
+            units.extend(_xlsx_sheet_units(name, sheet, values, merges.get(name) or []))
     finally:
         formulas.close()
         cached.close()
     return units
+
+
+def _xlsx_sheet_units(name, sheet, values, merges):
+    by_row = {}
+    for formula_row, cached_row in zip(sheet.iter_rows(), values.iter_rows()):
+        for formula_cell, cached_cell in zip(formula_row, cached_row):
+            fact = _xlsx_cell(formula_cell, cached_cell)
+            if fact is None:
+                continue
+            by_row.setdefault(fact.row, {})[fact.column_index] = fact
+    _fill_vertical_merges(by_row, merges)
+    rows = []
+    for row_number in sorted(by_row):
+        cells = [by_row[row_number][key] for key in sorted(by_row[row_number])]
+        if cells:
+            rows.append((row_number, cells))
+    if not rows:
+        return []
+    vertical_starts = {min_row for min_row, _min_col, max_row, _max_col in merges if max_row > min_row}
+    titles, rest = _xlsx_titles(rows, vertical_starts)
+    if not rest:
+        rest = rows
+        titles = []
+    if _single_column_prose(rest):
+        return _xlsx_prose_units(name, titles, rest)
+    labels = _label_map(rest) if _row_is_header(rest) else None
+    data = rest[1:] if labels else rest
+    if labels and not data:
+        data = rest
+        labels = None
+    prefix = [f'工作表{name}', *titles]
+    units = []
+    for row_number, cells in data:
+        fields, unknown = _fields_for_cells(cells, labels)
+        locator = {
+            'kind': 'xlsx_rows',
+            'sheet': name,
+            'row_from': row_number,
+            'row_to': row_number,
+        }
+        units.extend(_units_from_fields(
+            locator, prefix, fields, unknown, row_key='row_from', row_value=row_number))
+    return units
+
+
+def _xlsx_titles(rows, vertical_starts):
+    titles = []
+    rest = list(rows)
+    while rest and rest[0][0] not in vertical_starts and len(rest[0][1]) == 1 and any(len(cells) >= 2 for _, cells in rest[1:]):
+        cell = rest[0][1][0]
+        if _cell_unknown(cell):
+            break
+        titles.append(_cell_text(cell))
+        rest = rest[1:]
+    return titles, rest
+
+
+def _single_column_prose(rows):
+    return len(rows) >= 2 and all(
+        len(cells) == 1 and not _cell_unknown(cells[0]) for _, cells in rows)
+
+
+def _xlsx_prose_units(name, titles, rows):
+    prefix = ' | '.join(part for part in [f'工作表{name}', *titles] if part)
+    batches = []
+    current = []
+
+    def render(batch):
+        body = '\n'.join(_cell_text(cells[0]) for _, cells in batch)
+        return f'{prefix}\n{body}' if prefix else body
+
+    for row in rows:
+        trial = current + [row]
+        if current and len(render(trial)) > MAX_CHARS:
+            batches.append(current)
+            current = [row]
+        else:
+            current = trial
+    if current:
+        batches.append(current)
+    units = []
+    for batch in batches:
+        text = render(batch)
+        columns = []
+        for _, cells in batch:
+            column = _cell_column(cells[0])
+            if column not in columns:
+                columns.append(column)
+        locator = {
+            'kind': 'xlsx_rows',
+            'sheet': name,
+            'row_from': batch[0][0],
+            'row_to': batch[-1][0],
+            'columns': columns,
+        }
+        _append_text_units(units, locator, text)
+    return units
+
+
+def _fill_vertical_merges(by_row, merges):
+    for min_row, min_col, max_row, _max_col in merges:
+        if max_row <= min_row:
+            continue
+        source = by_row.get(min_row, {}).get(min_col)
+        if source is None or source.formula_state == 'unknown':
+            continue
+        for row_number in range(min_row + 1, max_row + 1):
+            existing = by_row.get(row_number)
+            if not existing or min_col in existing:
+                continue
+            existing[min_col] = source._replace(row=row_number)
+
+
+def _xlsx_cell(formula_cell, cached_cell):
+    raw = formula_cell.value
+    if raw is None:
+        return None
+    formula = isinstance(raw, str) and raw.startswith('=')
+    cached = cached_cell.value
+    column = formula_cell.column_letter
+    column_index = formula_cell.column
+    row = formula_cell.row
+    if formula and _missing_cached(cached):
+        return _XlsxCell(row, column_index, column, '', 'unknown', None)
+    if formula:
+        text = _plain(cached)
+        if not text:
+            return _XlsxCell(row, column_index, column, '', 'unknown', cached)
+        return _XlsxCell(row, column_index, column, text, 'not_recalculated', cached)
+    text = _plain(raw)
+    if not text:
+        return None
+    return _XlsxCell(row, column_index, column, text, '', raw)
+
+
+def _missing_cached(value):
+    if value is None:
+        return True
+    return isinstance(value, str) and (not value.strip() or value.startswith('='))
+
+
+def _plain(value):
+    from datetime import date, datetime
+    if value is None:
+        return ''
+    if isinstance(value, bool):
+        return 'TRUE' if value else 'FALSE'
+    if isinstance(value, datetime):
+        return value.isoformat(sep=' ')
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    return str(value).strip()
+
+
+class _XlsxCell:
+    def __init__(self, row, column_index, column, text, formula_state, raw):
+        self.row = row
+        self.column_index = column_index
+        self.column = column
+        self.text = text
+        self.formula_state = formula_state
+        self.raw = raw
+
+    def _replace(self, **changes):
+        values = {
+            'row': self.row, 'column_index': self.column_index, 'column': self.column,
+            'text': self.text, 'formula_state': self.formula_state, 'raw': self.raw,
+        }
+        values.update(changes)
+        return _XlsxCell(**values)
+
+
+_XLSX_MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+_XLSX_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+
+def _xlsx_merges(blob):
+    """只读模式不提供合并区域。从压缩包读 mergeCell，失败时退回不合并。"""
+    try:
+        from openpyxl.utils.cell import range_boundaries
+        with zipfile.ZipFile(BytesIO(blob)) as package:
+            workbook = ET.fromstring(package.read('xl/workbook.xml'))
+            rels = ET.fromstring(package.read('xl/_rels/workbook.xml.rels'))
+            targets = {}
+            for rel in rels:
+                identity = rel.attrib.get('Id')
+                target = rel.attrib.get('Target')
+                if identity and target:
+                    targets[identity] = target
+            found = {}
+            for sheet in workbook.findall(f'{{{_XLSX_MAIN}}}sheets/{{{_XLSX_MAIN}}}sheet'):
+                name = sheet.attrib.get('name')
+                identity = sheet.attrib.get(f'{{{_XLSX_REL}}}id')
+                target = targets.get(identity, '')
+                path = _worksheet_path(target)
+                spans = []
+                try:
+                    root = ET.fromstring(package.read(path))
+                except KeyError:
+                    found[name] = []
+                    continue
+                for cell in root.findall(f'{{{_XLSX_MAIN}}}mergeCells/{{{_XLSX_MAIN}}}mergeCell'):
+                    ref = cell.attrib.get('ref')
+                    if not ref:
+                        continue
+                    min_col, min_row, max_col, max_row = range_boundaries(ref)
+                    spans.append((min_row, min_col, max_row, max_col))
+                found[name] = spans
+            return found
+    except (ET.ParseError, KeyError, OSError, ValueError, zipfile.BadZipFile):
+        return {}
+
+
+def _worksheet_path(target):
+    target = (target or '').replace('\\', '/').lstrip('/')
+    if target.startswith('xl/'):
+        return target
+    return 'xl/' + target
+
+
+def _cell_unknown(cell):
+    if isinstance(cell, _XlsxCell):
+        return cell.formula_state == 'unknown'
+    return False
+
+
+def _cell_text(cell):
+    if isinstance(cell, _XlsxCell):
+        return cell.text
+    return cell[1]
+
+
+def _cell_raw(cell):
+    if isinstance(cell, _XlsxCell):
+        return cell.raw
+    return cell[1]
+
+
+def _cell_column(cell):
+    if isinstance(cell, _XlsxCell):
+        return cell.column
+    return cell[0]
+
+
+def _cell_key(cell):
+    if isinstance(cell, _XlsxCell):
+        return cell.column_index
+    return cell[0]
+
+
+def _cell_state(cell):
+    if isinstance(cell, _XlsxCell):
+        return cell.formula_state
+    return ''
 
 
 def _parse_pptx(blob):
@@ -286,16 +977,94 @@ def _parse_pptx(blob):
     deck = Presentation(BytesIO(blob))
     units = []
     for slide_index, slide in enumerate(deck.slides, 1):
+        shapes = []
         for shape_index, shape in enumerate(slide.shapes, 1):
-            if not getattr(shape, 'has_text_frame', False):
-                continue
-            for paragraph_index, paragraph in enumerate(shape.text_frame.paragraphs, 1):
-                text = paragraph.text.strip()
+            blocks = _shape_blocks(shape)
+            if blocks:
+                shapes.append((shape_index, blocks))
+        if not shapes:
+            continue
+        slide_text = '\n'.join(text for _, blocks in shapes for _, text in blocks)
+        if len(slide_text) <= MAX_CHARS:
+            units.append(_unit({
+                'kind': 'pptx_slide',
+                'slide': slide_index,
+                'shape_from': shapes[0][0],
+                'shape_to': shapes[-1][0],
+            }, slide_text))
+            continue
+        for shape_index, blocks in shapes:
+            units.extend(_pack_shape(slide_index, shape_index, blocks))
+    return units
+
+
+def _shape_blocks(shape):
+    blocks = []
+    if getattr(shape, 'has_text_frame', False):
+        for index, paragraph in enumerate(shape.text_frame.paragraphs, 1):
+            text = paragraph.text.strip()
+            if text:
+                blocks.append((index, text))
+    if getattr(shape, 'has_table', False):
+        start = blocks[-1][0] + 1 if blocks else 1
+        for offset, row in enumerate(shape.table.rows):
+            seen = []
+            values = []
+            for cell in row.cells:
+                if any(cell is previous for previous in seen):
+                    continue
+                seen.append(cell)
+                text = cell.text.strip()
                 if text:
-                    units.append(_unit({
-                        'kind': 'pptx_paragraph', 'slide': slide_index,
-                        'shape': shape_index, 'paragraph': paragraph_index,
-                    }, text))
+                    values.append(text)
+            if values:
+                blocks.append((start + offset, ' | '.join(values)))
+    return blocks
+
+
+def _pack_shape(slide_index, shape_index, blocks):
+    units = []
+    current = []
+
+    def emit(batch):
+        if not batch:
+            return
+        text = '\n'.join(item for _, item in batch)
+        locator = {
+            'kind': 'pptx_shape',
+            'slide': slide_index,
+            'shape': shape_index,
+            'paragraph_from': batch[0][0],
+            'paragraph_to': batch[-1][0],
+        }
+        _append_text_units(units, locator, text)
+
+    for index, text in blocks:
+        if len(text) > MAX_CHARS:
+            emit(current)
+            current = []
+            pieces = _pieces(text)
+            total = len(pieces)
+            for part, piece in enumerate(pieces, 1):
+                locator = {
+                    'kind': 'pptx_shape',
+                    'slide': slide_index,
+                    'shape': shape_index,
+                    'paragraph_from': index,
+                    'paragraph_to': index,
+                }
+                if total > 1:
+                    locator['part'] = part
+                    locator['parts'] = total
+                units.append(_unit(locator, piece))
+            continue
+        prospective = current + [(index, text)]
+        if current and len('\n'.join(item for _, item in prospective)) > MAX_CHARS:
+            emit(current)
+            current = [(index, text)]
+        else:
+            current = prospective
+    emit(current)
     return units
 
 
@@ -386,6 +1155,7 @@ class OfficeIndex:
                     continue
                 units.append(_unit(image['locator'], text, status='succeeded'))
         self._phase(project_id, document_id, 'indexing')
+        units = _bound_units(units)
         version = self.version()
         failed = []
         indexed = []

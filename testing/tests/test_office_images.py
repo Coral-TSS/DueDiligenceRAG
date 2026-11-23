@@ -254,7 +254,8 @@ def test_document_is_fully_processed_only_when_all_vectors_exist(tmp_path, datab
     models.embed = fail_second
     document = Document()
     document.add_paragraph('第一段保留资本。')
-    document.add_paragraph('失败单元不要入库。')
+    # 标题单独成单元，嵌入失败才不会把前一段一起丢掉。
+    document.add_heading('失败单元不要入库。', level=1)
     buffer = BytesIO()
     document.save(buffer)
     with client(app) as http:
