@@ -99,6 +99,7 @@ class Settings:
     retrieval_fusion: str = 'rrf'
     retrieval_vector_limit: int = 12
     retrieval_keyword_limit: int = 12
+    # 产品设置里送入重排的融合名单仍是 1–12。EvidenceService.search 可以按次传入更大的值（最多 50），只给评测使用。
     retrieval_candidate_limit: int = 12
     retrieval_rrf_k: int = 60
     retrieval_vector_weight: float = 1.

@@ -72,8 +72,12 @@ class ParentSearch:
             coverage=dict(complete=False,status='not_evaluated'),
             status='candidates' if results else 'no_matches',results=results)
 
-    def format(self,project_id,version,ranked,live):
-        """将已评分且最终复验的子块聚合；混合查询复用同一来源／上下文规则。"""
+    def format(self,project_id,version,ranked,live,*,result_limit=5):
+        """将已评分且最终复验的子块聚合；混合查询复用同一来源／上下文规则。
+
+        缺省保留 5 个父块组，与产品查询一致。混合查询传入本次的 result_limit，
+        避免先在这里切到 5，再无法把更多父块送进最终名单。
+        """
         groups={}
         for row in live:
             original,score=ranked[(row['build_id'],row['id'])]
@@ -96,7 +100,7 @@ class ParentSearch:
             group['matched_children'].sort(key=lambda c:(-c['rerank_score'],-c['similarity'],c['id']))
             best=group['matched_children'][0]
             group.update(rerank_score=best['rerank_score'],similarity=best['similarity'],recall=best.get('recall'))
-        results=sorted(groups.values(),key=lambda g:(-g['rerank_score'],-g['similarity'],g['build_id'],g['parent_id']))[:5]
+        results=sorted(groups.values(),key=lambda g:(-g['rerank_score'],-g['similarity'],g['build_id'],g['parent_id']))[:result_limit]
         return results
 
     @staticmethod

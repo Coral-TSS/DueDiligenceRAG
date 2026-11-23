@@ -64,6 +64,26 @@ def test_fusion_order_respects_weights_and_single_channel_switches():
     assert only_keyword[0]['recall']['vector_score'] is None
 
 
+def test_search_window_keeps_the_product_top_five_and_allows_an_eval_override():
+    from dd_agent.app import SearchInput
+    from dd_agent.retrieval import search_window
+
+    settings = Settings()
+    window = search_window(settings)
+    assert (window.vector_limit, window.keyword_limit, window.candidate_limit, window.result_limit) == (12, 12, 12, 5)
+    widened = search_window(settings, vector_limit=20, keyword_limit=20, candidate_limit=40, result_limit=15)
+    assert (widened.vector_limit, widened.keyword_limit, widened.candidate_limit, widened.result_limit) == (20, 20, 40, 15)
+    # 13 超过产品设置的融合上限，但按次传入时允许，评测才能把加宽后的召回送进重排。
+    assert search_window(settings, candidate_limit=13).candidate_limit == 13
+    for kwargs in (
+        dict(vector_limit=0), dict(vector_limit=51), dict(keyword_limit=True),
+        dict(candidate_limit=51), dict(result_limit=0), dict(result_limit=False),
+    ):
+        with pytest.raises(ValueError, match='1–50'):
+            search_window(settings, **kwargs)
+    assert {'vector_limit', 'keyword_limit', 'candidate_limit', 'result_limit'}.isdisjoint(SearchInput.model_fields)
+
+
 def test_retrieval_settings_read_environment_and_reject_bad_values(monkeypatch):
     with pytest.raises(ValueError):
         Settings(retrieval_mode='both')

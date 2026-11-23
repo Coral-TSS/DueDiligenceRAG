@@ -39,6 +39,76 @@ FILTER_KEYS = (
     'date_point', 'period_start', 'period_end', 'page_from', 'page_to',
 )
 CHILD_KEYS = ('matched_children', 'children', 'chunks')
+# 产品界面和 MCP 仍是各路 12 条、融合后最多 12 条进重排、重排后保留 5 条。
+# 评测默认加宽两路召回。融合上限取两路之和，否则多召回的片段会在进重排前被切回 12 条。
+# 重排后再多留一些，避免金标只是在最后 5 条被截掉。这些数只传给这一次 search()。
+EVAL_VECTOR_LIMIT = 20
+EVAL_KEYWORD_LIMIT = 20
+EVAL_CANDIDATE_LIMIT = 40
+EVAL_RESULT_LIMIT = 15
+EVAL_LIMIT_MAX = 50
+_EVAL_LIMITS = (
+    ('vector_limit', 'EVAL_RETRIEVAL_VECTOR_LIMIT', EVAL_VECTOR_LIMIT, '向量召回条数'),
+    ('keyword_limit', 'EVAL_RETRIEVAL_KEYWORD_LIMIT', EVAL_KEYWORD_LIMIT, '关键词召回条数'),
+    ('candidate_limit', 'EVAL_RETRIEVAL_CANDIDATE_LIMIT', EVAL_CANDIDATE_LIMIT, '送入重排的候选条数'),
+    ('result_limit', 'EVAL_RETRIEVAL_RESULT_LIMIT', EVAL_RESULT_LIMIT, '重排后保留条数'),
+)
+
+
+def eval_retrieval_limits():
+    """评测这次检索用的四个上限。只读 EVAL_RETRIEVAL_*，不读产品的 DDA_RETRIEVAL_*。"""
+    return {
+        key: _eval_limit(env_name, default, label)
+        for key, env_name, default, label in _EVAL_LIMITS
+    }
+
+
+def resolve_eval_limits(overrides=None):
+    """环境变量为底，调用方传入的字典覆盖同名键。未知键直接拒绝。"""
+    limits = eval_retrieval_limits()
+    if not overrides:
+        return limits
+    if not isinstance(overrides, dict):
+        raise ValueError('检索上限必须是对象。')
+    unknown = set(overrides) - set(limits)
+    if unknown:
+        raise ValueError('未知的检索上限：' + '、'.join(sorted(unknown)))
+    limits.update(overrides)
+    return {
+        key: _checked_limit(limits[key], label, env_name)
+        for key, env_name, _default, label in _EVAL_LIMITS
+    }
+
+
+def format_retrieval_limits(limits):
+    return (
+        f"检索窗口：向量 {limits['vector_limit']}，关键词 {limits['keyword_limit']}，"
+        f"融合后送入重排 {limits['candidate_limit']}，重排后保留 {limits['result_limit']}。"
+        '产品界面和 MCP 仍只保留重排后的 5 条。'
+    )
+
+
+def public_retrieval_limits(limits):
+    """写入痕迹的四个整数。没有窗口时返回 None，回放记录不补这组字段。"""
+    if not limits:
+        return None
+    return {key: limits[key] for key, _env_name, _default, _label in _EVAL_LIMITS}
+
+
+def _eval_limit(name, default, label):
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return _checked_limit(default, label, name)
+    text = str(raw).strip()
+    if text.startswith('+') or text.startswith('-') or not text.isdigit():
+        raise ValueError(f'{name} 须为 1–{EVAL_LIMIT_MAX} 的整数。')
+    return _checked_limit(int(text), label, name)
+
+
+def _checked_limit(value, label, name):
+    if type(value) is not int or not 1 <= value <= EVAL_LIMIT_MAX:
+        raise ValueError(f'{label}（{name}）须为 1–{EVAL_LIMIT_MAX} 的整数。')
+    return value
 
 
 def load_eval_env():
@@ -500,9 +570,14 @@ def completion_text(completion):
 class RetrievalPipeline:
     """同一进程内复用 EvidenceService，避免重复加载本地嵌入和重排模型。"""
 
-    def __init__(self, service=None):
+    def __init__(self, service=None, *, limits=None):
+        # 先读 .env，再校验窗口，最后才加载模型。错误的 EVAL_RETRIEVAL_* 不必等到第一次检索。
+        # load_dotenv 不覆盖进程里已经设置的变量，因此会话里的覆盖优先于仓库 .env。
         if service is None:
             load_eval_env()
+        self.limits = resolve_eval_limits(limits)
+        self._announced_limits = False
+        if service is None:
             from dd_agent.config import Settings
             from dd_agent.retrieval import EvidenceService
 
@@ -514,12 +589,20 @@ class RetrievalPipeline:
 
     def retrieve(self, project_id, question, item=None):
         item = item or {}
+        if not self._announced_limits:
+            print(format_retrieval_limits(self.limits))
+            self._announced_limits = True
         # document_id 已进入 scope.document_ids。再传关键字会和 scope 冲突。
+        # 四个上限只属于这一次评测调用，不改产品设置，界面和 MCP 仍保留 5 条。
         found = self.service.search(
             project_id,
             question,
             document_id=None,
             scope=build_scope(item),
+            vector_limit=self.limits['vector_limit'],
+            keyword_limit=self.limits['keyword_limit'],
+            candidate_limit=self.limits['candidate_limit'],
+            result_limit=self.limits['result_limit'],
         )
         return contexts_from_search(found), found
 
@@ -586,9 +669,9 @@ class QueryApp:
         return self.generate_completion(query=query, context_list=context_list)
 
 
-def trace_for(record, found, item):
+def trace_for(record, found, item, limits=None):
     coverage = found.get('coverage') if isinstance(found, dict) else None
-    return {
+    trace = {
         'id': record['id'],
         'question': record['user_input'],
         'search_status': record.get('search_status'),
@@ -596,6 +679,10 @@ def trace_for(record, found, item):
         'coverage': coverage,
         'filters': filter_payload(item),
     }
+    window = public_retrieval_limits(limits)
+    if window is not None:
+        trace['retrieval_limits'] = window
+    return trace
 
 
 def write_json(path, payload):
@@ -718,7 +805,7 @@ def collect_records(pipeline, project_id, items, *, generate):
     for item in items:
         record, found = pipeline.run_item(project_id, item, generate=generate)
         records.append(record)
-        traces.append(trace_for(record, found, item))
+        traces.append(trace_for(record, found, item, getattr(pipeline, 'limits', None)))
         print(
             f"{record['id']}: status={record['search_status']} "
             f"contexts={len(record['retrieved_contexts'])}"

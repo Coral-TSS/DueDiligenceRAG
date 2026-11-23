@@ -1,6 +1,6 @@
 """父子索引查询仓储。每次 SQL 都核实来源；不加载模型或切换活动查询。"""
 from .retrieval import valid_vector
-from .search_queries import _recall_limit
+from .search_queries import _finalize_budget,_recall_limit
 from contextlib import nullcontext
 from .assembly import VERSION
 from .material_metadata import metadata_sql, span_page_sql
@@ -81,13 +81,15 @@ class ParentQueries:
                 JOIN live ON live.id=c.build_id'''+outer+'''
                 ORDER BY '''+exact+''' ts_rank_cd(c.lexemes,q.tsq) DESC,c.build_id,c.id LIMIT %s''',args).fetchall()
 
-    def finalize(self,project_id,version,candidates,*,conn=None,current_receipts_only=False):
-        """重排后在单一只读快照核对最多 12 个精确 child 身份及其父块。
+    def finalize(self,project_id,version,candidates,*,conn=None,current_receipts_only=False,budget=12):
+        """重排后在单一只读快照核对有限个精确 child 身份及其父块。
 
-        不持事务等待模型。父块最多 4000 字符，内部最多 12 份；响应层另限
-        5 个父块。子块和上下文在同一快照读取，避免逐父块查询混合来源版本。
+        缺省最多 12 个，与产品融合上限一致。评测可以传入更大的预算，最多 50。
+        不持事务等待模型。父块最多 4000 字符。响应层产品路径另限 5 个父块。
+        子块和上下文在同一快照读取，避免逐父块查询混合来源版本。
         """
-        if len(candidates)>12:raise ValueError('Candidate budget exceeded')
+        budget=_finalize_budget(budget)
+        if len(candidates)>budget:raise ValueError('Candidate budget exceeded')
         if not candidates:return []
         builds=[r['build_id'] for r in candidates]
         identities=[r['id'] for r in candidates]
@@ -105,7 +107,7 @@ class ParentQueries:
                   ON c.build_id=w.build_id AND c.id=w.id
                 JOIN live ON live.id=c.build_id
                 JOIN dd_agent.parent_index_parents p ON p.build_id=c.build_id AND p.id=c.parent_id
-                LIMIT 12''',args).fetchall()
+                LIMIT %s''',args+(budget,)).fetchall()
 
     def context(self,project_id,document_id,version,build_id,parent_id,*,offset=0,limit=4000,conn=None):
         """按不可变 build/parent 续读；过期、越项目和不存在统一返回 None。

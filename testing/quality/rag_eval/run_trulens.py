@@ -20,6 +20,7 @@ from pipeline import (  # noqa: E402
     filter_payload,
     format_judge_log,
     judge_llm_config,
+    public_retrieval_limits,
     load_score_records,
     openai_client,
     prepare_run,
@@ -169,14 +170,18 @@ def retrieve_only(dataset, project_id, out):
     traces = []
     for item in dataset['items']:
         contexts, found = pipeline.retrieve(project_id, item['question'], item)
-        traces.append({
+        trace = {
             'id': item['id'],
             'question': item['question'],
             'search_status': found.get('status') if isinstance(found, dict) else None,
             'context_count': len(contexts),
             'coverage': found.get('coverage') if isinstance(found, dict) else None,
             'filters': filter_payload(item),
-        })
+        }
+        window = public_retrieval_limits(getattr(pipeline, 'limits', None))
+        if window is not None:
+            trace['retrieval_limits'] = window
+        traces.append(trace)
         print(f"{item['id']}: status={traces[-1]['search_status']} contexts={len(contexts)}")
     write_json(out / 'traces.json', traces)
     print(f'已按 --retrieve-only 写出检索记录，未生成答案，也未调用 TruLens。输出目录：{out}')
@@ -266,7 +271,7 @@ def main(argv=None):
             answer = app.query(item['question'], filters=filters)
             preview = answer[:120].replace('\n', ' ')
             print(f"{item['id']}: {preview}")
-            answers.append({
+            answer_row = {
                 'id': item['id'],
                 'question': item['question'],
                 'answer': answer,
@@ -274,7 +279,11 @@ def main(argv=None):
                 'search_status': (app.last_found or {}).get('status') if isinstance(app.last_found, dict) else None,
                 'filters': filters,
                 'app_version': args.app_version,
-            })
+            }
+            window = public_retrieval_limits(getattr(app.pipeline, 'limits', None))
+            if window is not None:
+                answer_row['retrieval_limits'] = window
+            answers.append(answer_row)
     write_json(out / 'trulens_answers.json', answers)
     write_leaderboard(session, out)
     print(f'结果已写入：{out}')

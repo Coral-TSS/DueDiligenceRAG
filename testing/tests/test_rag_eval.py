@@ -111,13 +111,18 @@ class FakeSearch:
             }],
         }
 
-    def search(self, project_id, query, *, document_id=None, scope=None, cancel=None):
+    def search(self, project_id, query, *, document_id=None, scope=None, cancel=None,
+               vector_limit=None, keyword_limit=None, candidate_limit=None, result_limit=None):
         self.calls.append({
             'project_id': project_id,
             'query': query,
             'document_id': document_id,
             'scope': scope,
             'cancel': cancel,
+            'vector_limit': vector_limit,
+            'keyword_limit': keyword_limit,
+            'candidate_limit': candidate_limit,
+            'result_limit': result_limit,
         })
         return self.payload
 
@@ -328,6 +333,61 @@ def test_unfiltered_item_passes_an_empty_scope():
     assert contexts == ['办公材料片段']
     assert fake.calls[0]['scope'] is None
     assert fake.calls[0]['document_id'] is None
+
+
+def _clear_retrieval_env(monkeypatch):
+    for name in (
+        'EVAL_RETRIEVAL_VECTOR_LIMIT',
+        'EVAL_RETRIEVAL_KEYWORD_LIMIT',
+        'EVAL_RETRIEVAL_CANDIDATE_LIMIT',
+        'EVAL_RETRIEVAL_RESULT_LIMIT',
+        'DDA_RETRIEVAL_VECTOR_LIMIT',
+        'DDA_RETRIEVAL_KEYWORD_LIMIT',
+        'DDA_RETRIEVAL_CANDIDATE_LIMIT',
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_retrieve_uses_the_wider_eval_window_and_ignores_product_settings(monkeypatch):
+    _clear_retrieval_env(monkeypatch)
+    monkeypatch.setenv('DDA_RETRIEVAL_VECTOR_LIMIT', '50')
+    monkeypatch.setenv('DDA_RETRIEVAL_CANDIDATE_LIMIT', '12')
+    fake = FakeSearch()
+    retrieval = RetrievalPipeline(service=fake)
+    retrieval.retrieve(PROJECT, '示例问题', {'question': '示例问题'})
+    call = fake.calls[0]
+    assert call['vector_limit'] == pipeline.EVAL_VECTOR_LIMIT == 20
+    assert call['keyword_limit'] == pipeline.EVAL_KEYWORD_LIMIT == 20
+    assert call['candidate_limit'] == pipeline.EVAL_CANDIDATE_LIMIT == 40
+    assert call['result_limit'] == pipeline.EVAL_RESULT_LIMIT == 15
+    assert retrieval.limits == {
+        'vector_limit': 20,
+        'keyword_limit': 20,
+        'candidate_limit': 40,
+        'result_limit': 15,
+    }
+    monkeypatch.setenv('EVAL_RETRIEVAL_VECTOR_LIMIT', '24')
+    monkeypatch.setenv('EVAL_RETRIEVAL_KEYWORD_LIMIT', '24')
+    monkeypatch.setenv('EVAL_RETRIEVAL_CANDIDATE_LIMIT', '48')
+    monkeypatch.setenv('EVAL_RETRIEVAL_RESULT_LIMIT', ' 16 ')
+    overridden = RagPipeline(service=fake)
+    overridden.retrieve(PROJECT, '示例问题', {'question': '示例问题'})
+    assert fake.calls[1]['vector_limit'] == 24
+    assert fake.calls[1]['keyword_limit'] == 24
+    assert fake.calls[1]['candidate_limit'] == 48
+    assert fake.calls[1]['result_limit'] == 16
+    records, traces = pipeline.collect_records(
+        overridden,
+        PROJECT,
+        [{'id': 'q1', 'question': '示例主体的法定代表人是谁？', 'reference': ''}],
+        generate=False,
+    )
+    assert records[0]['retrieved_contexts'] == ['办公材料片段']
+    assert traces[0]['retrieval_limits'] == overridden.limits
+    for raw in ('0', '51', '20.5', 'true', '+20'):
+        monkeypatch.setenv('EVAL_RETRIEVAL_CANDIDATE_LIMIT', raw)
+        with pytest.raises(ValueError, match='1–50'):
+            RetrievalPipeline(service=fake)
 
 
 def test_missing_contexts_do_not_call_the_judge(monkeypatch):

@@ -10,6 +10,12 @@ def _recall_limit(limit):
         raise ValueError('召回条数无效。')
 
 
+def _finalize_budget(budget):
+    if type(budget) is not int or not 1<=budget<=50:
+        raise ValueError('Candidate budget exceeded')
+    return budget
+
+
 def _document_scope(excluded_documents=(), included_documents=None):
     """页级召回的材料范围。included 为 None 表示不额外收窄，空元组表示没有可召回的材料。"""
     clause = ''
@@ -34,10 +40,12 @@ CURRENT = '''FROM dd_agent.indexed_pages i
 class SearchQueries:
     def __init__(self,database):self.database=database
 
-    def names(self,project_id,documents,*,conn):
+    def names(self,project_id,documents,*,conn,budget=12):
         """仅最终候选材料的来源文件名，不读取原件路径或整项目材料清单。"""
         documents=list(set(documents))
-        if len(documents)>12:raise ValueError('Document metadata budget exceeded')
+        budget=_finalize_budget(budget)
+        # 缺省 12，与产品一次重排里可能出现的材料数一致。评测加宽候选后按本次融合上限放开。
+        if len(documents)>budget:raise ValueError('Document metadata budget exceeded')
         if not documents:return {}
         rows=conn.execute('''WITH names AS (
             SELECT s.document_id,s.filename,
@@ -97,8 +105,10 @@ class SearchQueries:
                 JOIN live ON c.document_id=live.document_id AND c.page_number=live.page_number AND c.index_version=live.index_version
                 ORDER BY '''+exact+''' ts_rank_cd(c.lexemes,q.tsq) DESC,c.id LIMIT %s''',args).fetchall()
 
-    def finalize(self,project_id,version,ids,*,conn=None,excluded_documents=()):
-        if len(ids)>12:raise ValueError('Candidate budget exceeded')
+    def finalize(self,project_id,version,ids,*,conn=None,excluded_documents=(),budget=12):
+        # 缺省仍是产品的 12 条。评测传入更大的融合名单时，这里和 SQL 的 LIMIT 一起放开，最多 50。
+        budget=_finalize_budget(budget)
+        if len(ids)>budget:raise ValueError('Candidate budget exceeded')
         owned=conn is None
         with (self.database.connect() if owned else nullcontext(conn)) as conn:
             # One short snapshot for final coverage and candidate metadata;
@@ -110,7 +120,7 @@ class SearchQueries:
                 FROM dd_agent.evidence_chunks c
                 JOIN (SELECT i.document_id,i.page_number,i.index_version,p.method,p.pipeline_version,p.verification '''+CURRENT+''') p
                 ON c.document_id=p.document_id AND c.page_number=p.page_number AND c.index_version=p.index_version
-                WHERE c.id=ANY(%s) LIMIT 12
+                WHERE c.id=ANY(%s) LIMIT %s
               ), names AS (
                 SELECT s.document_id,s.filename,
                   row_number() OVER (PARTITION BY s.document_id ORDER BY s.first_seen_at,s.filename) AS ordinal
@@ -120,5 +130,5 @@ class SearchQueries:
                   count(*)>50 AS sources_truncated FROM names GROUP BY document_id
               ) SELECT live.*,coalesce(sources.filenames,ARRAY[]::text[]) AS filenames,
                 coalesce(sources.sources_truncated,false) AS sources_truncated
-              FROM live LEFT JOIN sources USING(document_id)''',(project_id,version,ids)).fetchall() if ids else []
+              FROM live LEFT JOIN sources USING(document_id)''',(project_id,version,ids,budget)).fetchall() if ids else []
         return coverage,{row['id']:row for row in rows}

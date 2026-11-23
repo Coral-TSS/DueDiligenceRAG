@@ -24,7 +24,7 @@ D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe -m pip install -r D:\C
 
 Linux / macOS 在仓库根目录执行同样的四条命令，把 `Scripts\python.exe` 换成 `.venv-eval/bin/python`。先 `pip install -e` 本仓库，再安装评测依赖。
 
-检索仍使用仓库根目录 `.env` 里的 `DDA_DATABASE_URL` 和本地嵌入 / 重排模型。本包不改生产配置，不改索引版本，也不另建向量库。
+检索仍使用仓库根目录 `.env` 里的 `DDA_DATABASE_URL` 和本地嵌入 / 重排模型。本包不改生产配置，不改索引版本，也不另建向量库。评测自己的召回窗口见下文「检索窗口」，不要靠改 `DDA_RETRIEVAL_*` 来加宽这一次对比。
 
 ## 裁判模型
 
@@ -84,6 +84,34 @@ D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligen
 ```
 
 示例文件里的全零 `project_id` 不能直接跑，`--project-id` 也不能把全零 UUID 再传进去。
+
+## 检索窗口
+
+产品界面和 MCP 仍只返回重排后的 5 条。评测不改这两处，也不改 `DDA_RETRIEVAL_*`。它调用 `EvidenceService.search` 时另传这一次查询的上限。
+
+上次黄金集只保存了这 5 条。有的单事实问题，金标写在已索引的片段里，却不在这 5 条中。当时不知道它有没有进各路 12 条的召回窗口。只把最后保留条数加大不够：向量和关键词各取出更多候选之后，融合仍会把名单切回 12 条再送去重排，排在后面的片段到不了重排。所以评测默认同时加宽两路召回，并把融合后送入重排的条数放到两路之和。重排后再多留一些，用来接住那些已经进了重排、却在最后 5 条被截掉的片段。
+
+| 参数 | 评测默认 | 产品默认 | 这一次调用的范围 |
+| --- | --- | --- | --- |
+| 向量召回 `vector_limit` | 20 | `DDA_RETRIEVAL_VECTOR_LIMIT`，12 | 1–50 |
+| 关键词召回 `keyword_limit` | 20 | `DDA_RETRIEVAL_KEYWORD_LIMIT`，12 | 1–50 |
+| 融合后送入重排 `candidate_limit` | 40 | `DDA_RETRIEVAL_CANDIDATE_LIMIT`，12，而且设置里最大仍是 12 | 1–50 |
+| 重排后保留 `result_limit` | 15 | 固定 5。界面和 MCP 没有这个参数 | 1–50 |
+
+40 等于 20+20。两路几乎不重叠时，加宽后的候选都会进重排；重叠越多，实际送进重排的条数越少。Office 来源单元和页级 / 父子候选共用这一个融合上限。重排按 `DDA_RERANK_TOKEN_BUDGET`（默认 4096）分批，不是把这 40 条拼进同一次前向。单条仍超过模型输入上限时，失败方式和原来一样。查询总预算仍是 `DDA_SEARCH_TIMEOUT_SECONDS`（默认 120 秒）。若这次对比超时，先把 `EVAL_RETRIEVAL_CANDIDATE_LIMIT` 降到 24 或 32，不要先去改产品设置。
+
+只在评测进程里覆盖，不要写进仓库 `.env`：
+
+```powershell
+$env:EVAL_RETRIEVAL_VECTOR_LIMIT="24"
+$env:EVAL_RETRIEVAL_KEYWORD_LIMIT="24"
+$env:EVAL_RETRIEVAL_CANDIDATE_LIMIT="48"
+$env:EVAL_RETRIEVAL_RESULT_LIMIT="16"
+```
+
+空字符串沿用上表的评测默认。不是 1–50 的整数时，在加载检索模型之前直接失败。`traces.json` 的 `retrieval_limits` 记下这次实际使用的四个数，方便和只留 5 条的那次运行对照。
+
+不要把 `DDA_RETRIEVAL_VECTOR_LIMIT` 调大来做这次对比。那会改掉同一个进程里的产品设置，而且融合上限在设置里仍然不能超过 12，多召回的片段到不了重排。这次也不按类别或主体做默认过滤；材料上的过滤仍只来自黄金集里已经写明的字段。
 
 ## 只检索
 
@@ -152,7 +180,7 @@ D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligen
 | 文件 | 何时产生 |
 | --- | --- |
 | `records.json` | RAGAS 路径。含问题、检索片段、答案和 reference |
-| `traces.json` | 检索状态、片段数、coverage 和本条过滤条件 |
+| `traces.json` | 检索状态、片段数、coverage、本条过滤条件，以及这次的 `retrieval_limits` |
 | `ragas_scores.json` / `ragas_scores.csv` | 完整 RAGAS 打分。`--score-from` 只写这两个分数文件 |
 | `trulens_answers.json` | TruLens 路径的答案、片段数和过滤条件 |
 | `trulens_leaderboard.json` | 能取到排行榜时写出 |
