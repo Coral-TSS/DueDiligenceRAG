@@ -378,10 +378,13 @@ def fuse_candidates(vector_rows, keyword_rows, *, mode, fusion, rrf_k, vector_we
     return fused[:limit]
 
 
-def fuse_for(settings, vector_rows, keyword_rows, *, key):
+def fuse_for(settings, vector_rows, keyword_rows, *, key, limit=None):
+    # 缺省用产品设置，融合后最多 12 条。评测可以按次传入更大的名单，避免加宽后的召回在进重排前被切回去。
+    if limit is None:
+        limit = settings.retrieval_candidate_limit
     return fuse_candidates(vector_rows, keyword_rows, mode=settings.retrieval_mode, fusion=settings.retrieval_fusion,
         rrf_k=settings.retrieval_rrf_k, vector_weight=settings.retrieval_vector_weight,
-        keyword_weight=settings.retrieval_keyword_weight, limit=settings.retrieval_candidate_limit, key=key)
+        keyword_weight=settings.retrieval_keyword_weight, limit=limit, key=key)
 
 
 def backfill_lexemes(database, *, force=False, batch=200):

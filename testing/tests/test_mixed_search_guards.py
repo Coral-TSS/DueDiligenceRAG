@@ -18,6 +18,27 @@ def test_standalone_parent_build_is_not_a_managed_query_candidate(tmp_path,datab
     assert all(h.get('build_id')!=plan['id'] for h in x.search.search(x.p,'注册资本')['results'])
 
 
+def test_eval_window_reranks_past_twelve_and_can_keep_more_than_five(tmp_path,database_url,monkeypatch):
+    from dataclasses import replace
+    from test_parent_index import Budget
+    x=fixture(tmp_path,database_url)
+    # 短页凑不满 12 条。用和产品预算测试相同的长页，确认加宽后重排名单会超过 12。
+    x.db.save_page(x.other,'scan-v1',dict(page_number=1,status='succeeded',method='text',text='注册资本2000万元，'*1000))
+    x.evidence.index(x.p,x.other,[1])
+    monkeypatch.setattr('dd_agent.parent_index.LocalTokenBudget',lambda _:Budget())
+    x.evidence.settings=replace(x.evidence.settings,search_index_mode='mixed',search_parent_documents=(str(x.d),))
+    calls=[]
+    rerank=x.index.models.rerank
+    def counted(query,texts):
+        calls.append(len(texts))
+        return rerank(query,texts)
+    x.index.models.rerank=counted
+    product=x.evidence.search(x.p,'注册资本')
+    widened=x.evidence.search(x.p,'注册资本',vector_limit=20,keyword_limit=20,candidate_limit=40,result_limit=15)
+    assert calls[0]==12 and len(product['results'])<=5
+    assert calls[1]>12 and 5<len(widened['results'])<=15
+
+
 def test_dual_recall_has_one_twelve_candidate_rerank_budget(tmp_path,database_url):
     x=fixture(tmp_path,database_url)
     x.db.save_page(x.other,'scan-v1',dict(page_number=1,status='succeeded',method='text',text='注册资本2000万元，'*1000))

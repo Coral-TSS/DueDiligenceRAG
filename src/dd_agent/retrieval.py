@@ -4,6 +4,7 @@
 # 主要数据：indexed_pages 是页级发布记录，evidence_chunks 保存文字片段及 1024 维向量。
 # 生成报告不在这里执行；返回的是候选证据，不是模型生成的最终回答。
 from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import json
 import psycopg
@@ -260,6 +261,42 @@ class LocalModels:
 # 不匹配的旧向量可能仍在表中留档，但不会被当前检索返回。
 
 
+# 与 SQL 召回上限一致。产品设置里的融合条数另外限制在 1–12，见 Settings。
+MAX_SEARCH_LIMIT = 50
+DEFAULT_RESULT_LIMIT = 5
+
+
+@dataclass(frozen=True)
+class SearchWindow:
+    """一次查询的召回与保留条数。界面和 MCP 不传它，因此仍是各路 12、融合 12、保留 5。"""
+    vector_limit: int
+    keyword_limit: int
+    candidate_limit: int
+    result_limit: int
+
+    def __post_init__(self):
+        _bounded_count(self.vector_limit, '向量召回条数')
+        _bounded_count(self.keyword_limit, '关键词召回条数')
+        # 显式传入时可以高于产品设置的 12，这样评测加宽的两路召回才能进重排。
+        _bounded_count(self.candidate_limit, '送入重排的候选条数')
+        _bounded_count(self.result_limit, '重排后保留条数')
+
+
+def _bounded_count(value, label):
+    if type(value) is not int or not 1 <= value <= MAX_SEARCH_LIMIT:
+        raise ValueError(f'{label}须为 1–{MAX_SEARCH_LIMIT}。')
+
+
+def search_window(settings, *, vector_limit=None, keyword_limit=None, candidate_limit=None, result_limit=None):
+    """缺省取产品设置，重排后保留 5 条。传入的值只作用于这一次查询。"""
+    return SearchWindow(
+        settings.retrieval_vector_limit if vector_limit is None else vector_limit,
+        settings.retrieval_keyword_limit if keyword_limit is None else keyword_limit,
+        settings.retrieval_candidate_limit if candidate_limit is None else candidate_limit,
+        DEFAULT_RESULT_LIMIT if result_limit is None else result_limit,
+    )
+
+
 
 class EvidenceService:
     def __init__(self, settings=None, models=None, database=None):
@@ -436,8 +473,9 @@ class EvidenceService:
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector,%s::tsvector,%s)''',
                     (uuid4(), document_id, number, version, ordinal, chunk['start_offset'], chunk['end_offset'], chunk['text'], vector, document_tsvector(chunk['text']), Jsonb(spans)))
 
-    def _recall(self,queries,project_id,version,query,*,excluded_documents=(),included_documents=None,include_office=False,scope=None):
+    def _recall(self,queries,project_id,version,query,*,excluded_documents=(),included_documents=None,include_office=False,scope=None,window=None):
         """向量与关键词各自取有界候选，合并后再交给重排。单路开关不再查询另一路。"""
+        window=window or search_window(self.settings)
         control=current_control();control.check()
         settings=self.settings
         vector_rows=[]
@@ -449,20 +487,20 @@ class EvidenceService:
             vector=self._model_result('embedding',project_id,query,[],embed,valid_vector)
             control.check()
             vector_rows=queries.candidates(project_id,version,valid_vector(vector),
-                excluded_documents=excluded_documents,included_documents=included_documents,limit=settings.retrieval_vector_limit,scope=scope)
+                excluded_documents=excluded_documents,included_documents=included_documents,limit=window.vector_limit,scope=scope)
         keyword_rows=[]
         if settings.retrieval_mode!='vector':
             plan=build_keyword_query(query)
             if plan.tsquery:
                 found=queries.keyword_candidates(project_id,version,plan.tsquery,plan.needles,
-                    excluded_documents=excluded_documents,included_documents=included_documents,limit=settings.retrieval_keyword_limit,scope=scope)
-                keyword_rows=prepare_keyword_rows(found,plan)[:settings.retrieval_keyword_limit]
+                    excluded_documents=excluded_documents,included_documents=included_documents,limit=window.keyword_limit,scope=scope)
+                keyword_rows=prepare_keyword_rows(found,plan)[:window.keyword_limit]
         control.check()
         if include_office:
-            office_rows=self._office_rows(project_id, query, included_documents, scope)
+            office_rows=self._office_rows(project_id, query, included_documents, scope, window=window)
             vector_rows=list(vector_rows)+office_rows['vector']
             keyword_rows=list(keyword_rows)+office_rows['keyword']
-        return fuse_for(settings, vector_rows, keyword_rows, key=page_key)
+        return fuse_for(settings, vector_rows, keyword_rows, key=page_key, limit=window.candidate_limit)
 
     def _model_result(self,kind,project_id,query,texts,compute,validate):
         control=current_control();control.check()
@@ -477,7 +515,12 @@ class EvidenceService:
         return value
 
     @observed('search')
-    def search(self,project_id,query,*,cancel=None,document_id=None,scope=None):
+    def search(self,project_id,query,*,cancel=None,document_id=None,scope=None,
+            vector_limit=None,keyword_limit=None,candidate_limit=None,result_limit=None):
+        # 不传这些上限时与界面／MCP 相同：各路和融合用设置，重排后保留 5 条。
+        # 评测按次传入更大的召回和保留条数，不改设置，也不改其他调用方。
+        window=search_window(self.settings,vector_limit=vector_limit,keyword_limit=keyword_limit,
+            candidate_limit=candidate_limit,result_limit=result_limit)
         project_id=UUID(str(project_id));query=query.strip()
         if not 1<=len(query)<=500:raise ValueError('查询须为 1–500 个字符。')
         # document_id 只收窄召回范围，融合与重排仍走原路径。过滤在各路 SQL 内完成。
@@ -492,16 +535,17 @@ class EvidenceService:
                     from .mixed_search import MixedSearch
                     index=ParentIndex(self.settings,database=self.database,models=self.models)
                     found=MixedSearch(self,index,self.settings.search_parent_documents)._search(
-                        project_id,query,document_id=document_id,scope=scope)
+                        project_id,query,document_id=document_id,scope=scope,window=window)
                 else:
-                    found=self._search(project_id,query,document_id=document_id,scope=scope)
+                    found=self._search(project_id,query,document_id=document_id,scope=scope,window=window)
                 return self._annotate(found,project_id,scope)
         except AdmissionError as exc:
             if exc.code=='cancelled':raise SearchCancelled('查询已取消。') from None
             if exc.code=='deadline':raise SearchTimeout('本次查询超时，请稍后重试。') from None
             raise RetrievalBusy('本地模型繁忙，请稍后重试。') from None
 
-    def _search(self,project_id,query,*,project_checked=False,document_id=None,scope=None):
+    def _search(self,project_id,query,*,project_checked=False,document_id=None,scope=None,window=None):
+        window=window or search_window(self.settings)
         control=current_control();control.check()
         if not project_checked and not self.database.project_exists(project_id):raise RetrievalError('项目不存在。')
         included=self._bound_documents(project_id,document_id,scope)
@@ -511,7 +555,7 @@ class EvidenceService:
         response=dict(index_version=version,coverage=coverage,results=[],status='not_indexed')
         if not coverage['indexed_pages'] and not coverage['office_chunks']:
             return response
-        rows=self._recall(queries,project_id,version,query,included_documents=included,include_office=bool(coverage['office_chunks']),scope=scope)
+        rows=self._recall(queries,project_id,version,query,included_documents=included,include_office=bool(coverage['office_chunks']),scope=scope,window=window)
         if rows:
             texts=[r['text'] for r in rows]
             def validate_scores(scores):
@@ -522,7 +566,7 @@ class EvidenceService:
             for row,score in zip(rows,scores,strict=True):row['rerank_score']=score
         control.check()
         # Even a warm model cache never skips fresh SQL recall or source checks.
-        coverage,live=queries.finalize(project_id,version,[r['id'] for r in rows])
+        coverage,live=queries.finalize(project_id,version,[r['id'] for r in rows],budget=window.candidate_limit)
         control.check()
         current=[]
         for row in rows:
@@ -533,7 +577,7 @@ class EvidenceService:
             row.update(live[row['id']])
             row['source_url']=f"/reader?project={project_id}&document={row['document_id']}&page={row['page_number']}"
             current.append(row)
-        response.update(coverage=coverage,results=sorted(current,key=lambda r:(-r['rerank_score'],-r['similarity'],str(r['id'])))[:5],
+        response.update(coverage=coverage,results=sorted(current,key=lambda r:(-r['rerank_score'],-r['similarity'],str(r['id'])))[:window.result_limit],
             status='candidates' if current else 'no_matches')
         return response
 
@@ -544,8 +588,9 @@ class EvidenceService:
         from .office import OfficeIndex
         return OfficeIndex(self.settings, self.database, self.models)
 
-    def _office_rows(self, project_id, query, included, scope=None):
+    def _office_rows(self, project_id, query, included, scope=None, window=None):
         from .lexical import build_keyword_query
+        window=window or search_window(self.settings)
         office=self._office()
         version=office.version()
         vector_rows=[]
@@ -556,13 +601,13 @@ class EvidenceService:
                 return values[0]
             vector=self._model_result('embedding',project_id,query,[],embed,valid_vector)
             vector_rows=office.candidates(project_id, version, vector=valid_vector(vector), included=included,
-                                          limit=self.settings.retrieval_vector_limit, scope=scope)
+                                          limit=window.vector_limit, scope=scope)
         keyword_rows=[]
         if self.settings.retrieval_mode!='vector':
             plan=build_keyword_query(query)
             if plan.tsquery:
                 keyword_rows=office.candidates(project_id, version, tsquery=plan.tsquery, needles=plan.needles,
-                                               included=included, limit=self.settings.retrieval_keyword_limit, scope=scope)
+                                               included=included, limit=window.keyword_limit, scope=scope)
         names=self._office_names(project_id, [row['document_id'] for row in vector_rows+keyword_rows])
         for row in vector_rows+keyword_rows:
             row.update(names.get(row['document_id'], {'filenames': []}))

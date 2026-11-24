@@ -88,6 +88,49 @@ def test_index_reads_only_requested_pages(tmp_path,database_url,monkeypatch):
     assert service.index(p,d,[1])['indexed_pages']==[1]
 
 
+def test_search_override_widens_recall_and_can_keep_more_than_five(tmp_path,database_url):
+    from dataclasses import replace
+    from dd_agent.lexical import document_tsvector
+    from dd_agent.model_results import ModelResults
+    from test_page_reads import seed
+    app,p,d,service,models=indexed(tmp_path,database_url)
+    seed(app,d,20,prefix='注册资本第')
+    version=service.version()
+    vector='['+','.join(['1']+['0']*1023)+']'
+    with service.database.connect() as conn:
+        conn.execute('DELETE FROM dd_agent.evidence_chunks WHERE document_id=%s',(d,))
+        conn.execute('DELETE FROM dd_agent.indexed_pages WHERE document_id=%s',(d,))
+        conn.execute('''INSERT INTO dd_agent.indexed_pages
+            (document_id,page_number,index_version,pipeline_version,source_updated_at,source_revision)
+            SELECT document_id,page_number,%s,pipeline_version,updated_at,source_revision
+            FROM dd_agent.effective_document_pages WHERE document_id=%s''',(version,d))
+        conn.execute('''INSERT INTO dd_agent.evidence_chunks
+            (id,document_id,page_number,index_version,ordinal,start_offset,end_offset,text,embedding)
+            SELECT gen_random_uuid(),document_id,page_number,%s,0,0,length(text),text,%s::public.vector
+            FROM dd_agent.effective_document_pages WHERE document_id=%s''',(version,vector,d))
+        for row in conn.execute('SELECT id, text FROM dd_agent.evidence_chunks WHERE document_id=%s',(d,)).fetchall():
+            conn.execute('UPDATE dd_agent.evidence_chunks SET lexemes=%s::tsvector WHERE id=%s',
+                (document_tsvector(row['text']),row['id']))
+    sizes=[]
+    real=models.rerank
+    def counted(query,texts):
+        sizes.append(len(texts))
+        return real(query,texts)
+    models.rerank=counted
+    default=service.search(p,'注册资本')
+    widened=service.search(p,'注册资本',vector_limit=20,keyword_limit=20,candidate_limit=40,result_limit=15)
+    assert len(default['results'])==5 and len(widened['results'])==15 and sizes==[12,20]
+    # 只开关键词时，加宽的必须是关键词名单，而不是向量上限。
+    service.settings=replace(service.settings,retrieval_mode='keyword')
+    service.model_results=ModelResults()
+    sizes.clear()
+    keyword=service.search(p,'注册资本')
+    keyword_wide=service.search(p,'注册资本',keyword_limit=20,candidate_limit=40,result_limit=15)
+    assert len(keyword['results'])==5 and len(keyword_wide['results'])==15 and sizes==[12,20]
+    with pytest.raises(ValueError,match='1–50'):
+        service.search(p,'注册资本',candidate_limit=51)
+
+
 def test_search_sql_returns_fixed_rows_for_20_and_649_page_corpora(tmp_path,database_url):
     import json
     from test_page_reads import seed
