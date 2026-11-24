@@ -51,11 +51,13 @@ def test_docx_paragraph_and_table_are_searchable_without_a_fake_pdf_page(tmp_pat
     assert result['results']
     hit = result['results'][0]
     assert hit['text'] == '甲公司章程约定注册资本。'
-    assert hit['locator'] == {'kind': 'docx_paragraph', 'paragraph': 1}
+    assert hit['locator'] == {'kind': 'docx_paragraphs', 'paragraph_from': 1, 'paragraph_to': 1}
+    assert hit['locator_label'] == '段落 1'
     assert 'PDF 第' not in hit['locator_label']
     table_hits = service.search(project_id, '持股比例')['results']
-    table_hit = next(hit for hit in table_hits if hit['text'] == '持股比例百分之二十')
-    assert table_hit['locator'] == {'kind': 'docx_table_cell', 'table': 1, 'row': 1, 'column': 2, 'paragraph': 1}
+    table_hit = next(hit for hit in table_hits if hit['text'] == '表1 | 股东: 持股比例百分之二十')
+    assert table_hit['locator'] == {'kind': 'docx_table_row', 'table': 1, 'row': 1, 'columns': [1, 2]}
+    assert table_hit['locator_label'] == '表1 行1 列1–2'
     assert 'PDF 第' not in str(table_hit['locator_label'])
     with client(app) as http:
         other = project(http, '另一个项目')
@@ -110,13 +112,17 @@ def test_xlsx_uses_cached_values_and_does_not_invent_formula_results(tmp_path, d
         document_id = uploaded.json()['document']['id']
     service = _service(app, tmp_path, database_url)
     service.index_office(project_id, document_id)
-    revenue = next(hit for hit in service.search(project_id, '营业收入')['results'] if hit['text'] == '营业收入')
-    assert revenue['locator'] == {'kind': 'xlsx_cell', 'sheet': '利润表', 'row': 1, 'column': 'A'}
-    cached = next(hit for hit in service.search(project_id, '2')['results'] if hit['text'] == '2')
-    assert cached['locator']['column'] == 'B'
-    assert cached['formula_state'] == 'not_recalculated'
-    assert '未重算' in cached['locator_label']
-    assert all(hit['text'] not in {'=9+9', '18'} for hit in service.search(project_id, '9+9')['results'])
+    revenue = next(hit for hit in service.search(project_id, '营业收入')['results'] if '营业收入' in hit['text'])
+    assert revenue['text'] == '工作表利润表 | A: 营业收入 | B: 2'
+    assert revenue['locator'] == {
+        'kind': 'xlsx_rows', 'sheet': '利润表', 'row_from': 1, 'row_to': 1,
+        'columns': ['A', 'B'], 'unknown_columns': ['C'],
+    }
+    assert revenue['formula_state'] == 'not_recalculated'
+    assert '未重算' in revenue['locator_label']
+    assert '部分公式未知' in revenue['locator_label']
+    assert '=9+9' not in revenue['text'] and '18' not in revenue['text']
+    assert all('=9+9' not in hit['text'] and hit['text'] != '18' for hit in service.search(project_id, '9+9')['results'])
 
 
 def test_pptx_slide_shape_paragraph_is_not_labeled_as_a_pdf_page(tmp_path, database_url):
@@ -135,7 +141,8 @@ def test_pptx_slide_shape_paragraph_is_not_labeled_as_a_pdf_page(tmp_path, datab
     service = _service(app, tmp_path, database_url)
     service.index_office(project_id, document_id)
     hit = next(item for item in service.search(project_id, '并购方案')['results'] if item['text'] == '第二页并购方案')
-    assert hit['locator'] == {'kind': 'pptx_paragraph', 'slide': 2, 'shape': 1, 'paragraph': 1}
+    assert hit['locator'] == {'kind': 'pptx_slide', 'slide': 2, 'shape_from': 1, 'shape_to': 1}
+    assert hit['locator_label'] == '幻灯片2 形状1'
     assert 'PDF 第' not in hit['locator_label']
 
 
@@ -178,7 +185,8 @@ def test_repeat_upload_does_not_duplicate_vectors_and_failed_unit_can_retry(tmp_
     models.embed = fail_second
     document = Document()
     document.add_paragraph('第一段保留。')
-    document.add_paragraph('失败单元不要入库。')
+    # 两个正文段会并进同一单元。这里用标题切开，才能单独验证后一个单元嵌入失败后可重试。
+    document.add_heading('失败单元不要入库。', level=1)
     buffer = BytesIO()
     document.save(buffer)
     body = buffer.getvalue()

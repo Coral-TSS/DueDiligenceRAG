@@ -366,7 +366,7 @@ def test_converted_doc_is_cited_from_the_original_and_stays_inside_the_project(t
     service = _service(app, tmp_path, database_url, soffice_path=binary)
     hit = next(item for item in service.search(project_id, '章程约定')['results'] if item['text'] == '甲公司章程约定注册资本。')
     assert hit['filenames'] == ['章程.doc']
-    assert hit['locator'] == {'kind': 'docx_paragraph', 'paragraph': 1}
+    assert hit['locator'] == {'kind': 'docx_paragraphs', 'paragraph_from': 1, 'paragraph_to': 1}
     assert 'PDF 第' not in hit['locator_label']
     assert '.docx' not in hit['source_url']
     with client(app) as http:
@@ -391,8 +391,10 @@ def test_converted_doc_is_cited_from_the_original_and_stays_inside_the_project(t
 
 
 @pytest.mark.parametrize(('name', 'body', 'query', 'text', 'locator'), [
-    ('利润表.xls', workbook(), '营业收入', '营业收入资本', {'kind': 'xlsx_cell', 'sheet': '利润表', 'row': 1, 'column': 'A'}),
-    ('方案.ppt', presentation(), '并购方案', '并购方案资本', {'kind': 'pptx_paragraph', 'slide': 1, 'shape': 1, 'paragraph': 1}),
+    ('利润表.xls', workbook(), '营业收入', '工作表利润表 | A: 营业收入资本',
+     {'kind': 'xlsx_rows', 'sheet': '利润表', 'row_from': 1, 'row_to': 1, 'columns': ['A']}),
+    ('方案.ppt', presentation(), '并购方案', '并购方案资本',
+     {'kind': 'pptx_slide', 'slide': 1, 'shape_from': 1, 'shape_to': 1}),
 ])
 def test_xls_and_ppt_reuse_modern_locators_and_keep_the_original_name(tmp_path, database_url, name, body, query, text, locator):
     binary = _fake(tmp_path, 'success')

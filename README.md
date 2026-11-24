@@ -14,7 +14,7 @@
 .\.venv-dev\Scripts\python.exe -m dd_agent
 ```
 
-Linux / macOS 把解释器换成 `.venv-dev/bin/python`。网页只监听 `http://127.0.0.1:8765`。`init-db` 按文件名顺序执行 `src/dd_agent/migrations/`（当前到 `019_material_metadata.sql`，健康检查要求 schema 19），可以重复执行，不删除已有材料。
+Linux / macOS 把解释器换成 `.venv-dev/bin/python`。网页只监听 `http://127.0.0.1:8765`。`init-db` 按文件名顺序执行 `src/dd_agent/migrations/`（当前到 `022_drop_uncategorized.sql`，健康检查要求 schema 22），可以重复执行，不删除已有材料。
 
 只读 MCP 给另一台机器上的客户端列项目、列材料和检索。它不上传、不做 OCR，也不提供原件下载。启动命令不变。
 
@@ -78,6 +78,25 @@ GPU 包装进对应的 OCR、视觉或检索环境，不要装进 `.venv-dev`。
 ## 数据
 
 业务原件、页面图和运行记录在 `DDA_DATA_DIR`（默认 `.local/data`）。数据库里只保留连接配置和迁移脚本，不保留转储或客户数据。请同时备份 PostgreSQL 和数据目录。
+
+## Office 检索单元
+
+Word、Excel、PowerPoint 不再按段落或单元格各做一个向量。Excel 每个数据行配上工作表名和列名（`工作表利润表 | 项目: 营业收入 | 2023: 100`）。表名写在行首，不拿去当列名；只有一列的说明文字按行范围合并。Word 表格一行配上表头，两列的标签和值写在一起；正文在同一个标题下合并，遇到下一个标题就切开。幻灯片在大约 700 字以内合成一条，放不下再按形状切开。合并后的定位仍是范围：工作表和行、列，表和行，段落范围，或幻灯片。超过 700 字会再切，原文不截断。没有缓存值的公式不会被写成计算结果。
+
+索引版本是 `office-unit-v2`。已经按旧方式入库的 Office 向量不会进入当前检索，覆盖缺口里会显示待重建。这次没有新的数据库迁移，也不会在启动或迁移时自动重做这些文件，材料类别也不变。
+
+重新处理必须由你对本机材料逐份发起。项目里的「处理全部已登记材料」会跳过上次已经完成的材料，不能用来刷新这批 Office 文件。
+
+1. 拉下这次改动后，重新启动本机服务（`python -m dd_agent`）。不需要为这次改动单独跑 `init-db`。
+2. 在材料列表里打开每一份 `.doc`、`.docx`、`.xls`、`.xlsx`、`.ppt`、`.pptx`，点「自动处理该材料」。也可以对每一份调用 `POST /api/projects/{project_id}/documents/{document_id}/processing`。含嵌入图的 Word 会再次做图片识别。
+3. 等该材料的说明里出现「当前版本向量已全部入库」。旧向量不会混进新的检索结果。
+4. 然后用仓库外的黄金集重跑只检索评测。不要把客户材料、黄金集或评测输出提交进仓库。
+
+```powershell
+.\.venv-eval\Scripts\python.exe testing\quality\rag_eval\run_ragas.py --dataset D:\EvalData\rag\dataset.local.json --retrieve-only
+```
+
+Linux / macOS 把解释器换成 `.venv-eval/bin/python`，数据集路径换成你本机放在仓库外的那份。
 
 ## 测试
 
