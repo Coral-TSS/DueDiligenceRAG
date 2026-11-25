@@ -3,8 +3,10 @@ import asyncio
 import importlib.util
 import inspect
 import json
+import os
 import sys
 import types
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -1080,3 +1082,178 @@ def test_trulens_provider_receives_a_bound_client_for_deepseek(monkeypatch):
     assert plain.kwargs['api_key'] == 'eval-key'
     assert 'client' not in plain.kwargs
     assert 'extra_body' not in plain.kwargs
+
+
+_JUDGE_ENV = (
+    'EVAL_LLM_API_KEY',
+    'EVAL_LLM_BASE_URL',
+    'EVAL_LLM_MODEL',
+    'OPENAI_API_KEY',
+    'OPENAI_BASE_URL',
+)
+
+
+@contextmanager
+def _without_judge_env():
+    """清掉裁判变量，结束时还原，包括 load_dotenv 写进去的值。"""
+    saved = {name: os.environ.get(name) for name in _JUDGE_ENV}
+    for name in _JUDGE_ENV:
+        os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _script_pipeline(script):
+    """入口脚本经 sys.path 导入的 pipeline，和本文件顶部那个模块不是同一个对象。"""
+    return sys.modules[script.load_eval_env.__module__]
+
+
+def _watch_env_then_key(script, monkeypatch):
+    order = []
+    seen = []
+    real_load = script.load_eval_env
+    real_require = script.require_api_key
+
+    def load_eval_env():
+        order.append('load')
+        real_load()
+
+    def require_api_key(config=None):
+        order.append('require')
+        resolved = real_require(config)
+        seen.append({
+            'api_key': resolved['api_key'],
+            'base_url': resolved['base_url'],
+            'model': resolved['model'],
+        })
+        return resolved
+
+    monkeypatch.setattr(script, 'load_eval_env', load_eval_env)
+    monkeypatch.setattr(script, 'require_api_key', require_api_key)
+    return order, seen
+
+
+def _silence_ragas(script, monkeypatch):
+    monkeypatch.setattr(script, 'RagPipeline', lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(script, 'collect_records', lambda *args, **kwargs: ([], []))
+    monkeypatch.setattr(script, 'score_records', lambda *args, **kwargs: {
+        'metrics_run': ['Faithfulness'],
+        'metrics_skipped': [],
+        'missing_reference_ids': [],
+        'metric_keys': {},
+        'note': 'fixture',
+        'aggregates': {'faithfulness': 1.0},
+        'rows': [{'id': 'q1', 'user_input': '示例', 'faithfulness': 1.0}],
+    })
+
+
+def _silence_trulens(script, monkeypatch):
+    class DummyTru:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_build(project_id, app_version, database_url, pipeline=None):
+        if pipeline is None:
+            app = SimpleNamespace(
+                last_contexts=[],
+                last_found={'status': 'candidates'},
+                pipeline=SimpleNamespace(limits=None),
+                query=lambda query, filters=None: '材料未记载。',
+            )
+        else:
+            app = script.QueryApp(pipeline, project_id)
+        session = SimpleNamespace(get_leaderboard=lambda: None)
+        return session, app, DummyTru()
+
+    monkeypatch.setattr(script, 'build_wrapped_app', fake_build)
+    monkeypatch.setattr(script, 'retrieve_only', lambda *args, **kwargs: None)
+    monkeypatch.setattr(script, 'RagPipeline', lambda *args, **kwargs: SimpleNamespace())
+
+
+def test_load_eval_env_keeps_process_values_and_fills_the_rest(tmp_path, monkeypatch):
+    (tmp_path / '.env').write_text(
+        'EVAL_LLM_API_KEY=from-dotenv\n'
+        'EVAL_LLM_BASE_URL=https://api.deepseek.com\n'
+        'EVAL_LLM_MODEL=from-dotenv-model\n'
+        'OPENAI_API_KEY=from-dotenv-openai\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(pipeline, 'REPO_ROOT', tmp_path)
+    with _without_judge_env():
+        os.environ['EVAL_LLM_API_KEY'] = 'from-process'
+        os.environ['EVAL_LLM_MODEL'] = 'from-process-model'
+        pipeline.load_eval_env()
+        assert os.environ['EVAL_LLM_API_KEY'] == 'from-process'
+        assert os.environ['EVAL_LLM_MODEL'] == 'from-process-model'
+        assert os.environ['EVAL_LLM_BASE_URL'] == 'https://api.deepseek.com'
+        assert os.environ['OPENAI_API_KEY'] == 'from-dotenv-openai'
+        os.environ.pop('EVAL_LLM_API_KEY')
+        pipeline.load_eval_env()
+        assert os.environ['EVAL_LLM_API_KEY'] == 'from-dotenv'
+        assert os.environ['EVAL_LLM_MODEL'] == 'from-process-model'
+
+
+def test_eval_clis_load_repo_env_before_the_judge_key(tmp_path, monkeypatch):
+    (tmp_path / '.env').write_text(
+        'EVAL_LLM_API_KEY=from-dotenv\n'
+        'EVAL_LLM_BASE_URL=https://api.deepseek.com\n'
+        'EVAL_LLM_MODEL=from-dotenv-model\n',
+        encoding='utf-8',
+    )
+    dataset = _write(tmp_path, _body())
+    records = tmp_path / 'records.json'
+    records.write_text(json.dumps([_score_record()], ensure_ascii=False), encoding='utf-8')
+    ragas = _load_script('run_ragas')
+    trulens = _load_script('run_trulens')
+    monkeypatch.setattr(_script_pipeline(ragas), 'REPO_ROOT', tmp_path)
+    assert trulens.load_eval_env.__globals__ is ragas.load_eval_env.__globals__
+    _silence_ragas(ragas, monkeypatch)
+    _silence_trulens(trulens, monkeypatch)
+    watched = (
+        (ragas, *_watch_env_then_key(ragas, monkeypatch)),
+        (trulens, *_watch_env_then_key(trulens, monkeypatch)),
+    )
+
+    with _without_judge_env():
+        os.environ['EVAL_LLM_MODEL'] = 'from-process'
+        for script, order, seen in watched:
+            order.clear()
+            seen.clear()
+            script.main(['--score-from', str(records), '--out', str(tmp_path / f'{script.__name__}-score')])
+            assert order == ['load', 'require'], script.__name__
+            assert seen[-1] == {
+                'api_key': 'from-dotenv',
+                'base_url': 'https://api.deepseek.com',
+                'model': 'from-process',
+            }
+            order.clear()
+            seen.clear()
+            script.main(['--dataset', str(dataset), '--out', str(tmp_path / f'{script.__name__}-run')])
+            assert order == ['load', 'require'], script.__name__
+            assert seen[0]['api_key'] == 'from-dotenv'
+            assert seen[0]['model'] == 'from-process'
+
+        for name in _JUDGE_ENV:
+            os.environ.pop(name, None)
+        (tmp_path / '.env').write_text('\n', encoding='utf-8')
+        for script, order, seen in watched:
+            order.clear()
+            with pytest.raises(RuntimeError, match='EVAL_LLM_API_KEY'):
+                script.main(['--score-from', str(records), '--out', str(tmp_path / f'{script.__name__}-missing')])
+            assert order == ['load', 'require'], script.__name__
+            order.clear()
+            script.main([
+                '--dataset', str(dataset),
+                '--out', str(tmp_path / f'{script.__name__}-retrieve'),
+                '--retrieve-only',
+            ])
+            assert order == ['load'], script.__name__

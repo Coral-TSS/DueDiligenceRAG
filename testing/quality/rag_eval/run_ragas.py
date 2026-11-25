@@ -18,6 +18,7 @@ from pipeline import (  # noqa: E402
     completion_kwargs,
     format_judge_log,
     judge_llm_config,
+    load_eval_env,
     load_score_records,
     metric_skip_message,
     openai_client,
@@ -181,6 +182,8 @@ def score_from(args, out):
 
 
 def main(argv=None):
+    # 裁判密钥在构造检索管道之前就检查。仓库 .env 必须先读进来，且不覆盖进程环境。
+    load_eval_env()
     args = parse_args(argv)
     out = Path(args.out)
     if args.score_from:

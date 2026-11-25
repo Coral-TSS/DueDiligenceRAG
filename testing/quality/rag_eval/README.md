@@ -36,6 +36,8 @@ $env:EVAL_LLM_BASE_URL="https://api.deepseek.com"
 $env:EVAL_LLM_MODEL="deepseek-flash"
 ```
 
+这三项也可以写在仓库根目录的 `.env` 里；进程里已经设置的同名变量优先，不会被 `.env` 覆盖。
+
 未设置 `EVAL_LLM_API_KEY` 时回退到 `OPENAI_API_KEY`。未设置 `EVAL_LLM_BASE_URL` 时回退到 `OPENAI_BASE_URL`。只使用 OpenAI 时，设置 `OPENAI_API_KEY` 即可。未设置 `EVAL_LLM_MODEL` 时，接口地址里包含 `deepseek` 则用 `deepseek-flash`，否则用 `gpt-4o-mini`。`deepseek-chat` 已在 2026-07-24 停用，不要再把它当作默认模型。显式设置 `EVAL_LLM_MODEL` 时仍用该名字。
 
 `deepseek-flash` 默认开启思考。思考写在 `reasoning_content` 里，并占用补全额度。额度用尽时 `finish_reason` 为 `length`，`message.content` 为空，RAGAS 读不到结构化结果。生成答案、RAGAS 裁判和 TruLens 裁判在 DeepSeek 上都会关闭思考。请求通过 OpenAI 兼容的 `extra_body` 发送：
