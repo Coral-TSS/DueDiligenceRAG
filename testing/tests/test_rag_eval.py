@@ -1257,3 +1257,367 @@ def test_eval_clis_load_repo_env_before_the_judge_key(tmp_path, monkeypatch):
                 '--retrieve-only',
             ])
             assert order == ['load'], script.__name__
+
+
+def test_factual_scores_use_recall_direction_not_precision_tp():
+    factual = _load_script('factual')
+    asymmetric = factual.scores_from_verdicts([0], [1])
+    assert asymmetric == {'precision': 0.0, 'recall': 1.0, 'f1': 0.0}
+    # ragas 0.4.4 的 recall 分子是 precision 方向的 TP。这里 TP=0、FN=0，官方 recall 为 0。
+    official_recall = 0 / (0 + 0 + 1e-8)
+    assert round(official_recall, 2) == 0.0
+    assert asymmetric['recall'] == 1.0
+    assert factual.scores_from_verdicts([0, 0], [0]) == {
+        'precision': 0.0, 'recall': 0.0, 'f1': 0.0,
+    }
+    assert factual.scores_from_verdicts([1], [1]) == {
+        'precision': 1.0, 'recall': 1.0, 'f1': 1.0,
+    }
+    assert factual.scores_from_verdicts([1, 0], [1]) == {
+        'precision': 0.5, 'recall': 1.0, 'f1': 0.67,
+    }
+    assert factual.verdict_counts([1, 0, 2]) == {
+        'supported': 1, 'unsupported': 1, 'other': 1,
+    }
+
+
+def test_chinese_factual_prompts_are_not_the_english_defaults():
+    factual = _load_script('factual')
+    assert '多出来的非矛盾措辞' in factual.NLI_INSTRUCTION
+    assert '直接推断' in factual.NLI_INSTRUCTION
+    assert 'directly inferred' not in factual.NLI_INSTRUCTION
+    assert 'Charles Babbage' not in factual.CLAIM_INSTRUCTION
+    assert '2018-03-15' in factual.CLAIM_INSTRUCTION
+    assert '100万元' in factual.NLI_INSTRUCTION
+    assert '百分之三十' in factual.NLI_INSTRUCTION
+    assert '稍长的句子' in factual.NLI_INSTRUCTION
+    wrapped, other_field, wrong_date = factual.NLI_EXAMPLES[0]['statements']
+    assert wrapped['verdict'] == 1
+    assert '2018-03-15' in wrapped['statement']
+    assert '根据材料' in wrapped['statement']
+    assert other_field['verdict'] == 0 and '法定代表人' in other_field['statement']
+    assert wrong_date['verdict'] == 0 and '2019' in wrong_date['statement']
+    percent, amount, conflict = factual.NLI_EXAMPLES[1]['statements']
+    assert percent['verdict'] == 1 and '百分之三十' in percent['statement']
+    assert amount['verdict'] == 1 and '1,000,000' in amount['statement']
+    assert conflict['verdict'] == 0 and '13%' in conflict['statement']
+    kept = factual.CLAIM_EXAMPLES[('low', 'low')][0]
+    assert kept[0].startswith('根据材料')
+    assert kept[1] == ['示例主体的成立日期为2018-03-15。']
+    assert set(factual.CLAIM_EXAMPLES) == {
+        ('low', 'low'), ('low', 'high'), ('high', 'low'), ('high', 'high'),
+    }
+    readme = (EVAL_DIR / 'README.md').read_text(encoding='utf-8')
+    ragas = (EVAL_DIR / 'run_ragas.py').read_text(encoding='utf-8')
+    assert 'factual_correctness_precision' in readme
+    assert 'factual_correctness_recall' in readme
+    assert 'factual_judge_trace.json' in readme
+    assert 'build_factual_metric' in ragas
+    assert 'FactualCorrectness(llm=llm)' not in ragas
+
+
+def test_score_records_persists_precision_recall_and_compact_trace(tmp_path):
+    script = _load_script('run_ragas')
+    response = '根据材料，示例主体的成立日期为2018-03-15。'
+    reference = '示例主体成立于2018年3月15日。'
+
+    class Metric:
+        def score(self, **kwargs):
+            result = SimpleNamespace(value=0.0, precision=0.0, recall=1.0, f1=0.0)
+            result.judge_trace = {
+                'response_claim_count': 1,
+                'reference_claim_count': 1,
+                'precision_nli': {'supported': 0, 'unsupported': 1, 'other': 0},
+                'recall_nli': {'supported': 1, 'unsupported': 0, 'other': 0},
+                'precision': 0.0,
+                'recall': 1.0,
+                'f1': 0.0,
+                'response': kwargs['response'],
+                'reference': kwargs['reference'],
+                'claims': [kwargs['response']],
+            }
+            return result
+
+    scored = script.score_records([
+        _score_record(response=response, reference=reference),
+    ], scorers=[
+        ('factual_correctness', Metric(), script._factual_kwargs),
+    ])
+    row = scored['rows'][0]
+    assert row['factual_correctness_precision'] == 0.0
+    assert row['factual_correctness_recall'] == 1.0
+    assert row['factual_correctness_f1'] == 0.0
+    assert row['factual_correctness'] == row['factual_correctness_f1']
+    assert scored['aggregates']['factual_correctness_recall'] == 1.0
+    assert scored['aggregates']['factual_correctness_precision'] == 0.0
+    out = tmp_path / 'scores'
+    script.write_score_bundle(out, scored)
+    trace = json.loads((out / 'factual_judge_trace.json').read_text(encoding='utf-8'))
+    blob = json.dumps(trace, ensure_ascii=False)
+    assert response not in blob
+    assert reference not in blob
+    assert '根据材料' not in blob
+    assert 'claims' not in trace['rows'][0]
+    assert trace['rows'][0]['id'] == 'q1'
+    assert trace['rows'][0]['recall_nli'] == {'supported': 1, 'unsupported': 0, 'other': 0}
+    assert trace['rows'][0]['precision_nli']['unsupported'] == 1
+    scores = json.loads((out / 'ragas_scores.json').read_text(encoding='utf-8'))
+    assert 'factual_judge_trace' not in scores
+    assert scores['rows'][0]['factual_correctness_recall'] == 1.0
+    csv_text = (out / 'ragas_scores.csv').read_text(encoding='utf-8-sig')
+    assert 'factual_correctness_precision' in csv_text
+    assert 'factual_correctness_recall' in csv_text
+    assert response not in csv_text
+
+
+def _last_prompt_input(prompt):
+    marker = '\ninput: '
+    index = prompt.rfind(marker)
+    raw = prompt[index + len(marker):].split('\nOutput:', 1)[0].strip()
+    return json.loads(raw)
+
+
+def _fact_value(text):
+    import re
+
+    facts = {}
+    date_cn = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', text)
+    date_num = re.search(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', text)
+    match = date_cn or date_num
+    if '成立' in text:
+        if match:
+            year, month, day = match.groups()
+            facts['established'] = f'{int(year):04d}-{int(month):02d}-{int(day):02d}'
+        else:
+            facts['established'] = None
+    if '法定代表人' in text:
+        person = re.search(r'法定代表人(?:是|为)\s*([^\s，。,；;]+)', text)
+        facts['representative'] = person.group(1) if person else None
+    if '注册资本' in text:
+        wan = re.search(r'(\d+(?:\.\d+)?)\s*万元', text)
+        yuan = re.search(r'([\d,]+(?:\.\d+)?)\s*元', text)
+        if wan:
+            facts['capital'] = float(wan.group(1)) * 10000
+        elif yuan:
+            facts['capital'] = float(yuan.group(1).replace(',', ''))
+        else:
+            facts['capital'] = None
+    if '持股' in text:
+        percent = re.search(r'(\d+(?:\.\d+)?)\s*%', text)
+        words = re.search(r'百分之\s*(\d+(?:\.\d+)?|三十|十三)', text)
+        if percent:
+            facts['holding'] = float(percent.group(1))
+        elif words:
+            token = words.group(1)
+            facts['holding'] = {'三十': 30.0, '十三': 13.0}.get(token)
+            if facts['holding'] is None:
+                facts['holding'] = float(token)
+        else:
+            facts['holding'] = None
+    return facts
+
+
+def _aligned_verdict(context, statement, relaxed):
+    context_facts = _fact_value(context)
+    statement_facts = _fact_value(statement)
+    if not statement_facts:
+        return 0
+    for field, value in statement_facts.items():
+        if field not in context_facts or context_facts[field] != value or value is None:
+            return 0
+    if relaxed:
+        return 1
+    for phrase in ('根据材料', '如下', '该公司'):
+        if phrase in statement and phrase not in context:
+            return 0
+    return 1
+
+
+def _scripted_judge():
+    from ragas.llms.base import InstructorBaseRagasLLM
+    from ragas.metrics.collections.factual_correctness.util import StatementFaithfulnessAnswer
+
+    class ScriptedJudge(InstructorBaseRagasLLM):
+        """按提示语选择宽对齐或英文默认的逐字规则。不调用外部模型。"""
+
+        def generate(self, prompt, response_model):
+            return asyncio.run(self.agenerate(prompt, response_model))
+
+        async def agenerate(self, prompt, response_model):
+            payload = _last_prompt_input(prompt)
+            if response_model.__name__ == 'ClaimDecompositionOutput':
+                return response_model(claims=[payload['response']])
+            if response_model.__name__ != 'NLIStatementOutput':
+                raise AssertionError(response_model.__name__)
+            relaxed = '多出来的非矛盾措辞' in prompt
+            return response_model(statements=[
+                StatementFaithfulnessAnswer(
+                    statement=statement,
+                    reason='synthetic',
+                    verdict=_aligned_verdict(payload['context'], statement, relaxed),
+                )
+                for statement in payload['statements']
+            ])
+
+    return ScriptedJudge()
+
+
+def test_rendered_chinese_prompts_replace_english_defaults():
+    pytest.importorskip('ragas')
+    from ragas.metrics.collections.factual_correctness.util import (
+        ClaimDecompositionInput,
+        ClaimDecompositionPrompt,
+        NLIStatementInput,
+        NLIStatementPrompt,
+    )
+
+    factual = _load_script('factual')
+    claim = factual.chinese_claim_prompt()
+    nli = factual.chinese_nli_prompt()
+    claim_text = claim.to_string(ClaimDecompositionInput(
+        response='示例主体成立于2018年3月15日。',
+        atomicity='low',
+        coverage='low',
+    ))
+    high_text = claim.to_string(ClaimDecompositionInput(
+        response='示例主体成立于2018年3月15日。',
+        atomicity='low',
+        coverage='high',
+    ))
+    nli_text = nli.to_string(NLIStatementInput(
+        context='示例主体成立于2018年3月15日。',
+        statements=['根据材料，示例主体的成立日期为2018-03-15。'],
+    ))
+    assert '套话不要单独成条' in claim_text
+    assert 'Charles Babbage' not in claim_text
+    assert '示例行业' in claim_text
+    assert '持股比例为30%' in high_text
+    assert '多出来的非矛盾措辞' in nli_text
+    assert '2018-03-15' in nli_text
+    assert 'directly inferred' not in nli_text
+    assert claim.language == 'chinese'
+    assert nli.language == 'chinese'
+    english_claim = ClaimDecompositionPrompt().to_string(ClaimDecompositionInput(
+        response='x', atomicity='low', coverage='low',
+    ))
+    english_nli = NLIStatementPrompt().to_string(NLIStatementInput(
+        context='x', statements=['y'],
+    ))
+    assert 'Charles Babbage' in english_claim
+    assert 'directly inferred' in english_nli
+    assert claim.instruction != ClaimDecompositionPrompt.instruction
+    assert nli.instruction != NLIStatementPrompt.instruction
+
+
+def test_wrapped_chinese_fact_is_not_zero_and_conflict_stays_low():
+    pytest.importorskip('ragas')
+    from ragas.metrics.collections import FactualCorrectness
+
+    factual = _load_script('factual')
+    script = _load_script('run_ragas')
+    judge = _scripted_judge()
+    metric = factual.build_factual_metric(judge)
+    official_recall = FactualCorrectness(llm=judge, mode='recall')
+    official_f1 = FactualCorrectness(llm=judge, mode='f1')
+    assert official_recall.mode == 'recall'
+    assert 'directly inferred' in official_recall.nli_prompt.instruction
+    assert 'directly inferred' not in metric.nli_prompt.instruction
+    assert metric.__class__.__name__ == 'DueDiligenceFactualCorrectness'
+
+    response = '根据材料，示例主体的成立日期为2018-03-15。'
+    reference = '示例主体成立于2018年3月15日。'
+    result = metric.score(response=response, reference=reference)
+    assert result.precision == 1.0
+    assert result.recall == 1.0
+    assert result.value == 1.0
+    assert official_recall.score(response=response, reference=reference).value == 0.0
+    assert official_f1.score(response=response, reference=reference).value == 0.0
+    blob = json.dumps(result.judge_trace, ensure_ascii=False)
+    assert response not in blob
+    assert reference not in blob
+    assert result.judge_trace['response_claim_count'] == 1
+    assert result.judge_trace['reference_claim_count'] == 1
+    assert result.judge_trace['precision_nli']['supported'] == 1
+    assert result.judge_trace['recall_nli']['supported'] == 1
+
+    wrong_field = metric.score(
+        response='示例主体的法定代表人是甲。',
+        reference=reference,
+    )
+    assert wrong_field.precision == 0.0
+    assert wrong_field.recall == 0.0
+    assert wrong_field.value == 0.0
+    conflict = metric.score(
+        response='示例主体的持股比例为13%。',
+        reference='示例主体的持股比例为30%。',
+    )
+    assert conflict.precision == 0.0
+    assert conflict.recall == 0.0
+    assert conflict.value == 0.0
+    percent = metric.score(
+        response='根据材料，示例主体持股百分之三十。',
+        reference='示例主体的持股比例为30%。',
+    )
+    assert percent.precision == 1.0 and percent.recall == 1.0 and percent.value == 1.0
+    amount = metric.score(
+        response='示例主体的注册资本为1,000,000元。',
+        reference='示例主体的注册资本是100万元。',
+    )
+    assert amount.precision == 1.0 and amount.recall == 1.0 and amount.value == 1.0
+
+    scored = script.score_records([
+        _score_record(
+            id='date-wrap',
+            user_input='示例主体何时成立？',
+            response=response,
+            reference=reference,
+            retrieved_contexts=['合成片段'],
+        ),
+    ], scorers=[
+        ('factual_correctness', metric, script._factual_kwargs),
+    ])
+    row = scored['rows'][0]
+    assert row['factual_correctness_precision'] == 1.0
+    assert row['factual_correctness_recall'] == 1.0
+    assert row['factual_correctness'] == 1.0
+    trace_blob = json.dumps(scored['factual_judge_trace'], ensure_ascii=False)
+    assert response not in trace_blob
+    assert reference not in trace_blob
+    assert '合成片段' not in trace_blob
+
+
+def test_installed_ragas_recall_mode_still_reuses_precision_tp():
+    pytest.importorskip('ragas')
+    import numpy as np
+    from ragas.metrics.collections import FactualCorrectness
+
+    factual = _load_script('factual')
+    judge = _scripted_judge()
+    metric = factual.build_factual_metric(judge)
+
+    async def claims_and_verdicts(text, against):
+        if against == 'gold':
+            return ['kept-out-of-trace'], [0]
+        return ['kept-out-of-trace'], [1]
+
+    metric._claims_and_verdicts = claims_and_verdicts
+    result = metric.score(response='response-text', reference='gold')
+    assert result.precision == 0.0
+    assert result.recall == 1.0
+    assert result.f1 == 0.0
+    assert 'kept-out-of-trace' not in json.dumps(result.judge_trace, ensure_ascii=False)
+    assert 'response-text' not in json.dumps(result.judge_trace, ensure_ascii=False)
+    assert result.judge_trace['recall_nli']['supported'] == 1
+    assert result.judge_trace['precision_nli']['unsupported'] == 1
+
+    async def direction(text, other):
+        if text == 'response-text':
+            return np.array([False])
+        return np.array([True])
+
+    official_recall = FactualCorrectness(llm=judge, mode='recall')
+    official_recall._decompose_and_verify_claims = direction
+    official_f1 = FactualCorrectness(llm=judge, mode='f1')
+    official_f1._decompose_and_verify_claims = direction
+    assert official_recall.score(response='response-text', reference='gold').value == 0.0
+    assert official_f1.score(response='response-text', reference='gold').value == 0.0

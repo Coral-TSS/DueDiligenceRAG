@@ -145,9 +145,24 @@ D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligen
 D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligenceRAG\testing\quality\rag_eval\run_ragas.py --score-from D:\EvalData\rag\output\records.json --out D:\EvalData\rag\output
 ```
 
-这条命令只写 `ragas_scores.json` 和 `ragas_scores.csv`。它不改写 `records.json` 和 `traces.json`，即使 `--out` 就是这两份文件所在的目录。不能和 `--dataset`、`--retrieve-only` 或 `--project-id` 一起用。
+这条命令写出 `ragas_scores.json`、`ragas_scores.csv`，以及旁边的 `factual_judge_trace.json`。它不改写 `records.json` 和 `traces.json`，即使 `--out` 就是这两份文件所在的目录。不能和 `--dataset`、`--retrieve-only` 或 `--project-id` 一起用。
 
 记录文件是上面这条 RAGAS 命令写出的 JSON 数组，也可以是含非空 `records` 数组的对象。每条要有 `user_input`（或 `question`）、字符串数组 `retrieved_contexts`，以及非空 `response`（或 `answer`）。`reference` 可空；缺了的条目仍按上面的规则跳过 ContextRecall 和 FactualCorrectness。`--retrieve-only` 留下的空答案不能打分。
+
+### 事实正确性
+
+FactualCorrectness 的拆句提示和 NLI 对齐提示使用中文说明和中文示例，面向尽调里的短事实。同一事实的不同写法算同一条：日期（`2018年3月15日` 与 `2018-03-15`）、数字和金额（`100万元` 与 `1,000,000元`）、百分数（`30%` 与 `百分之三十`）。参考答案很短、回答只用稍长的句子把这个事实包起来时，只要没有矛盾，算支持。多出来的非矛盾措辞不会把该条判成不支持。互相矛盾，或者答到另一个字段（例如金标是成立日期，回答却是法定代表人），仍然不支持。
+
+不要只看一个 F1。ragas 0.4.4 的 `FactualCorrectness` 即使用 `mode="recall"`，分子仍是 precision 方向的支持条数，短金标对上稍长的回答时这个数会变成 0。本包自己按两个方向计数，并在 `ragas_scores.json` 的每一行和汇总里同时写出：
+
+| 字段 | 含义 |
+| --- | --- |
+| `factual_correctness_precision` | 回答拆出的陈述里，被参考答案支持的比例 |
+| `factual_correctness_recall` | 参考答案拆出的陈述里，被回答支持的比例。分子是这一方向的支持条数，不是 precision 方向的 TP |
+| `factual_correctness_f1` | 上面两者的调和平均，用来和单个分数对照 |
+| `factual_correctness` | 与 `factual_correctness_f1` 相同 |
+
+`factual_judge_trace.json` 与这两份分数字段一起写出。每一行只有 `id`、`response_claim_count`、`reference_claim_count`、`precision_nli`、`recall_nli`、`precision`、`recall`、`f1`。两个 `*_nli` 对象只计 `supported`、`unsupported`、`other` 的条数。这个文件不写陈述原文、回答、参考答案或检索片段。FactualCorrectness 被跳过时，`rows` 为空数组。
 
 ## TruLens
 
@@ -183,7 +198,8 @@ D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligen
 | --- | --- |
 | `records.json` | RAGAS 路径。含问题、检索片段、答案和 reference |
 | `traces.json` | 检索状态、片段数、coverage、本条过滤条件，以及这次的 `retrieval_limits` |
-| `ragas_scores.json` / `ragas_scores.csv` | 完整 RAGAS 打分。`--score-from` 只写这两个分数文件 |
+| `ragas_scores.json` / `ragas_scores.csv` | 完整 RAGAS 打分。事实正确性同时有 precision、recall 和 F1 |
+| `factual_judge_trace.json` | 事实正确性的条目计数和判决标签计数，与分数文件一起写出。没有陈述原文 |
 | `trulens_answers.json` | TruLens 路径的答案、片段数和过滤条件 |
 | `trulens_leaderboard.json` | 能取到排行榜时写出 |
 | `trulens.sqlite` | TruLens 会话库，按 `--app-version` 累积 |
