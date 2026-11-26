@@ -85,7 +85,9 @@ def make_ragas_llm(config=None):
 
 
 def build_scorers(llm, selected):
-    from ragas.metrics.collections import ContextRecall, Faithfulness, FactualCorrectness
+    from ragas.metrics.collections import ContextRecall, Faithfulness
+
+    from factual import build_factual_metric
 
     scorers = []
     if 'Faithfulness' in selected:
@@ -94,7 +96,9 @@ def build_scorers(llm, selected):
         # 集合 API 的类名是 ContextRecall，对应旧的 LLMContextRecall。
         scorers.append(('context_recall', ContextRecall(llm=llm), _context_recall_kwargs))
     if 'FactualCorrectness' in selected:
-        scorers.append(('factual_correctness', FactualCorrectness(llm=llm), _factual_kwargs))
+        # 不用 FactualCorrectness 的默认 ascore。ragas 0.4.4 的 recall / F1
+        # 分子仍是 precision 方向的支持条数，mode="recall" 改不了这一点。
+        scorers.append(('factual_correctness', build_factual_metric(llm), _factual_kwargs))
     return scorers
 
 
@@ -121,12 +125,54 @@ def _factual_kwargs(record):
     }
 
 
+FACTUAL_NOTE = (
+    '每条都有 reference，已计算 Faithfulness、ContextRecall 和 FactualCorrectness。'
+    'FactualCorrectness 的 factual_correctness_precision 是回答中的事实被参考答案支持的比例，'
+    'factual_correctness_recall 是参考答案中的事实被回答覆盖的比例，'
+    'factual_correctness 与 factual_correctness_f1 是这两者的调和平均。'
+    '条目计数写在 factual_judge_trace.json，与 ragas_scores 一起写出。'
+)
+FACTUAL_SCORE_FIELDS = (
+    'factual_correctness',
+    'factual_correctness_precision',
+    'factual_correctness_recall',
+    'factual_correctness_f1',
+)
+
+
 def metric_value(metric, **kwargs):
     result = metric.score(**kwargs)
+    if hasattr(result, 'precision') and hasattr(result, 'recall'):
+        f1 = getattr(result, 'f1', None)
+        if f1 is None:
+            f1 = getattr(result, 'value', 0.0)
+        return {
+            'precision': float(result.precision),
+            'recall': float(result.recall),
+            'f1': float(f1),
+            'judge_trace': getattr(result, 'judge_trace', None),
+        }
     value = getattr(result, 'value', result)
     if hasattr(value, 'item'):
         value = value.item()
     return float(value)
+
+
+def _apply_factual_value(row, record, value, traces):
+    from factual import compact_judge_trace
+
+    row['factual_correctness_precision'] = value['precision']
+    row['factual_correctness_recall'] = value['recall']
+    row['factual_correctness_f1'] = value['f1']
+    row['factual_correctness'] = value['f1']
+    trace = compact_judge_trace(value.get('judge_trace'))
+    if trace is None:
+        trace = compact_judge_trace({
+            'precision': value['precision'],
+            'recall': value['recall'],
+            'f1': value['f1'],
+        })
+    traces.append({'id': record['id'], **trace})
 
 
 def score_records(records, llm=None, scorers=None):
@@ -138,17 +184,29 @@ def score_records(records, llm=None, scorers=None):
         llm = llm or make_ragas_llm()
         scorers = build_scorers(llm, selection['selected'])
     rows = []
+    traces = []
     for record in records:
         row = {'id': record['id'], 'user_input': record['user_input']}
         for key, metric, arguments in scorers:
             try:
-                row[key] = metric_value(metric, **arguments(record))
+                value = metric_value(metric, **arguments(record))
             except Exception as exc:
                 detail = redact_secrets(exc)
                 raise RuntimeError(f"第 {record['id']} 条 {key} 打分失败：{detail}") from None
+            if key == 'factual_correctness' and isinstance(value, dict):
+                _apply_factual_value(row, record, value, traces)
+            else:
+                row[key] = value
         rows.append(row)
-    aggregates = {}
+    aggregate_keys = []
     for key, _metric, _arguments in scorers:
+        if key not in aggregate_keys:
+            aggregate_keys.append(key)
+    for key in FACTUAL_SCORE_FIELDS:
+        if any(key in row for row in rows) and key not in aggregate_keys:
+            aggregate_keys.append(key)
+    aggregates = {}
+    for key in aggregate_keys:
         numbers = [row[key] for row in rows if isinstance(row.get(key), (int, float))]
         aggregates[key] = (sum(numbers) / len(numbers)) if numbers else None
     return {
@@ -159,11 +217,30 @@ def score_records(records, llm=None, scorers=None):
             'Faithfulness': 'faithfulness',
             'LLMContextRecall': 'context_recall',
             'FactualCorrectness': 'factual_correctness',
+            'FactualCorrectnessPrecision': 'factual_correctness_precision',
+            'FactualCorrectnessRecall': 'factual_correctness_recall',
+            'FactualCorrectnessF1': 'factual_correctness_f1',
         },
-        'note': message or '每条都有 reference，已计算 Faithfulness、ContextRecall 和 FactualCorrectness。',
+        'note': message or FACTUAL_NOTE,
         'aggregates': aggregates,
         'rows': rows,
+        'factual_judge_trace': {
+            'metric': 'FactualCorrectness',
+            'rows': traces,
+        },
     }
+
+
+def write_score_bundle(out, scores):
+    """写出分数，并把事实正确性的计数痕迹放在旁边。痕迹里没有陈述原文。"""
+    trace = scores.get('factual_judge_trace') or {
+        'metric': 'FactualCorrectness',
+        'rows': [],
+    }
+    body = {key: value for key, value in scores.items() if key != 'factual_judge_trace'}
+    write_json(out / 'ragas_scores.json', body)
+    write_csv(out / 'ragas_scores.csv', body['rows'])
+    write_json(out / 'factual_judge_trace.json', trace)
 
 
 def score_from(args, out):
@@ -176,8 +253,7 @@ def score_from(args, out):
     records = load_score_records(args.score_from)
     print(format_judge_log(suffix='根据已有记录打分，不检索、不生成'))
     scores = score_records(records)
-    write_json(out / 'ragas_scores.json', scores)
-    write_csv(out / 'ragas_scores.csv', scores['rows'])
+    write_score_bundle(out, scores)
     print(f'已根据已有记录打分，未改写 records.json 或 traces.json。结果已写入：{out}')
 
 
@@ -206,8 +282,7 @@ def main(argv=None):
         return
     print(format_judge_log())
     scores = score_records(records)
-    write_json(out / 'ragas_scores.json', scores)
-    write_csv(out / 'ragas_scores.csv', scores['rows'])
+    write_score_bundle(out, scores)
     print(f'结果已写入：{out}')
 
 
