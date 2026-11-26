@@ -24,7 +24,7 @@ dd-agent = "dd_agent.__main__:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-dd_agent = ["static/*", "migrations/*.sql", "profiles/*.json"]
+dd_agent = ["static/*", "migrations/*.sql", "profiles/*.json", "lexicon/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["testing/tests"]

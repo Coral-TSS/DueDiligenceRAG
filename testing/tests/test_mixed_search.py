@@ -29,7 +29,7 @@ def test_complete_material_replaces_old_hits_and_reranks_candidates_once(tmp_pat
     def counted(query,texts):calls.append(list(texts));return rerank(query,texts)
     x.index.models.rerank=counted
     result=x.search.search(x.p,'注册资本')
-    assert len(calls)==1 and len(calls[0])<=12
+    assert len(calls)==1 and len(calls[0])<=x.evidence.settings.retrieval_candidate_limit
     assert result['coverage']['complete'] and result['coverage']['indexed_pages']==3
     assert {hit['index_kind'] for hit in result['results']}=={'page','parent_child'}
     assert all(hit['index_kind']=='parent_child' for hit in result['results'] if str(hit['document_id'])==str(x.d))

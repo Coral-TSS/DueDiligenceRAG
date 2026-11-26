@@ -81,10 +81,10 @@ class ParentQueries:
                 JOIN live ON live.id=c.build_id'''+outer+'''
                 ORDER BY '''+exact+''' ts_rank_cd(c.lexemes,q.tsq) DESC,c.build_id,c.id LIMIT %s''',args).fetchall()
 
-    def finalize(self,project_id,version,candidates,*,conn=None,current_receipts_only=False,budget=12):
+    def finalize(self,project_id,version,candidates,*,conn=None,current_receipts_only=False,budget=24):
         """重排后在单一只读快照核对有限个精确 child 身份及其父块。
 
-        缺省最多 12 个，与产品融合上限一致。评测可以传入更大的预算，最多 50。
+        缺省最多 24 个，与产品融合上限一致。评测可以传入更大的预算，最多 50。
         不持事务等待模型。父块最多 4000 字符。响应层产品路径另限 5 个父块。
         子块和上下文在同一快照读取，避免逐父块查询混合来源版本。
         """

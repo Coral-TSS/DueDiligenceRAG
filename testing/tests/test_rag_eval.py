@@ -386,6 +386,7 @@ def test_retrieve_uses_the_wider_eval_window_and_ignores_product_settings(monkey
     )
     assert records[0]['retrieved_contexts'] == ['办公材料片段']
     assert traces[0]['retrieval_limits'] == overridden.limits
+    assert 'query_rewrite' not in traces[0]
     for raw in ('0', '51', '20.5', 'true', '+20'):
         monkeypatch.setenv('EVAL_RETRIEVAL_CANDIDATE_LIMIT', raw)
         with pytest.raises(ValueError, match='1–50'):

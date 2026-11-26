@@ -7,6 +7,7 @@ import math
 from time import monotonic
 from uuid import UUID
 from .lexical import build_keyword_query, fuse_for, mixed_key, prepare_keyword_rows
+from .query_rewrite import QueryRewrite, attach_query_rewrite, resolve_query
 from .model_admission import request_scope,current_control,AdmissionError
 from .parent_coverage import ParentCoverage
 from .parent_search import ParentSearch
@@ -27,19 +28,22 @@ class MixedSearch:
         self.pages=SearchQueries(evidence.database)
 
     def search(self,project_id,query,*,cancel=None):
-        project_id=UUID(str(project_id));query=query.strip()
-        if not 1<=len(query)<=500:raise ValueError('查询须为 1–500 个字符。')
+        project_id=UUID(str(project_id))
+        rewrite=resolve_query(query, enabled=self.evidence.settings.query_rewrite_enabled)
         try:
             with request_scope('interactive',cancel=cancel,
                     deadline=monotonic()+self.evidence.settings.search_timeout_seconds):
-                return self._search(project_id,query,document_id=None,scope=None,window=None)
+                found=self._search(project_id,rewrite,document_id=None,scope=None,window=None)
+                return attach_query_rewrite(found, rewrite)
         except AdmissionError as exc:
             if exc.code=='cancelled':raise SearchCancelled('查询已取消。') from None
             if exc.code=='deadline':raise SearchTimeout('本次查询超时，请稍后重试。') from None
             raise RetrievalBusy('本地模型繁忙，请稍后重试。') from None
 
-    def _search(self,project_id,query,*,document_id=None,scope=None,window=None):
+    def _search(self,project_id,rewrite,*,document_id=None,scope=None,window=None):
         # 缺省窗口就是产品设置加最后保留 5 条。评测经 EvidenceService.search 传入更大的窗口。
+        if not isinstance(rewrite, QueryRewrite):
+            raise TypeError('查询改写结果无效。')
         window=window or search_window(self.evidence.settings)
         control=current_control();control.check()
         documents=self.documents;limited=False;project_checked=False
@@ -48,7 +52,7 @@ class MixedSearch:
             if discovered is None:raise RetrievalError('项目不存在。')
             documents=discovered['documents'];limited=discovered['limited'];project_checked=True
         if not documents:
-            response=self.evidence._search(project_id,query,project_checked=True,document_id=document_id,scope=scope,window=window)
+            response=self.evidence._search(project_id,rewrite,project_checked=True,document_id=document_id,scope=scope,window=window)
             for hit in response['results']:
                 if hit.get('index_kind')!='source_unit':hit['index_kind']='page'
             return dict(response,index_kind='page',parent_documents=[],selection_changed=False,parent_selection_limited=False)
@@ -70,10 +74,10 @@ class MixedSearch:
         vector_rows=[]
         if settings.retrieval_mode!='keyword':
             def embed():
-                values=self.evidence.models.embed([query],query=True)
+                values=self.evidence.models.embed([rewrite.rewritten],query=True)
                 if len(values)!=1:raise RetrievalError('查询向量数量不符。')
                 return values[0]
-            vector=self.evidence._model_result('embedding',project_id,query,[],embed,valid_vector)
+            vector=self.evidence._model_result('embedding',project_id,rewrite.rewritten,[],embed,valid_vector)
             old=self.pages.candidates(project_id,page_version,valid_vector(vector),excluded_documents=selected,
                 included_documents=page_included,limit=window.vector_limit,scope=scope)
             children=self.parent.queries.candidates(project_id,parent_version,vector,documents=parent_selected,
@@ -83,7 +87,7 @@ class MixedSearch:
                 key=lambda r:(-r['similarity'],r['index_kind'],str(r['id'])))[:window.vector_limit]
         keyword_rows=[]
         if settings.retrieval_mode!='vector':
-            plan=build_keyword_query(query)
+            plan=build_keyword_query(rewrite.original, extra_terms=rewrite.keyword_terms)
             if plan.tsquery:
                 old=self.pages.keyword_candidates(project_id,page_version,plan.tsquery,plan.needles,
                     excluded_documents=selected,included_documents=page_included,limit=window.keyword_limit,scope=scope)
@@ -91,8 +95,8 @@ class MixedSearch:
                     documents=parent_selected,current_receipts_only=True,limit=window.keyword_limit,scope=scope) if parent_selected else []
                 keyword_rows=prepare_keyword_rows([dict(r,index_kind='page') for r in old]+[dict(r,index_kind='parent_child') for r in children],plan)
                 keyword_rows=keyword_rows[:window.keyword_limit]
-        # 融合后再交给一次重排。产品默认不超过 12 条；本次窗口可以更大，评测用来扩大进重排的名单。
-        office_rows=self.evidence._office_rows(project_id, query, page_included, scope, window=window)
+        # 融合后再交给一次重排。产品默认不超过 24 条；本次窗口可以更大，评测用来扩大进重排的名单。
+        office_rows=self.evidence._office_rows(project_id, rewrite, page_included, scope, window=window)
         vector_rows=list(vector_rows)+office_rows['vector']
         keyword_rows=list(keyword_rows)+office_rows['keyword']
         rows=fuse_for(settings,vector_rows,keyword_rows,key=mixed_key,limit=window.candidate_limit)
@@ -102,8 +106,8 @@ class MixedSearch:
                 raise RetrievalError('重排序输出无效，请重试。')
         if rows:
             texts=[r['text'] for r in rows]
-            scores=self.evidence._model_result('reranker',project_id,query,texts,
-                lambda:self.evidence.models.rerank(query,texts),validate)
+            scores=self.evidence._model_result('reranker',project_id,rewrite.rewritten,texts,
+                lambda:self.evidence.models.rerank(rewrite.rewritten,texts),validate)
             for row,score in zip(rows,scores,strict=True):row['rerank_score']=score
         control.check()
         old=[r for r in rows if r['index_kind']=='page']

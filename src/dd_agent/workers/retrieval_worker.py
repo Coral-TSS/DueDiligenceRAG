@@ -13,7 +13,10 @@ from dd_agent.performance import timed, span, count
 
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
+# 这条参与嵌入指纹。改动会使已有向量索引失效，因此保持不变。
 INSTRUCTION = 'Retrieve evidence passages relevant to the due diligence question.'
+# 重排沿用官方的 Instruct／Query／Document 格式，只把说明换成中文尽调证据。
+RERANK_INSTRUCTION = '给定尽职调查问题，判断文档是否包含该问题所问字段的原文证据。'
 PREFIX = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
 SUFFIX = '<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
 
@@ -145,7 +148,7 @@ def rerank_loaded(engine, query, texts, token_budget=4096):
     yes, no = (tokenizer.convert_tokens_to_ids(word) for word in ('yes', 'no'))
     rows, lengths = [], []
     for text in texts:
-        ids = tokenizer(f'<Instruct>: {INSTRUCTION}\n<Query>: {query}\n<Document>: {text}', add_special_tokens=False, truncation=False)['input_ids']
+        ids = tokenizer(rerank_pair(query, text), add_special_tokens=False, truncation=False)['input_ids']
         if len(ids) + len(prefix) + len(suffix) > 4096:
             raise ValueError('Reranking input exceeds token budget')
         row = prefix + ids + suffix
@@ -161,6 +164,12 @@ def rerank_loaded(engine, query, texts, token_budget=4096):
             chosen = yes_no_logits(model, inputs, no, yes)
             results.extend(chosen.softmax(dim=1)[:, 1].tolist())
     return results
+
+
+def rerank_pair(query, text, instruction=None):
+    """Qwen3-Reranker 的用户段。前缀和后缀仍是官方 yes/no 模板。"""
+    task = RERANK_INSTRUCTION if instruction is None else instruction
+    return f'<Instruct>: {task}\n<Query>: {query}\n<Document>: {text}'
 
 
 def rerank(path, query, texts):

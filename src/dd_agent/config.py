@@ -99,8 +99,11 @@ class Settings:
     retrieval_fusion: str = 'rrf'
     retrieval_vector_limit: int = 12
     retrieval_keyword_limit: int = 12
-    # 产品设置里送入重排的融合名单仍是 1–12。EvidenceService.search 可以按次传入更大的值（最多 50），只给评测使用。
-    retrieval_candidate_limit: int = 12
+    # 送入重排的融合名单。默认 24，让重排看到两路各 12 条的并集，而不是在重排前切回 12。
+    # 界面和 MCP 最后仍只保留 5 条。设置与单次查询一样是 1–50；评测仍按次传入自己的窗口。
+    retrieval_candidate_limit: int = 24
+    # 规则改写和官方术语扩展。默认开，不调用大模型。
+    query_rewrite_enabled: bool = True
     retrieval_rrf_k: int = 60
     retrieval_vector_weight: float = 1.
     retrieval_keyword_weight: float = 1.
@@ -137,8 +140,10 @@ class Settings:
             raise ValueError('召回融合只支持 rrf 或 weighted。')
         if any(type(v) is not int or not 1 <= v <= 50 for v in (self.retrieval_vector_limit, self.retrieval_keyword_limit)):
             raise ValueError('各路召回条数须为 1–50。')
-        if type(self.retrieval_candidate_limit) is not int or not 1 <= self.retrieval_candidate_limit <= 12:
-            raise ValueError('送入重排的候选条数须为 1–12。')
+        if type(self.retrieval_candidate_limit) is not int or not 1 <= self.retrieval_candidate_limit <= 50:
+            raise ValueError('送入重排的候选条数须为 1–50。')
+        if type(self.query_rewrite_enabled) is not bool:
+            raise ValueError('查询改写开关无效。')
         if type(self.retrieval_rrf_k) is not int or not 1 <= self.retrieval_rrf_k <= 1000:
             raise ValueError('RRF 平滑常数须为 1–1000。')
         weights = (self.retrieval_vector_weight, self.retrieval_keyword_weight)
@@ -269,7 +274,8 @@ class Settings:
             retrieval_fusion=os.getenv('DDA_RETRIEVAL_FUSION', 'rrf').strip().lower(),
             retrieval_vector_limit=int(os.getenv('DDA_RETRIEVAL_VECTOR_LIMIT') or '12'),
             retrieval_keyword_limit=int(os.getenv('DDA_RETRIEVAL_KEYWORD_LIMIT') or '12'),
-            retrieval_candidate_limit=int(os.getenv('DDA_RETRIEVAL_CANDIDATE_LIMIT') or '12'),
+            retrieval_candidate_limit=int(os.getenv('DDA_RETRIEVAL_CANDIDATE_LIMIT') or '24'),
+            query_rewrite_enabled=os.getenv('DDA_QUERY_REWRITE', '1').strip().lower() not in {'0', 'false', 'no'},
             retrieval_rrf_k=int(os.getenv('DDA_RETRIEVAL_RRF_K') or '60'),
             retrieval_vector_weight=float(os.getenv('DDA_RETRIEVAL_VECTOR_WEIGHT') or '1'),
             retrieval_keyword_weight=float(os.getenv('DDA_RETRIEVAL_KEYWORD_WEIGHT') or '1'),

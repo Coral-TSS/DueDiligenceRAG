@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 from .cache import cache_directory, file_entries, resolve_fingerprint, venv_runtime_descriptor
 from .chunks import layout_chunks, split_text
 from .lexical import build_keyword_query, document_tsvector, fuse_for, page_key, prepare_keyword_rows
+from .query_rewrite import QueryRewrite, attach_query_rewrite, resolve_query
 from .model_results import ModelResults
 from .model_admission import request_scope, current_control, AdmissionError
 from .control import ProcessingDeferred
@@ -261,14 +262,14 @@ class LocalModels:
 # 不匹配的旧向量可能仍在表中留档，但不会被当前检索返回。
 
 
-# 与 SQL 召回上限一致。产品设置里的融合条数另外限制在 1–12，见 Settings。
+# 与 SQL 召回上限一致。产品设置里的融合条数也是 1–50，默认 24，见 Settings。
 MAX_SEARCH_LIMIT = 50
 DEFAULT_RESULT_LIMIT = 5
 
 
 @dataclass(frozen=True)
 class SearchWindow:
-    """一次查询的召回与保留条数。界面和 MCP 不传它，因此仍是各路 12、融合 12、保留 5。"""
+    """一次查询的召回与保留条数。界面和 MCP 不传它，因此仍是各路 12、融合 24、保留 5。"""
     vector_limit: int
     keyword_limit: int
     candidate_limit: int
@@ -277,7 +278,7 @@ class SearchWindow:
     def __post_init__(self):
         _bounded_count(self.vector_limit, '向量召回条数')
         _bounded_count(self.keyword_limit, '关键词召回条数')
-        # 显式传入时可以高于产品设置的 12，这样评测加宽的两路召回才能进重排。
+        # 显式传入时可以高于产品默认的 24，这样评测加宽的两路召回才能进重排。上限仍是 50。
         _bounded_count(self.candidate_limit, '送入重排的候选条数')
         _bounded_count(self.result_limit, '重排后保留条数')
 
@@ -473,7 +474,7 @@ class EvidenceService:
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::public.vector,%s::tsvector,%s)''',
                     (uuid4(), document_id, number, version, ordinal, chunk['start_offset'], chunk['end_offset'], chunk['text'], vector, document_tsvector(chunk['text']), Jsonb(spans)))
 
-    def _recall(self,queries,project_id,version,query,*,excluded_documents=(),included_documents=None,include_office=False,scope=None,window=None):
+    def _recall(self,queries,project_id,version,rewrite,*,excluded_documents=(),included_documents=None,include_office=False,scope=None,window=None):
         """向量与关键词各自取有界候选，合并后再交给重排。单路开关不再查询另一路。"""
         window=window or search_window(self.settings)
         control=current_control();control.check()
@@ -481,23 +482,23 @@ class EvidenceService:
         vector_rows=[]
         if settings.retrieval_mode!='keyword':
             def embed():
-                values=self.models.embed([query],query=True)
+                values=self.models.embed([rewrite.rewritten],query=True)
                 if len(values)!=1:raise RetrievalError('查询向量数量不符。')
                 return values[0]
-            vector=self._model_result('embedding',project_id,query,[],embed,valid_vector)
+            vector=self._model_result('embedding',project_id,rewrite.rewritten,[],embed,valid_vector)
             control.check()
             vector_rows=queries.candidates(project_id,version,valid_vector(vector),
                 excluded_documents=excluded_documents,included_documents=included_documents,limit=window.vector_limit,scope=scope)
         keyword_rows=[]
         if settings.retrieval_mode!='vector':
-            plan=build_keyword_query(query)
+            plan=build_keyword_query(rewrite.original, extra_terms=rewrite.keyword_terms)
             if plan.tsquery:
                 found=queries.keyword_candidates(project_id,version,plan.tsquery,plan.needles,
                     excluded_documents=excluded_documents,included_documents=included_documents,limit=window.keyword_limit,scope=scope)
                 keyword_rows=prepare_keyword_rows(found,plan)[:window.keyword_limit]
         control.check()
         if include_office:
-            office_rows=self._office_rows(project_id, query, included_documents, scope, window=window)
+            office_rows=self._office_rows(project_id, rewrite, included_documents, scope, window=window)
             vector_rows=list(vector_rows)+office_rows['vector']
             keyword_rows=list(keyword_rows)+office_rows['keyword']
         return fuse_for(settings, vector_rows, keyword_rows, key=page_key, limit=window.candidate_limit)
@@ -521,8 +522,9 @@ class EvidenceService:
         # 评测按次传入更大的召回和保留条数，不改设置，也不改其他调用方。
         window=search_window(self.settings,vector_limit=vector_limit,keyword_limit=keyword_limit,
             candidate_limit=candidate_limit,result_limit=result_limit)
-        project_id=UUID(str(project_id));query=query.strip()
-        if not 1<=len(query)<=500:raise ValueError('查询须为 1–500 个字符。')
+        project_id=UUID(str(project_id))
+        # 长度只校验用户原句。改写在这一次入口完成，页级和混合路径都用同一结果。
+        rewrite=resolve_query(query, enabled=self.settings.query_rewrite_enabled)
         # document_id 只收窄召回范围，融合与重排仍走原路径。过滤在各路 SQL 内完成。
         if document_id is not None:document_id=UUID(str(document_id))
         try:
@@ -535,16 +537,18 @@ class EvidenceService:
                     from .mixed_search import MixedSearch
                     index=ParentIndex(self.settings,database=self.database,models=self.models)
                     found=MixedSearch(self,index,self.settings.search_parent_documents)._search(
-                        project_id,query,document_id=document_id,scope=scope,window=window)
+                        project_id,rewrite,document_id=document_id,scope=scope,window=window)
                 else:
-                    found=self._search(project_id,query,document_id=document_id,scope=scope,window=window)
-                return self._annotate(found,project_id,scope)
+                    found=self._search(project_id,rewrite,document_id=document_id,scope=scope,window=window)
+                return self._annotate(attach_query_rewrite(found, rewrite),project_id,scope)
         except AdmissionError as exc:
             if exc.code=='cancelled':raise SearchCancelled('查询已取消。') from None
             if exc.code=='deadline':raise SearchTimeout('本次查询超时，请稍后重试。') from None
             raise RetrievalBusy('本地模型繁忙，请稍后重试。') from None
 
-    def _search(self,project_id,query,*,project_checked=False,document_id=None,scope=None,window=None):
+    def _search(self,project_id,rewrite,*,project_checked=False,document_id=None,scope=None,window=None):
+        if not isinstance(rewrite, QueryRewrite):
+            raise TypeError('查询改写结果无效。')
         window=window or search_window(self.settings)
         control=current_control();control.check()
         if not project_checked and not self.database.project_exists(project_id):raise RetrievalError('项目不存在。')
@@ -555,14 +559,14 @@ class EvidenceService:
         response=dict(index_version=version,coverage=coverage,results=[],status='not_indexed')
         if not coverage['indexed_pages'] and not coverage['office_chunks']:
             return response
-        rows=self._recall(queries,project_id,version,query,included_documents=included,include_office=bool(coverage['office_chunks']),scope=scope,window=window)
+        rows=self._recall(queries,project_id,version,rewrite,included_documents=included,include_office=bool(coverage['office_chunks']),scope=scope,window=window)
         if rows:
             texts=[r['text'] for r in rows]
             def validate_scores(scores):
                 if not isinstance(scores,list) or len(scores)!=len(rows) or any(not isinstance(v,(float,int)) or not math.isfinite(v) or not 0<=v<=1 for v in scores):
                     raise RetrievalError('重排序输出无效，请重试。')
-            scores=self._model_result('reranker',project_id,query,texts,
-                lambda:self.models.rerank(query,texts),validate_scores)
+            scores=self._model_result('reranker',project_id,rewrite.rewritten,texts,
+                lambda:self.models.rerank(rewrite.rewritten,texts),validate_scores)
             for row,score in zip(rows,scores,strict=True):row['rerank_score']=score
         control.check()
         # Even a warm model cache never skips fresh SQL recall or source checks.
@@ -588,7 +592,7 @@ class EvidenceService:
         from .office import OfficeIndex
         return OfficeIndex(self.settings, self.database, self.models)
 
-    def _office_rows(self, project_id, query, included, scope=None, window=None):
+    def _office_rows(self, project_id, rewrite, included, scope=None, window=None):
         from .lexical import build_keyword_query
         window=window or search_window(self.settings)
         office=self._office()
@@ -596,15 +600,15 @@ class EvidenceService:
         vector_rows=[]
         if self.settings.retrieval_mode!='keyword':
             def embed():
-                values=self.models.embed([query],query=True)
+                values=self.models.embed([rewrite.rewritten],query=True)
                 if len(values)!=1:raise RetrievalError('查询向量数量不符。')
                 return values[0]
-            vector=self._model_result('embedding',project_id,query,[],embed,valid_vector)
+            vector=self._model_result('embedding',project_id,rewrite.rewritten,[],embed,valid_vector)
             vector_rows=office.candidates(project_id, version, vector=valid_vector(vector), included=included,
                                           limit=window.vector_limit, scope=scope)
         keyword_rows=[]
         if self.settings.retrieval_mode!='vector':
-            plan=build_keyword_query(query)
+            plan=build_keyword_query(rewrite.original, extra_terms=rewrite.keyword_terms)
             if plan.tsquery:
                 keyword_rows=office.candidates(project_id, version, tsquery=plan.tsquery, needles=plan.needles,
                                                included=included, limit=window.keyword_limit, scope=scope)

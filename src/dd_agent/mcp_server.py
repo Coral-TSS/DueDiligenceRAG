@@ -688,6 +688,13 @@ def _search(evidence, project_id, query, arguments):
     }
     if 'coverage' in found:
         payload['coverage'] = found['coverage']
+    rewrite = found.get('query_rewrite')
+    if isinstance(rewrite, dict) and isinstance(rewrite.get('original'), str) and isinstance(rewrite.get('rewritten'), str):
+        payload['query_rewrite'] = {
+            'original': rewrite['original'],
+            'rewritten': rewrite['rewritten'],
+            'enabled': bool(rewrite.get('enabled')),
+        }
     for key in ('excluded_uncategorized', 'excluded_unsubjected', 'excluded_undated', 'message'):
         if key in found:
             payload[key] = found[key]

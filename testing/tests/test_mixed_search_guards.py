@@ -35,8 +35,9 @@ def test_eval_window_reranks_past_twelve_and_can_keep_more_than_five(tmp_path,da
     x.index.models.rerank=counted
     product=x.evidence.search(x.p,'注册资本')
     widened=x.evidence.search(x.p,'注册资本',vector_limit=20,keyword_limit=20,candidate_limit=40,result_limit=15)
-    assert calls[0]==12 and len(product['results'])<=5
-    assert calls[1]>12 and 5<len(widened['results'])<=15
+    # 产品融合默认 24，长页应能超过旧的 12 条上限，但仍不超过这次的产品设置。
+    assert 12 < calls[0] <= x.evidence.settings.retrieval_candidate_limit and len(product['results'])<=5
+    assert calls[1] > calls[0] and 5<len(widened['results'])<=15
 
 
 def test_dual_recall_has_one_twelve_candidate_rerank_budget(tmp_path,database_url):
@@ -47,7 +48,8 @@ def test_dual_recall_has_one_twelve_candidate_rerank_budget(tmp_path,database_ur
     def counted(query,texts):calls.append(len(texts));return rerank(query,texts)
     x.index.models.rerank=counted
     result=x.search.search(x.p,'注册资本')
-    assert calls==[12] and len(result['results'])<=5
+    assert len(calls)==1 and 12 < calls[0] <= x.evidence.settings.retrieval_candidate_limit
+    assert len(result['results'])<=5
     other_project=x.db.create_project('另一个项目')['id']
     empty=x.search.search(other_project,'注册资本')
     assert empty['results']==[] and empty['parent_documents']==[]

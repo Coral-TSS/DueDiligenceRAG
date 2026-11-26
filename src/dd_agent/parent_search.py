@@ -8,6 +8,7 @@ from time import monotonic
 from uuid import UUID
 
 from .lexical import build_keyword_query, fuse_for, prepare_keyword_rows
+from .query_rewrite import QueryRewrite, attach_query_rewrite, resolve_query
 from .model_admission import request_scope,current_control,AdmissionError
 from .parent_queries import ParentQueries
 from .parent_references import reference_url
@@ -24,32 +25,34 @@ class ParentSearch:
         self.queries=ParentQueries(evidence.database)
 
     def search(self,project_id,query,*,cancel=None):
-        project_id=UUID(str(project_id));query=query.strip()
-        if not 1<=len(query)<=500:raise ValueError('查询须为 1–500 个字符。')
+        project_id=UUID(str(project_id))
+        rewrite=resolve_query(query, enabled=self.evidence.settings.query_rewrite_enabled)
         try:
             with request_scope('interactive',cancel=cancel,
                     deadline=monotonic()+self.evidence.settings.search_timeout_seconds):
-                return self._search(project_id,query)
+                return attach_query_rewrite(self._search(project_id,rewrite), rewrite)
         except AdmissionError as exc:
             if exc.code=='cancelled':raise SearchCancelled('查询已取消。') from None
             if exc.code=='deadline':raise SearchTimeout('本次查询超时，请稍后重试。') from None
             raise RetrievalBusy('本地模型繁忙，请稍后重试。') from None
 
-    def _search(self,project_id,query):
+    def _search(self,project_id,rewrite):
+        if not isinstance(rewrite, QueryRewrite):
+            raise TypeError('查询改写结果无效。')
         control=current_control();control.check()
         version=self.index.version();control.check()
         def embed():
-            values=self.evidence.models.embed([query],query=True)
+            values=self.evidence.models.embed([rewrite.rewritten],query=True)
             if len(values)!=1:raise RetrievalError('查询向量数量不符。')
             return values[0]
         settings=self.evidence.settings
         vector_rows=[]
         if settings.retrieval_mode!='keyword':
-            vector=self.evidence._model_result('embedding',project_id,query,[],embed,valid_vector)
+            vector=self.evidence._model_result('embedding',project_id,rewrite.rewritten,[],embed,valid_vector)
             vector_rows=self.queries.candidates(project_id,version,vector,limit=settings.retrieval_vector_limit)
         keyword_rows=[]
         if settings.retrieval_mode!='vector':
-            plan=build_keyword_query(query)
+            plan=build_keyword_query(rewrite.original, extra_terms=rewrite.keyword_terms)
             if plan.tsquery:
                 found=self.queries.keyword_candidates(project_id,version,plan.tsquery,plan.needles,limit=settings.retrieval_keyword_limit)
                 keyword_rows=prepare_keyword_rows(found,plan)[:settings.retrieval_keyword_limit]
@@ -62,11 +65,11 @@ class ParentSearch:
         scores=[]
         if rows:
             texts=[r['text'] for r in rows]
-            scores=self.evidence._model_result('reranker',project_id,query,texts,
-                lambda:self.evidence.models.rerank(query,texts),validate)
+            scores=self.evidence._model_result('reranker',project_id,rewrite.rewritten,texts,
+                lambda:self.evidence.models.rerank(rewrite.rewritten,texts),validate)
         control.check()
         ranked={(r['build_id'],r['id']):(r,score) for r,score in zip(rows,scores,strict=True)}
-        live=self.queries.finalize(project_id,version,rows);control.check()
+        live=self.queries.finalize(project_id,version,rows,budget=settings.retrieval_candidate_limit);control.check()
         results=self.format(project_id,version,ranked,live)
         return dict(index_kind='parent_child',index_version=version,
             coverage=dict(complete=False,status='not_evaluated'),

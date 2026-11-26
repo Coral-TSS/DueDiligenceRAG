@@ -105,8 +105,8 @@ class SearchQueries:
                 JOIN live ON c.document_id=live.document_id AND c.page_number=live.page_number AND c.index_version=live.index_version
                 ORDER BY '''+exact+''' ts_rank_cd(c.lexemes,q.tsq) DESC,c.id LIMIT %s''',args).fetchall()
 
-    def finalize(self,project_id,version,ids,*,conn=None,excluded_documents=(),budget=12):
-        # 缺省仍是产品的 12 条。评测传入更大的融合名单时，这里和 SQL 的 LIMIT 一起放开，最多 50。
+    def finalize(self,project_id,version,ids,*,conn=None,excluded_documents=(),budget=24):
+        # 缺省与产品融合上限一致，目前是 24 条。评测传入更大的融合名单时，这里和 SQL 的 LIMIT 一起放开，最多 50。
         budget=_finalize_budget(budget)
         if len(ids)>budget:raise ValueError('Candidate budget exceeded')
         owned=conn is None
