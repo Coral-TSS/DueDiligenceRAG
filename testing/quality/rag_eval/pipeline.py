@@ -30,18 +30,25 @@ DEEPSEEK_EXTRA_BODY = {
     'reasoning_effort': 'none',
 }
 GENERATION_SYSTEM = (
-    '你只根据给定的检索片段作答。片段里没有的信息必须明确写成“材料未记载”，'
-    '不要推断，也不要补充片段以外的知识。用中文回答。'
+    '你只根据给定的检索片段作答，不使用片段以外的知识，也不要推断。'
+    '只回答问题所问的那一个字段，按原文摘录数字、日期、人名和比例。'
+    '同一片段里相邻的其他日期、金额、职务或比例不要写入答案。'
+    '所问字段已经写在给定片段里时，必须直接答出，不能写“材料未记载”。'
+    '只有给定片段里确实没有这一字段时，才回答“材料未记载”。'
+    '用中文回答。'
 )
+# 评测检索仍保留更多片段给 Context Recall。生成只看重排后的前几条，避免把相邻事实抄进答案。
+GENERATION_CONTEXT_LIMIT = 5
 REFERENCE_METRICS = ('LLMContextRecall', 'FactualCorrectness')
 FILTER_KEYS = (
     'document_id', 'document_ids', 'categories', 'subject_ids',
     'date_point', 'period_start', 'period_end', 'page_from', 'page_to',
 )
 CHILD_KEYS = ('matched_children', 'children', 'chunks')
-# 产品界面和 MCP 仍是各路 12 条、融合后最多 12 条进重排、重排后保留 5 条。
-# 评测默认加宽两路召回。融合上限取两路之和，否则多召回的片段会在进重排前被切回 12 条。
+# 产品界面和 MCP 仍是各路 12 条、融合后默认 24 条进重排、重排后保留 5 条。
+# 评测默认加宽两路召回。融合上限取两路之和，否则多召回的片段会在进重排前被切掉。
 # 重排后再多留一些，避免金标只是在最后 5 条被截掉。这些数只传给这一次 search()。
+# 生成只使用其中前 GENERATION_CONTEXT_LIMIT 条，检索窗口本身不缩短。
 EVAL_VECTOR_LIMIT = 20
 EVAL_KEYWORD_LIMIT = 20
 EVAL_CANDIDATE_LIMIT = 40
@@ -242,6 +249,42 @@ def _blank_to_none(value):
         text = value.strip()
         return text or None
     return value
+
+
+def contexts_for_generation(contexts, limit=None):
+    """重排顺序上的前若干条。检索窗口可以更长，这里只决定送给生成的片段。"""
+    if limit is None:
+        limit = GENERATION_CONTEXT_LIMIT
+    if type(limit) is not int or not 1 <= limit <= EVAL_LIMIT_MAX:
+        raise ValueError(f'生成所用片段条数须为 1–{EVAL_LIMIT_MAX} 的整数。')
+    chosen = []
+    for text in contexts or []:
+        if not isinstance(text, str):
+            continue
+        cleaned = text.strip()
+        if not cleaned:
+            continue
+        chosen.append(cleaned)
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+def generation_user_message(question, contexts):
+    joined = '\n\n---\n\n'.join(contexts)
+    return (
+        '只回答下面这个问题所问的字段。答案必须摘自检索片段。\n\n'
+        f'问题：{question}\n\n检索片段：\n{joined}'
+    )
+
+
+def faithfulness_contexts(record):
+    """Faithfulness 对照模型实际看到的片段。旧记录没有该字段时仍用完整检索窗口。"""
+    contexts = record.get('generation_contexts') if isinstance(record, dict) else None
+    if isinstance(contexts, list) and contexts and all(isinstance(item, str) and item.strip() for item in contexts):
+        return [item.strip() for item in contexts]
+    retrieved = record.get('retrieved_contexts') if isinstance(record, dict) else None
+    return list(retrieved or [])
 
 
 def contexts_from_search(found):
@@ -615,17 +658,17 @@ class RagPipeline(RetrievalPipeline):
         self._chat = chat
 
     def generate(self, question, contexts):
-        if not contexts:
+        selected = contexts_for_generation(contexts)
+        if not selected:
             return NO_CONTEXT_ANSWER
         config = require_api_key()
         client = self._chat if self._chat is not None else openai_client(config)
-        joined = '\n\n---\n\n'.join(contexts)
         completion = client.chat.completions.create(
             model=config['model'],
             temperature=0,
             messages=[
                 {'role': 'system', 'content': GENERATION_SYSTEM},
-                {'role': 'user', 'content': f'问题：{question}\n\n检索片段：\n{joined}'},
+                {'role': 'user', 'content': generation_user_message(question, selected)},
             ],
             **completion_kwargs(config),
         )
@@ -634,6 +677,7 @@ class RagPipeline(RetrievalPipeline):
     def run_item(self, project_id, item, *, generate=True):
         question = item['question'].strip()
         contexts, found = self.retrieve(project_id, question, item)
+        used = contexts_for_generation(contexts)
         response = self.generate(question, contexts) if generate else ''
         record = {
             'id': item.get('id') or '',
@@ -643,6 +687,8 @@ class RagPipeline(RetrievalPipeline):
             'reference': str(item.get('reference') or '').strip(),
             'search_status': found.get('status') if isinstance(found, dict) else None,
         }
+        if generate:
+            record['generation_contexts'] = used
         return record, found
 
 
@@ -676,6 +722,9 @@ def trace_for(record, found, item, limits=None):
         'question': record['user_input'],
         'search_status': record.get('search_status'),
         'context_count': len(record['retrieved_contexts']),
+        'retrieved_context_count': len(record['retrieved_contexts']),
+        'generation_context_count': len(record['generation_contexts']) if isinstance(record.get('generation_contexts'), list) else 0,
+        'generation_context_limit': GENERATION_CONTEXT_LIMIT,
         'coverage': coverage,
         'filters': filter_payload(item),
     }
@@ -756,6 +805,11 @@ def normalize_score_record(item, index):
     }
     if item.get('search_status') is not None:
         record['search_status'] = item.get('search_status')
+    if 'generation_contexts' in item:
+        generation = item.get('generation_contexts')
+        if not isinstance(generation, list) or not all(isinstance(text, str) for text in generation):
+            raise ValueError(f'{label}的 generation_contexts 必须是字符串数组。')
+        record['generation_contexts'] = [text.strip() for text in generation if text.strip()]
     return record
 
 
@@ -816,6 +870,7 @@ def collect_records(pipeline, project_id, items, *, generate):
         traces.append(trace_for(record, found, item, getattr(pipeline, 'limits', None)))
         print(
             f"{record['id']}: status={record['search_status']} "
-            f"contexts={len(record['retrieved_contexts'])}"
+            f"contexts={len(record['retrieved_contexts'])} "
+            f"generation_contexts={len(record.get('generation_contexts') or [])}"
         )
     return records, traces

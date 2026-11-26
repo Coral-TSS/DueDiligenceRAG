@@ -385,7 +385,11 @@ def test_retrieve_uses_the_wider_eval_window_and_ignores_product_settings(monkey
         generate=False,
     )
     assert records[0]['retrieved_contexts'] == ['办公材料片段']
+    assert 'generation_contexts' not in records[0]
     assert traces[0]['retrieval_limits'] == overridden.limits
+    assert traces[0]['retrieved_context_count'] == 1
+    assert traces[0]['generation_context_count'] == 0
+    assert traces[0]['generation_context_limit'] == pipeline.GENERATION_CONTEXT_LIMIT == 5
     assert 'query_rewrite' not in traces[0]
     for raw in ('0', '51', '20.5', 'true', '+20'):
         monkeypatch.setenv('EVAL_RETRIEVAL_CANDIDATE_LIMIT', raw)
@@ -407,6 +411,9 @@ def test_missing_contexts_do_not_call_the_judge(monkeypatch):
     assert record['response'] == NO_CONTEXT_ANSWER
     assert chat.calls == []
     assert '中文' in GENERATION_SYSTEM and '材料未记载' in GENERATION_SYSTEM
+    assert '只回答问题所问的那一个字段' in GENERATION_SYSTEM
+    assert '相邻' in GENERATION_SYSTEM and '必须直接答出' in GENERATION_SYSTEM
+    assert '片段以外' in GENERATION_SYSTEM
 
 
 def test_generation_uses_only_retrieved_context_and_does_not_log_the_key(monkeypatch):
@@ -433,6 +440,8 @@ def test_generation_uses_only_retrieved_context_and_does_not_log_the_key(monkeyp
     assert 'deepseek_web_search' not in json.dumps(sent, ensure_ascii=False)
     assert sent['messages'][0]['content'] == GENERATION_SYSTEM
     assert '办公材料片段' in sent['messages'][1]['content']
+    assert '只回答下面这个问题所问的字段' in sent['messages'][1]['content']
+    assert record['generation_contexts'] == ['办公材料片段']
     assert 'eval-key' not in json.dumps(sent, ensure_ascii=False)
     info = describe_judge_llm()
     assert info == {
@@ -442,6 +451,65 @@ def test_generation_uses_only_retrieved_context_and_does_not_log_the_key(monkeyp
         'thinking_disabled': True,
     }
     assert 'eval-key' not in json.dumps(info)
+
+
+def test_generation_keeps_the_retrieval_window_and_sends_only_the_top_snippets(monkeypatch, tmp_path):
+    monkeypatch.setenv('EVAL_LLM_API_KEY', 'eval-key')
+    monkeypatch.setenv('EVAL_LLM_MODEL', 'gpt-4o-mini')
+    contexts = [f'片段{index}记载了不同字段。' for index in range(8)]
+    fake = FakeSearch({
+        'status': 'candidates',
+        'coverage': {'office_chunks': 0},
+        'results': [{'text': text} for text in contexts],
+        'query_rewrite': {
+            'original': '示例主体的法定代表人是谁？',
+            'rewritten': '示例主体的法定代表人是谁？（法定代表人）',
+            'enabled': True,
+            'keyword_terms': ['不应进入痕迹'],
+        },
+    })
+    chat = FakeChat()
+    rag = RagPipeline(service=fake, chat=chat)
+    item = {'id': 'cut', 'question': '示例主体的法定代表人是谁？', 'reference': '甲'}
+    record, _found = rag.run_item(PROJECT, item, generate=True)
+    assert record['retrieved_contexts'] == contexts
+    assert record['generation_contexts'] == contexts[:pipeline.GENERATION_CONTEXT_LIMIT]
+    sent = chat.calls[0]['messages'][1]['content']
+    assert '片段0记载了不同字段。' in sent and '片段4记载了不同字段。' in sent
+    assert '片段5记载了不同字段。' not in sent
+    assert '不应进入痕迹' not in sent
+    _records, traces = pipeline.collect_records(rag, PROJECT, [item], generate=True)
+    trace = traces[0]
+    assert trace['retrieved_context_count'] == 8
+    assert trace['generation_context_count'] == 5
+    assert trace['context_count'] == 8
+    assert trace['query_rewrite'] == {
+        'original': '示例主体的法定代表人是谁？',
+        'rewritten': '示例主体的法定代表人是谁？（法定代表人）',
+        'enabled': True,
+    }
+    assert 'keyword_terms' not in trace['query_rewrite']
+    assert pipeline.faithfulness_contexts(record) == contexts[:5]
+    assert pipeline.faithfulness_contexts({'retrieved_contexts': contexts}) == contexts
+    script = _load_script('run_ragas')
+    assert script._faithfulness_kwargs(record)['retrieved_contexts'] == contexts[:5]
+    assert script._context_recall_kwargs(record)['retrieved_contexts'] == contexts
+    saved_path = tmp_path / 'records.json'
+    saved_path.write_text(json.dumps([record], ensure_ascii=False), encoding='utf-8')
+    saved = load_score_records(saved_path)[0]
+    assert saved['generation_contexts'] == contexts[:5]
+    assert saved['retrieved_contexts'] == contexts
+    broken = tmp_path / 'broken.json'
+    broken.write_text(json.dumps([_score_record(generation_contexts='不是数组')], ensure_ascii=False), encoding='utf-8')
+    with pytest.raises(ValueError, match='generation_contexts'):
+        load_score_records(broken)
+    readme = (EVAL_DIR / 'README.md').read_text(encoding='utf-8')
+    assert 'generation_contexts' in readme
+    assert 'retrieved_context_count' in readme
+    assert '前 5' in readme
+    assert 'Agent' in readme
+    with pytest.raises(ValueError, match='1–50'):
+        pipeline.contexts_for_generation(contexts, limit=0)
 
 
 def test_judge_env_prefers_eval_variables_and_hides_query_secrets(monkeypatch):

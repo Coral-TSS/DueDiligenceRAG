@@ -115,6 +115,18 @@ $env:EVAL_RETRIEVAL_RESULT_LIMIT="16"
 
 不要把 `DDA_RETRIEVAL_VECTOR_LIMIT` 调大来做这次对比。那会改掉同一个进程里的产品设置。评测窗口只认 `EVAL_RETRIEVAL_*` 和这一次传入 `search()` 的四个数。产品检索默认还会做规则改写（`DDA_QUERY_REWRITE=1`，设为 `0` 关闭），向量和重排用轻改写后的问句，关键词另补官方词。`traces.json` 在检索结果带有 `query_rewrite` 时记下 `original` 和 `rewritten`，不写补充词表，也不写片段。这次也不按类别或主体做默认过滤；材料上的过滤仍只来自黄金集里已经写明的字段。
 
+## 生成答案
+
+产品没有回答接口。这里的生成只给 RAGAS / TruLens 的答案类指标用。检索窗口保持上面的默认（重排后保留 15 条），`retrieved_contexts` 仍是这整个窗口，Context Recall 继续能看见这些片段。送给生成模型的只有重排后的前 5 条。同一条父块若展开成多个子块，按重排顺序取前 5 段文字。
+
+系统提示要求：只回答所问的那一个字段；按原文摘录；不要把同一片段里相邻的日期、金额、职务或比例抄进答案；片段里已经写了这一字段就必须答出；只有给定片段里确实没有时才写“材料未记载”；不使用片段以外的知识。
+
+`records.json` 里 `generation_contexts` 是实际送给模型的片段。`traces.json` 的 `retrieved_context_count` 和 `generation_context_count` 分别是检索到的条数和送去生成的条数，`generation_context_limit` 是这条上限。只检索、不生成时，送去生成的条数为 0。
+
+Faithfulness 在记录带有非空 `generation_contexts` 时只对照这几条，这样模型按提示拒答时，不会因为更后面的检索片段里有该事实而被判成不忠实。没有该字段的旧记录仍对照全部 `retrieved_contexts`。Context Recall 始终用完整的 `retrieved_contexts`。
+
+后续尽调 Agent 的作答提示应与这里同一条政策对齐。那次对齐不在本仓库的这次改动里。
+
 ## 只检索
 
 不生成答案，也不调用裁判模型。仍会连接 `.env` 中的数据库并加载本地检索模型。
@@ -196,8 +208,8 @@ D:\CodeWork\DueDiligenceRAG\.venv-eval\Scripts\python.exe D:\CodeWork\DueDiligen
 
 | 文件 | 何时产生 |
 | --- | --- |
-| `records.json` | RAGAS 路径。含问题、检索片段、答案和 reference |
-| `traces.json` | 检索状态、片段数、coverage、本条过滤条件、这次的 `retrieval_limits`，以及检索结果里的 `query_rewrite`（原句和轻改写） |
+| `records.json` | RAGAS 路径。含问题、完整检索片段、送给生成的片段、答案和 reference |
+| `traces.json` | 检索状态、检索条数和生成条数、coverage、过滤条件、`retrieval_limits`，以及 `query_rewrite`（原句和轻改写） |
 | `ragas_scores.json` / `ragas_scores.csv` | 完整 RAGAS 打分。事实正确性同时有 precision、recall 和 F1 |
 | `factual_judge_trace.json` | 事实正确性的条目计数和判决标签计数，与分数文件一起写出。没有陈述原文 |
 | `trulens_answers.json` | TruLens 路径的答案、片段数和过滤条件 |
