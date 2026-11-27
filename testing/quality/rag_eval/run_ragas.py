@@ -26,6 +26,7 @@ from pipeline import (  # noqa: E402
     RagPipeline,
     redact_secrets,
     require_api_key,
+    faithfulness_contexts,
     select_metric_names,
     write_csv,
     write_json,
@@ -103,10 +104,11 @@ def build_scorers(llm, selected):
 
 
 def _faithfulness_kwargs(record):
+    # Context Recall 仍用完整 retrieved_contexts。Faithfulness 只看生成时给模型的片段。
     return {
         'user_input': record['user_input'],
         'response': record['response'],
-        'retrieved_contexts': record['retrieved_contexts'],
+        'retrieved_contexts': faithfulness_contexts(record),
     }
 
 
