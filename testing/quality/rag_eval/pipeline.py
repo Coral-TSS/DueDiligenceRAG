@@ -682,6 +682,14 @@ def trace_for(record, found, item, limits=None):
     window = public_retrieval_limits(limits)
     if window is not None:
         trace['retrieval_limits'] = window
+    rewrite = found.get('query_rewrite') if isinstance(found, dict) else None
+    if isinstance(rewrite, dict) and isinstance(rewrite.get('original'), str) and isinstance(rewrite.get('rewritten'), str):
+        # 只留下原句和轻改写。不写关键词补充表，也不写片段。
+        trace['query_rewrite'] = {
+            'original': rewrite['original'],
+            'rewritten': rewrite['rewritten'],
+            'enabled': bool(rewrite.get('enabled')),
+        }
     return trace
 
 

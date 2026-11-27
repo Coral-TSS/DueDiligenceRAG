@@ -70,11 +70,11 @@ def test_search_window_keeps_the_product_top_five_and_allows_an_eval_override():
 
     settings = Settings()
     window = search_window(settings)
-    assert (window.vector_limit, window.keyword_limit, window.candidate_limit, window.result_limit) == (12, 12, 12, 5)
+    assert (window.vector_limit, window.keyword_limit, window.candidate_limit, window.result_limit) == (12, 12, 24, 5)
     widened = search_window(settings, vector_limit=20, keyword_limit=20, candidate_limit=40, result_limit=15)
     assert (widened.vector_limit, widened.keyword_limit, widened.candidate_limit, widened.result_limit) == (20, 20, 40, 15)
-    # 13 超过产品设置的融合上限，但按次传入时允许，评测才能把加宽后的召回送进重排。
-    assert search_window(settings, candidate_limit=13).candidate_limit == 13
+    # 按次传入可以不同于产品默认的 24，评测用这个窗口把加宽后的召回送进重排。
+    assert search_window(settings, candidate_limit=30).candidate_limit == 30
     for kwargs in (
         dict(vector_limit=0), dict(vector_limit=51), dict(keyword_limit=True),
         dict(candidate_limit=51), dict(result_limit=0), dict(result_limit=False),
@@ -87,8 +87,9 @@ def test_search_window_keeps_the_product_top_five_and_allows_an_eval_override():
 def test_retrieval_settings_read_environment_and_reject_bad_values(monkeypatch):
     with pytest.raises(ValueError):
         Settings(retrieval_mode='both')
+    assert Settings(retrieval_candidate_limit=24).retrieval_candidate_limit == 24
     with pytest.raises(ValueError):
-        Settings(retrieval_candidate_limit=13)
+        Settings(retrieval_candidate_limit=51)
     with pytest.raises(ValueError):
         Settings(retrieval_keyword_weight=0)
     monkeypatch.setattr('dd_agent.config.load_dotenv', lambda *args, **kwargs: None)
@@ -100,6 +101,7 @@ def test_retrieval_settings_read_environment_and_reject_bad_values(monkeypatch):
     assert settings.retrieval_mode == 'keyword' and settings.retrieval_fusion == 'weighted'
     assert settings.retrieval_keyword_limit == 8 and settings.retrieval_keyword_weight == 2.5
     assert settings.retrieval_vector_limit == 12 and settings.retrieval_rrf_k == 60
+    assert settings.retrieval_candidate_limit == 24 and settings.query_rewrite_enabled is True
 
 
 def prepared(tmp_path, database_url, **kwargs):

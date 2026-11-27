@@ -246,8 +246,12 @@ class KeywordPlan:
         return min(rank, 0.999)
 
 
-def build_keyword_query(query):
-    """长词优先。问句里已经有四字及以上的内容时，不再把“公司”这类二字词铺开。"""
+def build_keyword_query(query, extra_terms=()):
+    """长词优先。问句里已经有四字及以上的内容时，不再把“公司”这类二字词铺开。
+
+    extra_terms 是查询改写补上的官方词。先保住问句自己的词组，再把这些词
+    接在后面，不因为问句里已有长词就把官方词丢掉。
+    """
     norm = normalize(query)
     phrases = _phrases(norm)
     long = [phrase for phrase in phrases if len(phrase) >= 4]
@@ -275,7 +279,29 @@ def build_keyword_query(query):
         if len(kept) >= _MAX_GROUPS:
             break
     needles = [needle for _, _, needle, _ in kept if needle][:_MAX_NEEDLES]
-    return KeywordPlan([group for _, group, _, _ in kept], needles, canonical)
+    groups = [group for _, group, _, _ in kept]
+    return _with_extra_terms(groups, needles, canonical, extra_terms)
+
+
+def _with_extra_terms(groups, needles, canonical, extra_terms):
+    if not extra_terms:
+        return KeywordPlan(groups, needles, canonical)
+    seen = set(groups)
+    kept_groups = list(groups)
+    kept_needles = list(needles)
+    for term in extra_terms:
+        norm = normalize(term).strip()
+        if not _CJK_RUN.fullmatch(norm):
+            continue
+        for piece in _windows(norm):
+            group = _phrase_group(piece)
+            if not group or group in seen or len(kept_groups) >= _MAX_GROUPS:
+                continue
+            seen.add(group)
+            kept_groups.append(group)
+            if piece and len(kept_needles) < _MAX_NEEDLES:
+                kept_needles.append(piece)
+    return KeywordPlan(kept_groups, kept_needles, canonical)
 
 
 def prepare_keyword_rows(rows, plan):
@@ -379,7 +405,7 @@ def fuse_candidates(vector_rows, keyword_rows, *, mode, fusion, rrf_k, vector_we
 
 
 def fuse_for(settings, vector_rows, keyword_rows, *, key, limit=None):
-    # 缺省用产品设置，融合后最多 12 条。评测可以按次传入更大的名单，避免加宽后的召回在进重排前被切回去。
+    # 缺省用产品设置，融合后最多 24 条再送重排。评测可以按次传入更大的名单，避免加宽后的召回在进重排前被切回去。
     if limit is None:
         limit = settings.retrieval_candidate_limit
     return fuse_candidates(vector_rows, keyword_rows, mode=settings.retrieval_mode, fusion=settings.retrieval_fusion,

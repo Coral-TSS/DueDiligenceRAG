@@ -1,0 +1,180 @@
+{
+  "version": "dd-official-terms-v1",
+  "entries": [
+    {
+      "id": "legal_representative",
+      "match": ["法定代表人", "法人代表", "法人"],
+      "keyword": ["法定代表人", "法人代表"],
+      "vector": "法定代表人",
+      "exclude": ["法人股东", "法人资格", "企业法人", "法人机构", "法人单位"]
+    },
+    {
+      "id": "registered_capital",
+      "match": ["注册资本", "注册资金", "认缴出资额", "认缴出资", "认缴资本", "认缴"],
+      "keyword": ["注册资本", "认缴出资额"],
+      "vector": "注册资本",
+      "exclude": ["认缴期限", "缴付期限"]
+    },
+    {
+      "id": "paid_in_capital",
+      "match": ["实缴出资额", "实缴出资", "实缴资本", "实收资本", "实缴金额", "实缴"],
+      "keyword": ["实缴出资额", "实收资本"],
+      "vector": "实缴出资额",
+      "exclude": []
+    },
+    {
+      "id": "contribution_ratio",
+      "match": ["出资比例", "持股比例", "股权比例"],
+      "keyword": ["出资比例", "持股比例", "股权比例"],
+      "vector": "出资比例",
+      "exclude": []
+    },
+    {
+      "id": "contribution_time",
+      "match": ["出资时间", "认缴期限", "缴付期限"],
+      "keyword": ["出资时间", "认缴期限"],
+      "vector": "出资时间",
+      "exclude": []
+    },
+    {
+      "id": "establishment_date",
+      "match": ["成立日期", "成立时间", "设立日期", "设立时间", "注册日期", "开业日期"],
+      "keyword": ["成立日期", "设立日期"],
+      "vector": "成立日期",
+      "exclude": []
+    },
+    {
+      "id": "domicile",
+      "match": ["注册地址", "公司地址", "住所地", "住所"],
+      "keyword": ["住所", "注册地址"],
+      "vector": "住所",
+      "exclude": []
+    },
+    {
+      "id": "business_term",
+      "match": ["营业期限", "经营期限"],
+      "keyword": ["营业期限", "经营期限"],
+      "vector": "营业期限",
+      "exclude": []
+    },
+    {
+      "id": "business_scope",
+      "match": ["经营范围", "业务范围"],
+      "keyword": ["经营范围"],
+      "vector": "经营范围",
+      "exclude": []
+    },
+    {
+      "id": "company_name",
+      "match": ["企业名称", "公司名称", "名称预先核准"],
+      "keyword": ["企业名称", "公司名称"],
+      "vector": "企业名称",
+      "exclude": []
+    },
+    {
+      "id": "credit_code_label",
+      "match": ["统一社会信用代码", "社会信用代码", "信用代码"],
+      "keyword": ["统一社会信用代码"],
+      "vector": "统一社会信用代码",
+      "exclude": []
+    },
+    {
+      "id": "registration_number",
+      "match": ["工商注册号", "注册号"],
+      "keyword": ["注册号"],
+      "vector": "注册号",
+      "exclude": []
+    },
+    {
+      "id": "articles",
+      "match": ["公司章程", "章程"],
+      "keyword": ["公司章程"],
+      "vector": "公司章程",
+      "exclude": []
+    },
+    {
+      "id": "business_license",
+      "match": ["营业执照"],
+      "keyword": ["营业执照"],
+      "vector": "营业执照",
+      "exclude": []
+    },
+    {
+      "id": "executive_director",
+      "match": ["执行董事", "董事长"],
+      "keyword": ["执行董事", "董事长"],
+      "vector": "执行董事",
+      "exclude": []
+    },
+    {
+      "id": "manager",
+      "match": ["总经理", "经理"],
+      "keyword": ["总经理", "经理"],
+      "vector": "总经理",
+      "exclude": ["部门经理", "项目经理", "客户经理", "经理室"]
+    },
+    {
+      "id": "supervisor",
+      "match": ["监事会主席", "监事"],
+      "keyword": ["监事", "监事会主席"],
+      "vector": "监事",
+      "exclude": ["监事会决议"]
+    },
+    {
+      "id": "finance_officer",
+      "match": ["财务负责人", "财务总监"],
+      "keyword": ["财务负责人"],
+      "vector": "财务负责人",
+      "exclude": []
+    },
+    {
+      "id": "senior_management",
+      "match": ["高级管理人员", "高管"],
+      "keyword": ["高级管理人员"],
+      "vector": "高级管理人员",
+      "exclude": []
+    },
+    {
+      "id": "shareholder",
+      "match": ["出资人", "投资人", "股东"],
+      "keyword": ["股东", "出资人"],
+      "vector": "股东",
+      "exclude": ["股东会", "股东大会", "股东决定"]
+    },
+    {
+      "id": "shareholder_resolution",
+      "match": ["股东会决议", "股东大会决议", "股东决定"],
+      "keyword": ["股东会决议", "股东决定"],
+      "vector": "股东会决议",
+      "exclude": []
+    },
+    {
+      "id": "board_resolution",
+      "match": ["董事会决议"],
+      "keyword": ["董事会决议"],
+      "vector": "董事会决议",
+      "exclude": []
+    },
+    {
+      "id": "capital_verification",
+      "match": ["验资报告", "验资"],
+      "keyword": ["验资报告"],
+      "vector": "验资报告",
+      "exclude": []
+    },
+    {
+      "id": "incorporation",
+      "match": ["设立登记", "公司设立", "开业登记", "准予设立"],
+      "keyword": ["设立登记", "公司设立"],
+      "vector": "设立登记",
+      "exclude": []
+    },
+    {
+      "id": "branch",
+      "match": ["分支机构", "分公司"],
+      "keyword": ["分支机构", "分公司"],
+      "vector": "分支机构",
+      "exclude": []
+    }
+  ]
+}

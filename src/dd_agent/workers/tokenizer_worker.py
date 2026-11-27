@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
-from dd_agent.workers.retrieval_worker import INSTRUCTION,PREFIX,SUFFIX
+from dd_agent.workers.retrieval_worker import PREFIX,SUFFIX,rerank_pair
 
 
 def main():
@@ -20,7 +20,7 @@ def main():
     result=[]
     for text in texts:
         # 与当前 rerank_loaded 的格式一致；额外问题预算由父子分块入口预留。
-        pair=f'<Instruct>: {INSTRUCTION}\n<Query>: \n<Document>: {text}'
+        pair=rerank_pair('', text)
         result.append(dict(embedding=len(embedding.encode(text)),
             reranker=prefix+len(reranker.encode(pair,add_special_tokens=False))+suffix))
     print(json.dumps(dict(counts=result)),flush=True)

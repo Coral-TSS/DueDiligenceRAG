@@ -109,6 +109,12 @@ def test_search_returns_chunks_empty_list_and_rejects_bad_key(tmp_path, database
             found = _payload(session.call('tools/call', {'name': 'search_evidence', 'arguments': {
                 'project_id': project_id, 'query': '注册资本'}}, 2))
             assert found['status'] == 'candidates'
+            assert found['query'] == '注册资本'
+            assert found['query_rewrite'] == {
+                'original': '注册资本',
+                'rewritten': '注册资本',
+                'enabled': True,
+            }
             hit = next(row for row in found['results'] if row['text'] == '注册资本为2000万元。')
             assert hit['project_id'] == project_id
             assert hit['document_id'] == document_id
